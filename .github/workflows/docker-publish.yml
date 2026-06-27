@@ -56,6 +56,12 @@ jobs:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+    - name: Get project version
+      id: get_version
+      run: |
+        VERSION=$(grep "^version = " pyproject.toml | head -n1 | cut -d'"' -f2)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
     - name: Extract Docker metadata
       id: meta
       uses: docker/metadata-action@v5
@@ -66,7 +72,9 @@ jobs:
           type=semver,pattern={{major}}.{{minor}}
           type=ref,event=branch
           type=sha,format=short
+          type=raw,value=${{ steps.get_version.outputs.version }}
           type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
 
     - name: Build and push Docker image
       uses: docker/build-push-action@v6
