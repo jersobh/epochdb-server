@@ -9,11 +9,13 @@ import asyncio
 import httpx
 import numpy as np
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Security, Depends
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 
 from epochdb import AsyncEpochDB
+
 
 # -------------------------------------------------------------------------
 # 1. Structured Logging Configuration
@@ -68,6 +70,32 @@ shard_nodes_str = os.getenv("SHARD_NODES", "")
 shard_nodes = [s.strip() for s in shard_nodes_str.split(",") if s.strip()]
 hash_ring = ConsistentHashRing(shard_nodes) if shard_nodes else None
 
+# Security credentials and API key headers configuration
+API_KEY = os.getenv("API_KEY")
+INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+internal_token_header = APIKeyHeader(name="X-Internal-Token", auto_error=False)
+
+async def verify_auth(
+    x_api_key: Optional[str] = Security(api_key_header),
+    x_internal_token: Optional[str] = Security(internal_token_header)
+):
+    if NODE_MODE == "coordinator":
+        if API_KEY and x_api_key != API_KEY:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing X-API-Key header."
+            )
+    else:
+        token = x_internal_token or x_api_key
+        if INTERNAL_AUTH_TOKEN and token != INTERNAL_AUTH_TOKEN:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing X-Internal-Token header."
+            )
+
+
 def get_shard_for_id(memory_id: str) -> Optional[str]:
     if not shard_nodes:
         return None
@@ -102,7 +130,10 @@ async def lifespan(app: FastAPI):
         logger.info("Initializing Sharded Clustering Coordinator Gateway...")
         if not shard_nodes:
             logger.warning("No SHARD_NODES configured for coordinator. Check env config.")
-        client = httpx.AsyncClient(timeout=30.0)
+        headers = {}
+        if INTERNAL_AUTH_TOKEN:
+            headers["X-Internal-Token"] = INTERNAL_AUTH_TOKEN
+        client = httpx.AsyncClient(headers=headers, timeout=30.0)
         yield
         await client.aclose()
         logger.info("Coordinator HTTP client session closed cleanly.")
@@ -173,7 +204,28 @@ class TimelinePayload(BaseModel):
 # -------------------------------------------------------------------------
 # 5. API Core Router Endpoints
 # -------------------------------------------------------------------------
-@app.post("/remember", status_code=status.HTTP_201_CREATED)
+@app.get("/healthz", status_code=status.HTTP_200_OK)
+async def healthz():
+    """
+    Liveness and Readiness probe endpoint.
+    """
+    if NODE_MODE == "coordinator":
+        if not client:
+            raise HTTPException(status_code=503, detail="Coordinator gateway not initialized.")
+        if shard_nodes:
+            tasks = [client.get(f"{shard}/healthz", timeout=2.0) for shard in shard_nodes]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for shard_url, resp in zip(shard_nodes, responses):
+                if isinstance(resp, Exception) or resp.status_code != 200:
+                    logger.warning(f"Shard health probe failed: {shard_url} -> {resp}")
+                    raise HTTPException(status_code=503, detail="One or more backend shards are unhealthy or warming up.")
+        return {"status": "healthy", "mode": "coordinator"}
+    else:
+        if db is None:
+            raise HTTPException(status_code=503, detail="Storage engine not ready.")
+        return {"status": "healthy", "mode": "shard"}
+
+@app.post("/remember", status_code=status.HTTP_201_CREATED, dependencies=[Depends(verify_auth)])
 async def remember(payload: MemoryPayload):
     """
     Appends a new memory atom to the Hot Tier (RAM) and schedules background WAL logging.
@@ -256,7 +308,7 @@ async def remember(payload: MemoryPayload):
             logger.error(f"Failed to commit memory write block: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Internal storage layer mutation rejected: {str(e)}")
 
-@app.post("/get")
+@app.post("/get", dependencies=[Depends(verify_auth)])
 async def get_memory(payload: GetPayload):
     """
     Retrieves a specific memory by its unique ID.
@@ -297,8 +349,8 @@ async def get_memory(payload: GetPayload):
             logger.error(f"Error resolving memory retrieval: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/query")
-async def handle_query(payload: QueryPayload):
+@app.post("/query", dependencies=[Depends(verify_auth)])
+async def query_memories(payload: QueryPayload):
     """
     Performs semantic search across the memory database.
     Coordinator parallelizes requests to all shards and merges/re-ranks results.
@@ -352,7 +404,7 @@ async def handle_query(payload: QueryPayload):
             logger.error(f"Error resolving retrieval operations: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/update")
+@app.post("/update", dependencies=[Depends(verify_auth)])
 async def update_memory(payload: UpdatePayload):
     """
     Updates memory text or metadata.
@@ -388,7 +440,7 @@ async def update_memory(payload: UpdatePayload):
             logger.error(f"Error updating memory {payload.memory_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/delete")
+@app.post("/delete", dependencies=[Depends(verify_auth)])
 async def delete_memory(payload: DeletePayload):
     """
     Deletes memory (hard or soft).
@@ -424,8 +476,8 @@ async def delete_memory(payload: DeletePayload):
             logger.error(f"Error deleting memory {payload.memory_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/entity_graph")
-async def get_entity_graph(entity_id: str, depth: int = 2):
+@app.get("/entity_graph", dependencies=[Depends(verify_auth)])
+async def entity_graph(entity_id: str, depth: int = 2):
     """
     Retrieves the local entity graph or aggregates the distributed graph.
     """
@@ -465,7 +517,7 @@ async def get_entity_graph(entity_id: str, depth: int = 2):
             logger.error(f"Error retrieving entity graph for {entity_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/get_timeline")
+@app.post("/get_timeline", dependencies=[Depends(verify_auth)])
 async def get_timeline(payload: TimelinePayload):
     """
     Retrieves timeline chronologically.
@@ -501,7 +553,7 @@ async def get_timeline(payload: TimelinePayload):
             logger.error(f"Error getting timeline: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/stats", status_code=status.HTTP_200_OK)
+@app.get("/stats", status_code=status.HTTP_200_OK, dependencies=[Depends(verify_auth)])
 async def stats():
     """
     Provides real-time system metrics, cache status, and internal allocation maps.
@@ -541,7 +593,7 @@ async def stats():
             logger.error(f"Unable to safely pull analytical parameters: {str(e)}")
             raise HTTPException(status_code=500, detail="Stats access blocked.")
 
-@app.post("/compact", status_code=status.HTTP_200_OK)
+@app.post("/compact", status_code=status.HTTP_200_OK, dependencies=[Depends(verify_auth)])
 async def compact():
     """
     Administrative endpoint to compress historical Parquet archives, clear soft deletes,

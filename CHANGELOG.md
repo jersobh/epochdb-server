@@ -2,6 +2,22 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.3.0] - 2026-06-27
+
+### Added
+- **API Key Security & Internal Tokens**:
+  - Implemented token-based authentication on the coordinator gateway (`X-API-Key`) and shard nodes (`X-Internal-Token`).
+  - The coordinator automatically propagates the `X-Internal-Token` header to downstream shards.
+  - Client SDK (`AsyncRemoteEpochDB`) now supports optional `api_key` initialization.
+- **Production ASGI Process Management**:
+  - Replaced single-worker Uvicorn invocation with **Gunicorn** process manager running `uvicorn.workers.UvicornWorker`.
+  - Configured worker timeout limit to 120s to ensure embedding models warm up cleanly without getting SIGKILL from Gunicorn.
+- **Stale Lock Cleanup**:
+  - Pre-purges `/data/.lock` file prior to booting Gunicorn inside the container, preventing database lock crashes when Docker volumes are mounted persistently.
+- **Urllib-Based Health Probes**:
+  - Added a `/healthz` endpoint on shards (readiness indicator) and the coordinator (which polls shards' health).
+  - Integrated Docker `healthcheck` blocks in `docker-compose.yml` leveraging Python's built-in `urllib` to check container status without requiring external curl binaries.
+
 ---
 
 ## [0.2.0] - 2026-06-27

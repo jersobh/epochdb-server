@@ -7,7 +7,10 @@ import subprocess
 import asyncio
 import httpx
 import pytest
-from client import AsyncRemoteEpochDB
+
+from epochdb import AsyncRemoteEpochDB
+
+
 
 # Temporary storage directories for shards
 SHARD0_DIR = tempfile.mkdtemp(prefix="epochdb_shard0_")
@@ -27,6 +30,7 @@ def run_cluster():
     env0 = os.environ.copy()
     env0["NODE_MODE"] = "shard"
     env0["STORAGE_DIR"] = SHARD0_DIR
+    env0["INTERNAL_AUTH_TOKEN"] = "test-internal-token-67890"
     p0 = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S0)],
         env=env0, stdout=sys.stderr, stderr=sys.stderr
@@ -37,6 +41,7 @@ def run_cluster():
     env1 = os.environ.copy()
     env1["NODE_MODE"] = "shard"
     env1["STORAGE_DIR"] = SHARD1_DIR
+    env1["INTERNAL_AUTH_TOKEN"] = "test-internal-token-67890"
     p1 = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S1)],
         env=env1, stdout=sys.stderr, stderr=sys.stderr
@@ -47,6 +52,7 @@ def run_cluster():
     env2 = os.environ.copy()
     env2["NODE_MODE"] = "shard"
     env2["STORAGE_DIR"] = SHARD2_DIR
+    env2["INTERNAL_AUTH_TOKEN"] = "test-internal-token-67890"
     p2 = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S2)],
         env=env2, stdout=sys.stderr, stderr=sys.stderr
@@ -57,6 +63,8 @@ def run_cluster():
     env_coord = os.environ.copy()
     env_coord["NODE_MODE"] = "coordinator"
     env_coord["SHARD_NODES"] = f"http://127.0.0.1:{PORT_S0},http://127.0.0.1:{PORT_S1},http://127.0.0.1:{PORT_S2}"
+    env_coord["API_KEY"] = "test-api-key-12345"
+    env_coord["INTERNAL_AUTH_TOKEN"] = "test-internal-token-67890"
     p_coord = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_COORD)],
         env=env_coord, stdout=sys.stderr, stderr=sys.stderr
@@ -74,10 +82,10 @@ def run_cluster():
                 pytest.fail(f"Server subprocess {p.args} failed to start.")
                 
         try:
-            resp_coord = httpx.get(f"http://127.0.0.1:{PORT_COORD}/stats", timeout=1.0)
-            resp_s0 = httpx.get(f"http://127.0.0.1:{PORT_S0}/stats", timeout=1.0)
-            resp_s1 = httpx.get(f"http://127.0.0.1:{PORT_S1}/stats", timeout=1.0)
-            resp_s2 = httpx.get(f"http://127.0.0.1:{PORT_S2}/stats", timeout=1.0)
+            resp_coord = httpx.get(f"http://127.0.0.1:{PORT_COORD}/healthz", timeout=1.0)
+            resp_s0 = httpx.get(f"http://127.0.0.1:{PORT_S0}/healthz", timeout=1.0)
+            resp_s1 = httpx.get(f"http://127.0.0.1:{PORT_S1}/healthz", timeout=1.0)
+            resp_s2 = httpx.get(f"http://127.0.0.1:{PORT_S2}/healthz", timeout=1.0)
             if (resp_coord.status_code == 200 and 
                 resp_s0.status_code == 200 and 
                 resp_s1.status_code == 200 and 
@@ -107,26 +115,28 @@ def run_cluster():
 
 @pytest.mark.asyncio
 async def test_cluster_operations():
-    # Initialize clients for Coordinator and Shards
-    coord_db = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_COORD)
-    shard0 = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_S0)
-    shard1 = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_S1)
-    shard2 = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_S2)
-
+    # Initialize clients with auth keys
+    coord_db = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_COORD, api_key="test-api-key-12345")
+    shard0 = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_S0, api_key="test-internal-token-67890")
+    shard1 = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_S1, api_key="test-internal-token-67890")
+    shard2 = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_S2, api_key="test-internal-token-67890")
 
     try:
+        # 0. Test unauthorized access
+        unauth_coord = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_COORD, api_key="wrong-key")
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            await unauth_coord.stats()
+        assert exc_info.value.response.status_code == 401
+
         # 1. Ingest memories through coordinator
         m1 = "Albert Einstein was a theoretical physicist."
         m2 = "Marie Curie discovered radium and polonium."
         m3 = "Isaac Newton formulated the laws of gravity."
 
-        r1 = await coord_db.remember(m1, metadata={"triples": [("Albert Einstein", "is_a", "physicist")]})
-        r2 = await coord_db.remember(m2, metadata={"triples": [("Marie Curie", "discovered", "radium")]})
-        r3 = await coord_db.remember(m3, metadata={"triples": [("Isaac Newton", "formulated", "gravity")]})
+        id1 = await coord_db.remember(m1, metadata={"triples": [("Albert Einstein", "is_a", "physicist")]})
+        id2 = await coord_db.remember(m2, metadata={"triples": [("Marie Curie", "discovered", "radium")]})
+        id3 = await coord_db.remember(m3, metadata={"triples": [("Isaac Newton", "formulated", "gravity")]})
 
-        id1 = r1["id"]
-        id2 = r2["id"]
-        id3 = r3["id"]
 
         # Assert ID prefix matches standard pattern
         assert id1.startswith("shard")
@@ -141,26 +151,26 @@ async def test_cluster_operations():
         # 2. Verify memories were correctly sharded to target nodes
         idx1 = get_shard_index(id1)
         m1_shard_data = await shards[idx1].get(id1)
-        assert m1_shard_data["payload"] == m1
+        assert m1_shard_data.text == m1
 
         idx2 = get_shard_index(id2)
         m2_shard_data = await shards[idx2].get(id2)
-        assert m2_shard_data["payload"] == m2
+        assert m2_shard_data.text == m2
 
         idx3 = get_shard_index(id3)
         m3_shard_data = await shards[idx3].get(id3)
-        assert m3_shard_data["payload"] == m3
+        assert m3_shard_data.text == m3
 
         # 3. Query through coordinator (Re-ranking & Merging)
         query_results = await coord_db.query("Newton formulated gravity physics", k=3)
         assert len(query_results) > 0
         # The Newton memory should be returned
-        assert any("Newton" in r["text"] for r in query_results)
+        assert any("Newton" in r.text for r in query_results)
         
         # Verify scores are returned
         for r in query_results:
-            assert "score" in r
-            assert isinstance(r["score"], float)
+            assert hasattr(r, "score")
+            assert isinstance(r.score, float)
 
         # 4. Fetch entity graph from coordinator (distributed merge)
         graph = await coord_db.entity_graph("Marie Curie")
@@ -169,17 +179,17 @@ async def test_cluster_operations():
 
         # 5. Point query GET via coordinator (direct routing)
         point_mem = await coord_db.get(id2)
-        assert point_mem["payload"] == m2
+        assert point_mem.text == m2
 
         # 6. Update memory via coordinator (direct routing)
         await coord_db.update(id3, text="Isaac Newton formulated the laws of gravity and calculus.")
         updated_mem = await coord_db.get(id3)
-        assert "calculus" in updated_mem["payload"]
+        assert "calculus" in updated_mem.text
 
         # 7. Get timeline across the cluster (merged chronologically)
         timeline = await coord_db.get_timeline(entity_id="Isaac Newton")
         assert len(timeline) > 0
-        assert "calculus" in timeline[0]["payload"]
+        assert "calculus" in timeline[0].text
 
         # 8. Stats check (merged counts)
         stats = await coord_db.stats()
@@ -188,7 +198,7 @@ async def test_cluster_operations():
         # 9. Delete memory (direct routing)
         await coord_db.delete(id1, hard=True)
         deleted_mem = await coord_db.get(id1)
-        assert not deleted_mem or "_deleted" in deleted_mem.get("metadata", {})
+        assert not deleted_mem or "_deleted" in deleted_mem.metadata
 
         # 10. Check stats again
         stats2 = await coord_db.stats()

@@ -7,8 +7,15 @@ services:
     environment:
       - NODE_MODE=shard
       - STORAGE_DIR=/data
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
     volumes:
       - shard0_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
 
   shard1:
     build: .
@@ -18,8 +25,15 @@ services:
     environment:
       - NODE_MODE=shard
       - STORAGE_DIR=/data
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
     volumes:
       - shard1_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
 
   shard2:
     build: .
@@ -29,8 +43,15 @@ services:
     environment:
       - NODE_MODE=shard
       - STORAGE_DIR=/data
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
     volumes:
       - shard2_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
 
   coordinator:
     build: .
@@ -40,10 +61,18 @@ services:
     environment:
       - NODE_MODE=coordinator
       - SHARD_NODES=http://shard0:8080,http://shard1:8080,http://shard2:8080
+      - API_KEY=test-api-key-12345
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
     depends_on:
       - shard0
       - shard1
       - shard2
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
 
 volumes:
   shard0_data:

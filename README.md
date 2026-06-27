@@ -205,28 +205,30 @@ Use the provided `client.py` wrapper to interact with the database:
 
 ```python
 import asyncio
-from client import AsyncRemoteEpochDB
+from epochdb import AsyncRemoteEpochDB
 
 async def main():
     # Connect to the coordinator gateway
-    db = AsyncRemoteEpochDB(host="127.0.0.1", port=8080)
+    db = AsyncRemoteEpochDB(host="127.0.0.1", port=8080, api_key="test-api-key-12345")
     
     # Store a memory
-    r = await db.remember(
+    memory_id = await db.remember(
         "Marie Curie discovered radium.", 
         metadata={"triples": [("Marie Curie", "discovered", "radium")]}
     )
-    print(f"Stored: {r['id']}")
+    print(f"Stored: {memory_id}")
     
     # Semantic Query
     res = await db.query("Marie Curie discoveries", k=1)
-    print(f"Query match: {res[0]['text']} (Score: {res[0]['score']})")
+    if res:
+        print(f"Query match: {res[0].text} (Score: {res[0].score})")
     
     # Entity Graph
     graph = await db.entity_graph("Marie Curie")
     print(f"Graph: {graph}")
     
     await db.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
