@@ -14,6 +14,11 @@ SHARD0_DIR = tempfile.mkdtemp(prefix="epochdb_shard0_")
 SHARD1_DIR = tempfile.mkdtemp(prefix="epochdb_shard1_")
 SHARD2_DIR = tempfile.mkdtemp(prefix="epochdb_shard2_")
 
+PORT_COORD = 18080
+PORT_S0 = 18081
+PORT_S1 = 18082
+PORT_S2 = 18083
+
 @pytest.fixture(scope="module", autouse=True)
 def run_cluster():
     processes = []
@@ -23,7 +28,7 @@ def run_cluster():
     env0["NODE_MODE"] = "shard"
     env0["STORAGE_DIR"] = SHARD0_DIR
     p0 = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", "8081"],
+        [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S0)],
         env=env0, stdout=sys.stderr, stderr=sys.stderr
     )
     processes.append(p0)
@@ -33,7 +38,7 @@ def run_cluster():
     env1["NODE_MODE"] = "shard"
     env1["STORAGE_DIR"] = SHARD1_DIR
     p1 = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", "8082"],
+        [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S1)],
         env=env1, stdout=sys.stderr, stderr=sys.stderr
     )
     processes.append(p1)
@@ -43,7 +48,7 @@ def run_cluster():
     env2["NODE_MODE"] = "shard"
     env2["STORAGE_DIR"] = SHARD2_DIR
     p2 = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", "8083"],
+        [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S2)],
         env=env2, stdout=sys.stderr, stderr=sys.stderr
     )
     processes.append(p2)
@@ -51,9 +56,9 @@ def run_cluster():
     # 4. Start Coordinator Gateway
     env_coord = os.environ.copy()
     env_coord["NODE_MODE"] = "coordinator"
-    env_coord["SHARD_NODES"] = "http://127.0.0.1:8081,http://127.0.0.1:8082,http://127.0.0.1:8083"
+    env_coord["SHARD_NODES"] = f"http://127.0.0.1:{PORT_S0},http://127.0.0.1:{PORT_S1},http://127.0.0.1:{PORT_S2}"
     p_coord = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", "8080"],
+        [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_COORD)],
         env=env_coord, stdout=sys.stderr, stderr=sys.stderr
     )
     processes.append(p_coord)
@@ -69,10 +74,10 @@ def run_cluster():
                 pytest.fail(f"Server subprocess {p.args} failed to start.")
                 
         try:
-            resp_coord = httpx.get("http://127.0.0.1:8080/stats", timeout=1.0)
-            resp_s0 = httpx.get("http://127.0.0.1:8081/stats", timeout=1.0)
-            resp_s1 = httpx.get("http://127.0.0.1:8082/stats", timeout=1.0)
-            resp_s2 = httpx.get("http://127.0.0.1:8083/stats", timeout=1.0)
+            resp_coord = httpx.get(f"http://127.0.0.1:{PORT_COORD}/stats", timeout=1.0)
+            resp_s0 = httpx.get(f"http://127.0.0.1:{PORT_S0}/stats", timeout=1.0)
+            resp_s1 = httpx.get(f"http://127.0.0.1:{PORT_S1}/stats", timeout=1.0)
+            resp_s2 = httpx.get(f"http://127.0.0.1:{PORT_S2}/stats", timeout=1.0)
             if (resp_coord.status_code == 200 and 
                 resp_s0.status_code == 200 and 
                 resp_s1.status_code == 200 and 
@@ -103,10 +108,11 @@ def run_cluster():
 @pytest.mark.asyncio
 async def test_cluster_operations():
     # Initialize clients for Coordinator and Shards
-    coord_db = AsyncRemoteEpochDB(host="127.0.0.1", port=8080)
-    shard0 = AsyncRemoteEpochDB(host="127.0.0.1", port=8081)
-    shard1 = AsyncRemoteEpochDB(host="127.0.0.1", port=8082)
-    shard2 = AsyncRemoteEpochDB(host="127.0.0.1", port=8083)
+    coord_db = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_COORD)
+    shard0 = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_S0)
+    shard1 = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_S1)
+    shard2 = AsyncRemoteEpochDB(host="127.0.0.1", port=PORT_S2)
+
 
     try:
         # 1. Ingest memories through coordinator
