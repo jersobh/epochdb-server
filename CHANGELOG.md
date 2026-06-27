@@ -17,6 +17,10 @@ All notable changes to the EpochDB Distributed Server project will be documented
 - **Urllib-Based Health Probes**:
   - Added a `/healthz` endpoint on shards (readiness indicator) and the coordinator (which polls shards' health).
   - Integrated Docker `healthcheck` blocks in `docker-compose.yml` leveraging Python's built-in `urllib` to check container status without requiring external curl binaries.
+- **Docker Hub Build & Publish Workflow**:
+  - Added a GitHub Actions workflow `.github/workflows/docker-publish.yml` to build, tag (using SemVer and branch metadata), and publish the `jersobh/epochdb` image to Docker Hub automatically on tag and branch pushes.
+
+
 
 ---
 
