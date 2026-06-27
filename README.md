@@ -1,6 +1,13 @@
 # EpochDB Distributed Server
 
+[![Docker Pulls](https://img.shields.io/docker/pulls/jersobh/epochdb)](https://hub.docker.com/r/jersobh/epochdb)
+[![Docker Image Version (latest by date)](https://img.shields.io/docker/v/jersobh/epochdb?sort=date)](https://hub.docker.com/r/jersobh/epochdb)
+[![Publish](https://img.shields.io/github/actions/workflow/status/jersobh/epochdb-server/docker-publish.yml)](https://github.com/jersobh/epochdb-server/actions/workflows/docker-publish.yml)
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/jersobh/epochdb-server)](https://github.com/jersobh/epochdb-server/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 EpochDB Distributed Server is an asynchronous, high-concurrency memory and vector database server designed for agentic workloads. It supports multi-node clustering with automatic horizontal sharding, consistent hashing write distribution, and direct prefix-based routing.
+
 
 ---
 
