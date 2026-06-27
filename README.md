@@ -72,7 +72,43 @@ This will run:
 - `shard2` at `http://localhost:8083`
 - `coordinator` gateway at `http://localhost:8080` (public interface)
 
+### Running from Docker Hub Image
+
+You can pull and run a node directly from the Docker Hub registry:
+
+#### 1. Pull the Image
+```bash
+docker pull jersobh/epochdb:latest
+```
+
+#### 2. Run as a Shard Node (Storage Node)
+Start a shard storage node, binding it to port `8080` on the host, and mounting a local directory to persist SQLite data, Parquet archives, and vector indexes:
+```bash
+docker run -d \
+  --name epochdb-shard \
+  -p 8080:8080 \
+  -e NODE_MODE=shard \
+  -e STORAGE_DIR=/data \
+  -e INTERNAL_AUTH_TOKEN=your-secure-internal-token \
+  -v /absolute/path/to/local/data:/data \
+  jersobh/epochdb:latest
+```
+
+#### 3. Run as a Coordinator Node (Gateway Router)
+Start a gateway router node that distributes queries across backend shards:
+```bash
+docker run -d \
+  --name epochdb-coordinator \
+  -p 8080:8080 \
+  -e NODE_MODE=coordinator \
+  -e SHARD_NODES=http://shard0-ip:8080,http://shard1-ip:8080 \
+  -e API_KEY=your-client-api-key \
+  -e INTERNAL_AUTH_TOKEN=your-secure-internal-token \
+  jersobh/epochdb:latest
+```
+
 ### Local Configuration
+
 Environment variables used by the server:
 - `NODE_MODE`: `"shard"` (default) or `"coordinator"`.
 - `SHARD_NODES`: Comma-separated list of backend shard URLs (e.g. `http://shard0:8080,http://shard1:8080`). Required in coordinator mode.
