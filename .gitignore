@@ -1,0 +1,32 @@
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local EpochDB Storage & Databases
+shared_memory/
+*.db
+*.db-shm
+*.db-wal
+*.hnsw
+*.parquet
+wal.jsonl
+access_deltas.json
+cascade_graph.json
+metadata.json
+
+# Environment Variables
+.env
+
+# OS-specific
+.DS_Store
+Thumbs.db

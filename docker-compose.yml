@@ -1,0 +1,51 @@
+services:
+  shard0:
+    build: .
+    container_name: epochdb-shard0
+    ports:
+      - "8081:8080"
+    environment:
+      - NODE_MODE=shard
+      - STORAGE_DIR=/data
+    volumes:
+      - shard0_data:/data
+
+  shard1:
+    build: .
+    container_name: epochdb-shard1
+    ports:
+      - "8082:8080"
+    environment:
+      - NODE_MODE=shard
+      - STORAGE_DIR=/data
+    volumes:
+      - shard1_data:/data
+
+  shard2:
+    build: .
+    container_name: epochdb-shard2
+    ports:
+      - "8083:8080"
+    environment:
+      - NODE_MODE=shard
+      - STORAGE_DIR=/data
+    volumes:
+      - shard2_data:/data
+
+  coordinator:
+    build: .
+    container_name: epochdb-coordinator
+    ports:
+      - "8080:8080"
+    environment:
+      - NODE_MODE=coordinator
+      - SHARD_NODES=http://shard0:8080,http://shard1:8080,http://shard2:8080
+    depends_on:
+      - shard0
+      - shard1
+      - shard2
+
+volumes:
+  shard0_data:
+  shard1_data:
+  shard2_data:

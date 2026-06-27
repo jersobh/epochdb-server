@@ -1,0 +1,29 @@
+[project]
+name = "epochdb-server"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "jersobh",email = "jersobh@gmail.com"}
+]
+license = "MIT"
+package-mode = false
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "epochdb (==1.2.0)",
+    "uvicorn (>=0.49.0,<0.50.0)",
+    "fastapi (>=0.138.1,<0.139.0)",
+    "pydantic (>=2.13.4,<3.0.0)",
+    "sentence-transformers (>=5.6.0,<6.0.0)",
+    "httpx (>=0.28.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.1.1,<10.0.0)",
+    "pytest-asyncio (>=1.4.0,<2.0.0)"
+]
