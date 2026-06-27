@@ -337,18 +337,19 @@ sanitizer = ["nvidia-cuda-sanitizer-api (==13.0.85.*) ; sys_platform == \"linux\
 
 [[package]]
 name = "epochdb"
-version = "1.2.0"
+version = "1.3.0"
 description = "An agentic memory engine designed for lossless, tiered verbatim storage and multi-hop retrieval."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "epochdb-1.2.0-py3-none-any.whl", hash = "sha256:6858ea868bbf3f8dbd38ee7390966f502b0a7bd8d5af9bb017cb57dc95d74d7b"},
-    {file = "epochdb-1.2.0.tar.gz", hash = "sha256:2da5a6111db29a7a575e1bb69b362bdd008ea6baff46e9bcff10d0fa39352322"},
+    {file = "epochdb-1.3.0-py3-none-any.whl", hash = "sha256:3702da0370eed9fd63cc565c4c23824c936b12d0c0380b9b502c1462b7edf785"},
+    {file = "epochdb-1.3.0.tar.gz", hash = "sha256:2c3dc66f469cc1d01138134448e3aeb6112c4c1c030e43924a450d1fd62d279c"},
 ]
 
 [package.dependencies]
 hnswlib = "*"
+httpx = "*"
 intervaltree = "*"
 numpy = "*"
 pint = "*"
@@ -2555,4 +2556,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "e3be9b741cd1b69fb873a1b22282d3ba3a7f3a0b879ab0fae5d0c8e72f446bda"
+content-hash = "c9d662d5a93aaed7347ba837484c944349f5f65dd5e83f91e801fca74992b222"
