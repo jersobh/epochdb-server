@@ -1,0 +1,1399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EpochDB Knowledge Graph Explorer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/3d-force-graph"></script>
+    <style>
+        :root {
+            --bg-color: #000000;
+            --panel-bg: rgba(20, 20, 20, 0.75);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --text-main: #f4f4f5;
+            --text-muted: #a1a1aa;
+            --accent: #f97316;
+            --accent-grad: linear-gradient(135deg, #f97316 0%, #ff8c3a 100%);
+            --btn-grad: linear-gradient(135deg, #ea580c 0%, #f97316 100%);
+            --success: #22c55e;
+            --error: #ef4444;
+            --btn-bg: rgba(255, 255, 255, 0.05);
+            --card-bg: rgba(255, 255, 255, 0.02);
+            --item-bg: rgba(255, 255, 255, 0.03);
+            --shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.7);
+        }
+
+        body.light-mode {
+            --bg-color: #ffffff;
+            --panel-bg: rgba(244, 244, 245, 0.85);
+            --border-color: rgba(9, 9, 11, 0.1);
+            --text-main: #09090b;
+            --text-muted: #71717a;
+            --accent: #ea580c;
+            --accent-grad: linear-gradient(135deg, #ea580c 0%, #f97316 100%);
+            --btn-grad: linear-gradient(135deg, #ea580c 0%, #f97316 100%);
+            --success: #16a34a;
+            --error: #dc2626;
+            --btn-bg: rgba(9, 9, 11, 0.05);
+            --card-bg: rgba(9, 9, 11, 0.02);
+            --item-bg: rgba(9, 9, 11, 0.03);
+            --shadow: 0 12px 40px 0 rgba(9, 9, 11, 0.15);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body, html {
+            width: 100vw;
+            height: 100%;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            overflow: hidden;
+            transition: background-color 0.3s, color 0.3s;
+        }
+
+        #graph-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        #graph-canvas {
+            width: 100%;
+            height: 100%;
+        }
+
+        .sidebar {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 390px;
+            bottom: 20px;
+            z-index: 10;
+            background: var(--panel-bg);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            overflow-y: auto;
+            box-shadow: var(--shadow);
+            scrollbar-width: thin;
+            scrollbar-color: var(--border-color) transparent;
+            transition: background-color 0.3s, border-color 0.3s, box-shadow 0.3s;
+        }
+
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 16px;
+            margin-bottom: 8px;
+        }
+
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .logo-text {
+            font-size: 22px;
+            font-weight: 800;
+            background: var(--accent-grad);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: 0.5px;
+        }
+
+        .mode-badge {
+            background: var(--btn-bg);
+            border: 1px solid var(--border-color);
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--accent);
+            margin-left: auto;
+        }
+
+        .theme-toggle-btn {
+            background: var(--btn-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background-color 0.2s, border-color 0.2s;
+            margin-left: 8px;
+        }
+
+        .theme-toggle-btn:hover {
+            border-color: var(--accent);
+            background: rgba(249, 115, 22, 0.1);
+        }
+
+        /* Collapsible Accordion sections */
+        .accordion-item {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .accordion-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            padding: 8px 0;
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            user-select: none;
+            transition: color 0.2s;
+        }
+
+        .accordion-header:hover {
+            color: var(--text-main);
+        }
+
+        .accordion-header::after {
+            content: '▲';
+            font-size: 9px;
+            transition: transform 0.2s ease;
+        }
+
+        .accordion-header.collapsed::after {
+            transform: rotate(180deg);
+        }
+
+        .accordion-content {
+            max-height: 800px;
+            overflow-y: auto;
+            transition: max-height 0.3s cubic-bezier(0, 1, 0, 1), opacity 0.3s ease;
+            opacity: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-top: 8px;
+            padding-bottom: 8px;
+        }
+
+        .accordion-content.collapsed {
+            max-height: 0;
+            opacity: 0;
+            overflow: hidden;
+            margin: 0;
+            padding: 0;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px;
+            transition: background-color 0.3s, border-color 0.3s;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        label {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+
+        input, select, textarea {
+            background: var(--btn-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 10px 14px;
+            color: var(--text-main);
+            font-family: inherit;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.2s, background-color 0.2s, color 0.2s;
+        }
+
+        input:focus, select:focus, textarea:focus {
+            border-color: var(--accent);
+            background: rgba(249, 115, 22, 0.05);
+        }
+
+        /* Custom range slider styling (orange theme) */
+        input[type="range"] {
+            -webkit-appearance: none;
+            width: 100%;
+            height: 6px;
+            background: var(--btn-bg);
+            border-radius: 3px;
+            outline: none;
+            border: 1px solid var(--border-color);
+            cursor: pointer;
+            padding: 0;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: var(--accent);
+            cursor: pointer;
+            box-shadow: 0 2px 6px rgba(249, 115, 22, 0.4);
+            transition: background-color 0.2s, transform 0.1s;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.1);
+        }
+
+        input[type="range"]::-moz-range-thumb {
+            width: 16px;
+            height: 16px;
+            border: none;
+            border-radius: 50%;
+            background: var(--accent);
+            cursor: pointer;
+            box-shadow: 0 2px 6px rgba(249, 115, 22, 0.4);
+            transition: background-color 0.2s, transform 0.1s;
+        }
+
+        input[type="range"]::-moz-range-thumb:hover {
+            transform: scale(1.1);
+        }
+
+        .btn {
+            background: var(--btn-grad);
+            border: none;
+            border-radius: 8px;
+            padding: 12px 16px;
+            color: #fff;
+            font-family: inherit;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s, transform 0.1s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            box-shadow: 0 4px 14px rgba(249, 115, 22, 0.2);
+        }
+
+        .btn:hover {
+            opacity: 0.9;
+        }
+
+        .btn:active {
+            transform: scale(0.98);
+        }
+
+        .btn-secondary {
+            background: var(--btn-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            box-shadow: none;
+            transition: background-color 0.2s, border-color 0.2s, color 0.2s;
+        }
+
+        .btn-secondary:hover {
+            background: rgba(249, 115, 22, 0.1);
+            border-color: var(--accent);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .stat-box {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .stat-value {
+            font-size: 20px;
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .stat-label {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+        }
+
+        .node-inspector {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .node-name-header {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-main);
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .connections-list {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            max-height: 250px;
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+
+        .connections-list li {
+            background: var(--item-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 8px 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+        }
+
+        .relation-badge {
+            background: rgba(249, 115, 22, 0.15);
+            color: var(--accent);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        .node-link {
+            color: var(--accent);
+            text-decoration: none;
+            cursor: pointer;
+        }
+
+        .node-link:hover {
+            text-decoration: underline;
+        }
+
+        /* Timeline CSS */
+        .timeline-container {
+            max-height: 200px;
+            overflow-y: auto;
+            padding-left: 10px;
+            border-left: 2px solid var(--border-color);
+            margin-left: 6px;
+            position: relative;
+        }
+
+        .timeline-list {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .timeline-item {
+            position: relative;
+            padding-left: 16px;
+        }
+
+        .timeline-dot {
+            position: absolute;
+            left: -21px;
+            top: 4px;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent);
+            border: 2px solid var(--bg-color);
+            box-shadow: 0 0 0 2px var(--border-color);
+        }
+
+        .timeline-meta {
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+
+        .timeline-body {
+            font-size: 12px;
+            color: var(--text-main);
+            line-height: 1.4;
+        }
+
+        /* Semantic search results styling */
+        .query-results-list {
+            max-height: 280px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            padding-right: 4px;
+        }
+
+        .search-result-card {
+            background: var(--item-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            transition: border-color 0.2s;
+        }
+
+        .search-result-card:hover {
+            border-color: rgba(249, 115, 22, 0.3);
+        }
+
+        .entity-badge {
+            background: rgba(249, 115, 22, 0.1);
+            border: 1px solid rgba(249, 115, 22, 0.2);
+            color: var(--accent);
+            font-size: 11px;
+            font-weight: 500;
+            padding: 2px 6px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.2s, border-color 0.2s;
+        }
+
+        .entity-badge:hover {
+            background: rgba(249, 115, 22, 0.2);
+            border-color: var(--accent);
+        }
+
+        .tooltip {
+            position: absolute;
+            background: var(--panel-bg);
+            backdrop-filter: blur(8px);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 8px 14px;
+            font-size: 14px;
+            color: var(--text-main);
+            pointer-events: none;
+            z-index: 1000;
+            display: none;
+            box-shadow: var(--shadow);
+        }
+
+        /* Modal Auth styling */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.85);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+
+        .modal-overlay.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .modal-content {
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 24px;
+            padding: 40px;
+            width: 440px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            box-shadow: var(--shadow);
+        }
+
+        .modal-title {
+            font-size: 24px;
+            font-weight: 800;
+            text-align: center;
+            margin-bottom: 8px;
+        }
+
+        .toast-notification {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px 24px;
+            z-index: 9999;
+            box-shadow: var(--shadow);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            transform: translateY(100px);
+            opacity: 0;
+            transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), opacity 0.3s;
+        }
+
+        .toast-notification.active {
+            transform: translateY(0);
+            opacity: 1;
+        }
+
+        .toast-icon {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            color: #fff;
+        }
+
+        .toast-success .toast-icon {
+            background: var(--success);
+        }
+
+        .toast-error .toast-icon {
+            background: var(--error);
+        }
+
+        .no-data {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-muted);
+            font-size: 16px;
+            padding: 40px;
+            text-align: center;
+        }
+
+        .search-results-list {
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            max-height: 150px;
+            overflow-y: auto;
+            position: absolute;
+            width: calc(100% - 48px);
+            z-index: 100;
+            display: none;
+        }
+
+        .search-results-item {
+            padding: 8px 12px;
+            cursor: pointer;
+            font-size: 13px;
+            color: var(--text-main);
+        }
+
+        .search-results-item:hover {
+            background: var(--item-bg);
+            color: var(--accent);
+        }
+    </style>
+</head>
+<body>
+
+    <div id="graph-container">
+        <div id="graph-canvas"></div>
+    </div>
+
+    <div class="sidebar">
+        <div class="logo-container">
+            <div class="logo-icon">
+                <img src="/logo.png" alt="Logo" style="width: 32px; height: 32px; object-fit: contain; border-radius: 6px;">
+            </div>
+            <div class="logo-text">EpochDB</div>
+            <span class="mode-badge" id="server-mode">Shard</span>
+            <button class="theme-toggle-btn" id="theme-toggle" onclick="toggleTheme()" title="Switch Theme">&#9788;</button>
+        </div>
+
+        <!-- Ingest Memory Accordion -->
+        <div class="accordion-item">
+            <div class="accordion-header" onclick="toggleAccordion(this)">Ingest Memory</div>
+            <div class="accordion-content card">
+                <div class="form-group">
+                    <label for="ingest-text">Memory Text</label>
+                    <textarea id="ingest-text" placeholder="Albert Einstein was a theoretical physicist." rows="3" style="resize: none;"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="ingest-triples">Triples (Optional)</label>
+                    <input type="text" id="ingest-triples" placeholder="Albert Einstein, is_a, physicist">
+                    <div style="font-size: 10px; color: var(--text-muted); margin-top: 2px;">
+                        Format: Subj, pred, obj (semicolon separated for multiples)
+                    </div>
+                </div>
+                <button class="btn" onclick="ingestMemory()">Ingest Memory</button>
+            </div>
+        </div>
+
+        <!-- Semantic Search Accordion -->
+        <div class="accordion-item">
+            <div class="accordion-header collapsed" onclick="toggleAccordion(this)">Semantic Query</div>
+            <div class="accordion-content card collapsed">
+                <div class="form-group">
+                    <label for="query-input">Search Query</label>
+                    <input type="text" id="query-input" placeholder="E.g. relativity theory">
+                </div>
+                <div class="form-group">
+                    <label for="query-k">Limit (k)</label>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <input type="range" id="query-k" min="1" max="10" value="3" oninput="document.getElementById('k-val').innerText = this.value" style="flex: 1;">
+                        <span id="k-val" style="font-size: 13px; min-width: 15px;">3</span>
+                    </div>
+                </div>
+                <button class="btn" onclick="semanticSearch()">Search</button>
+                <div id="query-results" class="query-results-list" style="margin-top: 8px; display: none;"></div>
+            </div>
+        </div>
+
+        <!-- Query Graph Accordion -->
+        <div class="accordion-item">
+            <div class="accordion-header" onclick="toggleAccordion(this)">Query Graph</div>
+            <div class="accordion-content card">
+                <div class="form-group" style="position: relative;">
+                    <label for="search-input">Search / Focus Entity</label>
+                    <input type="text" id="search-input" placeholder="Type entity name..." autocomplete="off">
+                    <div class="search-results-list" id="search-results"></div>
+                </div>
+                <button class="btn btn-secondary" onclick="clearFocus()">Reset Zoom</button>
+            </div>
+        </div>
+
+        <!-- Subgraph Filter Accordion -->
+        <div class="accordion-item">
+            <div class="accordion-header" onclick="toggleAccordion(this)">Subgraph Filter</div>
+            <div class="accordion-content card">
+                <div class="form-group">
+                    <label for="subgraph-node">Center Entity</label>
+                    <input type="text" id="subgraph-node" placeholder="E.g. Apple (leave blank for all)">
+                </div>
+                <div class="form-group">
+                    <label for="subgraph-depth">Depth</label>
+                    <select id="subgraph-depth">
+                        <option value="1">1 Hop</option>
+                        <option value="2" selected>2 Hops</option>
+                        <option value="3">3 Hops</option>
+                    </select>
+                </div>
+                <button class="btn" onclick="loadGraph()">Filter Graph</button>
+            </div>
+        </div>
+
+        <!-- Entity Inspector Accordion (Hidden by default, shown when node selected) -->
+        <div id="inspector-panel" style="display: none;" class="accordion-item">
+            <div class="accordion-header" onclick="toggleAccordion(this)">Entity Inspector</div>
+            <div class="accordion-content card node-inspector">
+                <div class="node-name-header" id="node-name">Entity</div>
+                <div class="form-group">
+                    <label>Relations / Connections</label>
+                    <div id="node-details"></div>
+                </div>
+                <div class="form-group" style="margin-top: 8px;">
+                    <label>History Timeline</label>
+                    <div id="node-timeline" class="timeline-container"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Graph Settings Accordion -->
+        <div class="accordion-item">
+            <div class="accordion-header collapsed" onclick="toggleAccordion(this)">Graph Settings</div>
+            <div class="accordion-content card collapsed">
+                <div class="form-group">
+                    <label for="slider-repulsion">Simulation Repulsion</label>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <input type="range" id="slider-repulsion" min="10" max="500" step="10" value="120" oninput="updateGraphSetting('repulsion', parseFloat(this.value)); document.getElementById('repulsion-val').innerText = this.value" style="flex: 1;">
+                        <span id="repulsion-val" style="font-size: 13px; min-width: 25px;">120</span>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="slider-gravity">Simulation Gravity</label>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <input type="range" id="slider-gravity" min="0.05" max="1.5" step="0.05" value="0.75" oninput="updateGraphSetting('gravity', parseFloat(this.value)); document.getElementById('gravity-val').innerText = this.value" style="flex: 1;">
+                        <span id="gravity-val" style="font-size: 13px; min-width: 25px;">0.75</span>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="slider-friction">Simulation Friction (Decay)</label>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <input type="range" id="slider-friction" min="0.1" max="0.9" step="0.05" value="0.4" oninput="updateGraphSetting('friction', parseFloat(this.value)); document.getElementById('friction-val').innerText = this.value" style="flex: 1;">
+                        <span id="friction-val" style="font-size: 13px; min-width: 25px;">0.4</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- System Metrics Accordion -->
+        <div class="accordion-item">
+            <div class="accordion-header" onclick="toggleAccordion(this)">System Metrics</div>
+            <div class="accordion-content card">
+                <div class="stats-grid">
+                    <div class="stat-box">
+                        <div class="stat-value" id="stat-memories">0</div>
+                        <div class="stat-label">Memories</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="stat-l1">0</div>
+                        <div class="stat-label">L1 Cache</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Admin Operations Accordion -->
+        <div class="accordion-item">
+            <div class="accordion-header collapsed" onclick="toggleAccordion(this)">Admin Operations</div>
+            <div class="accordion-content card collapsed">
+                <button class="btn btn-secondary" onclick="triggerCompaction()" style="margin-bottom: 8px;">Trigger Compaction</button>
+                <button class="btn" onclick="seedMockData()">Seed Mock Data</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="tooltip" id="tooltip"></div>
+
+    <!-- Auth Modal Overlay -->
+    <div class="modal-overlay" id="auth-modal">
+        <div class="modal-content">
+            <div class="modal-title">Authorize Access</div>
+            <div style="color: var(--text-muted); font-size: 13px; text-align: center; margin-top: -10px;">
+                Enter authorization key to connect to your EpochDB gateway.
+            </div>
+            <div class="form-group">
+                <label for="auth-token">Access Token / API Key</label>
+                <input type="password" id="auth-token" placeholder="Enter key...">
+            </div>
+            <button class="btn" onclick="submitAuth()">Authenticate</button>
+        </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div class="toast-notification" id="toast">
+        <div class="toast-icon" id="toast-icon">&check;</div>
+        <div id="toast-message">Operation successful</div>
+    </div>
+
+    <script>
+        let Graph = null;
+        let currentNodes = [];
+        let currentEdges = [];
+        let mouseX = 0;
+        let mouseY = 0;
+
+        // Capture mouse moves globally for tooltips if needed
+        document.addEventListener('mousemove', (e) => {
+            mouseX = e.pageX;
+            mouseY = e.pageY;
+        });
+
+        // Accordion helper function
+        window.toggleAccordion = function(header) {
+            header.classList.toggle('collapsed');
+            const content = header.nextElementSibling;
+            content.classList.toggle('collapsed');
+        };
+
+        // Ingest Memory
+        window.ingestMemory = async function() {
+            const text = document.getElementById('ingest-text').value.trim();
+            const triplesRaw = document.getElementById('ingest-triples').value.trim();
+            if (!text) {
+                showToast("Please enter memory text.", "error");
+                return;
+            }
+
+            let triples = [];
+            if (triplesRaw) {
+                const parts = triplesRaw.split(';');
+                for (let part of parts) {
+                    const items = part.split(',').map(s => s.trim());
+                    if (items.length === 3) {
+                        triples.push([items[0], items[1], items[2]]);
+                    } else if (items.length > 0 && items[0]) {
+                        showToast("Invalid triple format: must be Subj, pred, obj", "error");
+                        return;
+                    }
+                }
+            }
+
+            try {
+                showToast("Ingesting memory...", "success");
+                const payload = { text };
+                if (triples.length > 0) {
+                    payload.metadata = { triples };
+                }
+                await apiRequest('/remember', 'POST', payload);
+                showToast("Memory ingested successfully!", "success");
+                document.getElementById('ingest-text').value = '';
+                document.getElementById('ingest-triples').value = '';
+                await loadGraph();
+                await loadStats();
+            } catch (err) {
+                showToast("Ingest failed: " + err.message, "error");
+            }
+        };
+
+        // Seed Mock Data
+        window.seedMockData = async function() {
+            const mockData = [
+                { text: "Albert Einstein was a theoretical physicist born in Germany.", metadata: { triples: [["Albert Einstein", "is_a", "theoretical physicist"], ["Albert Einstein", "born_in", "Germany"]] } },
+                { text: "Albert Einstein formulated the theory of relativity in 1905 and 1915.", metadata: { triples: [["Albert Einstein", "formulated", "theory of relativity"]] } },
+                { text: "Albert Einstein won the Nobel Prize in Physics in 1921 for his explanation of the photoelectric effect.", metadata: { triples: [["Albert Einstein", "won", "Nobel Prize in Physics"]] } },
+                { text: "Albert Einstein attended the historic Solvay Conference in Brussels.", metadata: { triples: [["Albert Einstein", "attended", "Solvay Conference"]] } },
+                { text: "Marie Curie discovered radium and polonium, launching the study of radioactivity.", metadata: { triples: [["Marie Curie", "discovered", "radium"], ["Marie Curie", "discovered", "polonium"]] } },
+                { text: "Marie Curie won the Nobel Prize in Physics in 1903 and the Nobel Prize in Chemistry in 1911.", metadata: { triples: [["Marie Curie", "won", "Nobel Prize in Physics"], ["Marie Curie", "won", "Nobel Prize in Chemistry"]] } },
+                { text: "Marie Curie attended the Solvay Conference alongside Einstein.", metadata: { triples: [["Marie Curie", "attended", "Solvay Conference"]] } },
+                { text: "Max Planck formulated the quantum theory, introducing the Planck constant.", metadata: { triples: [["Max Planck", "formulated", "quantum theory"]] } },
+                { text: "Max Planck won the Nobel Prize in Physics in 1918.", metadata: { triples: [["Max Planck", "won", "Nobel Prize in Physics"]] } },
+                { text: "Max Planck attended the Solvay Conference as one of its founders.", metadata: { triples: [["Max Planck", "attended", "Solvay Conference"]] } },
+                { text: "Ernest Rutherford formulated the planetary model of the atom.", metadata: { triples: [["Ernest Rutherford", "formulated", "atomic model"]] } },
+                { text: "Ernest Rutherford won the Nobel Prize in Chemistry in 1908.", metadata: { triples: [["Ernest Rutherford", "won", "Nobel Prize in Chemistry"]] } },
+                { text: "Ernest Rutherford attended the Solvay Conference and discussed nuclear structures.", metadata: { triples: [["Ernest Rutherford", "attended", "Solvay Conference"]] } },
+                { text: "Niels Bohr formulated the Bohr model of the atom, incorporating quantum theory.", metadata: { triples: [["Niels Bohr", "formulated", "Bohr model"]] } },
+                { text: "Niels Bohr won the Nobel Prize in Physics in 1922.", metadata: { triples: [["Niels Bohr", "won", "Nobel Prize in Physics"]] } },
+                { text: "Niels Bohr attended the Solvay Conference and engaged in famous debates with Einstein.", metadata: { triples: [["Niels Bohr", "attended", "Solvay Conference"]] } },
+                { text: "Werner Heisenberg formulated the uncertainty principle in quantum mechanics.", metadata: { triples: [["Werner Heisenberg", "formulated", "uncertainty principle"]] } },
+                { text: "Werner Heisenberg won the Nobel Prize in Physics in 1932.", metadata: { triples: [["Werner Heisenberg", "won", "Nobel Prize in Physics"]] } },
+                { text: "Werner Heisenberg attended the Solvay Conference in 1927.", metadata: { triples: [["Werner Heisenberg", "attended", "Solvay Conference"]] } },
+                { text: "The theory of relativity revolutionized modern physics by altering our understanding of space and time.", metadata: { triples: [["theory of relativity", "revolutionized", "modern physics"]] } },
+                { text: "Quantum theory revolutionized modern physics by introducing probability and discrete energy states.", metadata: { triples: [["quantum theory", "revolutionized", "modern physics"]] } },
+                { text: "The Bohr model was built on the foundations of Rutherford's atomic model.", metadata: { triples: [["Bohr model", "built_on", "atomic model"]] } },
+                { text: "The uncertainty principle was built on Planck's quantum theory.", metadata: { triples: [["uncertainty principle", "built_on", "quantum theory"]] } },
+                { text: "Radium is a highly radioactive element discovered in pitchblende.", metadata: { triples: [["radium", "is_a", "radioactive element"]] } },
+                { text: "Polonium is a highly radioactive element named after Marie Curie's homeland, Poland.", metadata: { triples: [["polonium", "is_a", "radioactive element"]] } },
+                { text: "Max Planck was born in Germany and studied at Munich.", metadata: { triples: [["Max Planck", "born_in", "Germany"]] } },
+                { text: "Werner Heisenberg was born in Germany and studied under Sommerfeld.", metadata: { triples: [["Werner Heisenberg", "born_in", "Germany"]] } },
+                { text: "Niels Bohr was born in Denmark and founded the Institute for Theoretical Physics.", metadata: { triples: [["Niels Bohr", "born_in", "Denmark"]] } },
+                { text: "Marie Curie was born in Poland and moved to France for her studies.", metadata: { triples: [["Marie Curie", "born_in", "Poland"]] } },
+                { text: "Ernest Rutherford was born in New Zealand and conducted research in Canada and England.", metadata: { triples: [["Ernest Rutherford", "born_in", "New Zealand"]] } },
+                { text: "Germany is a European nation central to early quantum research.", metadata: { triples: [["Germany", "is_in", "Europe"]] } },
+                { text: "Denmark is a European country where the Copenhagen interpretation was developed.", metadata: { triples: [["Denmark", "is_in", "Europe"]] } },
+                { text: "Poland is a European country in Eastern Europe.", metadata: { triples: [["Poland", "is_in", "Europe"]] } }
+            ];
+
+            try {
+                showToast("Seeding mock memories...", "success");
+                for (const item of mockData) {
+                    await apiRequest('/remember', 'POST', item);
+                }
+                showToast("Successfully seeded mock data!", "success");
+                await loadGraph();
+                await loadStats();
+            } catch (err) {
+                showToast("Seeding failed: " + err.message, "error");
+            }
+        };
+
+        // Semantic search
+        window.semanticSearch = async function() {
+            const query = document.getElementById('query-input').value.trim();
+            const k = parseInt(document.getElementById('query-k').value);
+            const container = document.getElementById('query-results');
+            
+            if (!query) {
+                showToast("Please enter a query.", "error");
+                return;
+            }
+
+            try {
+                container.innerHTML = '<div style="color: var(--text-muted); font-size: 13px;">Searching...</div>';
+                container.style.display = 'block';
+                
+                const data = await apiRequest('/query', 'POST', { query, k });
+                const results = data.results || [];
+                container.innerHTML = '';
+                
+                if (results.length === 0) {
+                    container.innerHTML = '<div style="color: var(--text-muted); font-size: 13px;">No matching memories found.</div>';
+                    return;
+                }
+
+                for (const r of results) {
+                    const div = document.createElement('div');
+                    div.className = 'search-result-card';
+                    
+                    const scorePercent = Math.round((r.score || 0) * 100);
+                    const scoreColor = `hsl(${scorePercent * 1.2}, 70%, 45%)`;
+                    
+                    const dateStr = r.created_at ? new Date(r.created_at * 1000).toLocaleString() : 'Unknown';
+                    
+                    // Extract unique entities referenced
+                    const entities = [];
+                    if (r.metadata && r.metadata.triples) {
+                        for (const [s, p, o] of r.metadata.triples) {
+                            if (!entities.includes(s)) entities.push(s);
+                            if (!entities.includes(o)) entities.push(o);
+                        }
+                    }
+
+                    const entityBadges = entities.map(e => `<span class="entity-badge" onclick="focusNodeByName('${e.replace(/'/g, "\\'")}')">${e}</span>`).join(' ');
+
+                    div.innerHTML = `
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                            <span style="font-size: 11px; color: var(--text-muted);">${dateStr}</span>
+                            <span style="font-size: 11px; font-weight: 700; color: ${scoreColor}; border: 1px solid ${scoreColor}; padding: 1px 5px; border-radius: 4px;">${scorePercent}% Match</span>
+                        </div>
+                        <div style="font-size: 13px; line-height: 1.4; color: var(--text-main); margin-bottom: 8px;">${r.text || r.payload}</div>
+                        ${entityBadges ? `<div style="display: flex; flex-wrap: wrap; gap: 4px; border-top: 1px solid var(--border-color); padding-top: 6px;">${entityBadges}</div>` : ''}
+                    `;
+                    container.appendChild(div);
+                }
+            } catch (err) {
+                container.innerHTML = `<div style="color: var(--error); font-size: 13px;">Search failed: ${err.message}</div>`;
+            }
+        };
+
+        // Graph Settings dynamic update
+        window.updateGraphSetting = function(key, value) {
+            if (Graph) {
+                if (key === 'repulsion') {
+                    Graph.d3Force('charge').strength(-value);
+                } else if (key === 'gravity') {
+                    Graph.d3Force('center').x(0).y(0).z(0);
+                } else if (key === 'friction') {
+                    Graph.d3VelocityDecay(value);
+                }
+                Graph.d3ReheatSimulation();
+            }
+        };
+
+        // Initialize Theme preference from localStorage on start
+        const savedTheme = localStorage.getItem('epochdb_theme') || 'dark';
+        if (savedTheme === 'light') {
+            document.body.classList.add('light-mode');
+        }
+        updateThemeButton(savedTheme === 'light');
+
+        window.toggleTheme = function() {
+            const body = document.body;
+            const isLight = body.classList.toggle('light-mode');
+            localStorage.setItem('epochdb_theme', isLight ? 'light' : 'dark');
+            updateThemeButton(isLight);
+            
+            if (Graph) {
+                Graph.backgroundColor(isLight ? '#ffffff' : '#000000');
+                Graph.linkColor(link => isLight ? 'rgba(9, 9, 11, 0.25)' : 'rgba(255, 255, 255, 0.25)');
+            }
+        };
+
+        function updateThemeButton(isLight) {
+            const btn = document.getElementById('theme-toggle');
+            if (isLight) {
+                btn.innerHTML = '&#9790;'; // Moon symbol
+                btn.title = 'Switch to Dark Mode';
+            } else {
+                btn.innerHTML = '&#9788;'; // Sun symbol
+                btn.title = 'Switch to Light Mode';
+            }
+        }
+
+        // Expose helper functions globally
+        window.focusNodeByName = function(name) {
+            if (Graph) {
+                const nodes = Graph.graphData().nodes;
+                const node = nodes.find(n => n.id === name);
+                if (node) {
+                    const distance = 80;
+                    const distRatio = 1 + distance/Math.hypot(node.x, node.y, node.z);
+                    Graph.cameraPosition(
+                        { x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio },
+                        node,
+                        1200
+                    );
+                    selectNodeByName(node.id);
+                }
+            }
+        };
+
+        window.clearFocus = function() {
+            if (Graph) {
+                Graph.cameraPosition(
+                    { x: 0, y: 0, z: 220 },
+                    { x: 0, y: 0, z: 0 },
+                    1000
+                );
+            }
+            document.getElementById('inspector-panel').style.display = 'none';
+        };
+
+        window.submitAuth = function() {
+            const token = document.getElementById('auth-token').value;
+            localStorage.setItem('epochdb_token', token);
+            document.getElementById('auth-modal').classList.remove('active');
+            initApp();
+        };
+
+        window.triggerCompaction = async function() {
+            try {
+                showToast("Initiating database compaction...", "success");
+                await apiRequest('/compact', 'POST');
+                showToast("Database compacted successfully!", "success");
+                loadGraph();
+                loadStats();
+            } catch (err) {
+                showToast("Compaction failed: " + err.message, "error");
+            }
+        };
+
+        window.loadGraph = async function() {
+            const centerNode = document.getElementById('subgraph-node').value.trim();
+            const depth = document.getElementById('subgraph-depth').value;
+            
+            let url = '/entity_graph';
+            if (centerNode) {
+                url += `?entity_id=${encodeURIComponent(centerNode)}&depth=${depth}`;
+            }
+            
+            try {
+                const data = await apiRequest(url);
+                renderGraph(data);
+            } catch (err) {
+                console.error("Failed to load entity graph:", err);
+                showToast("Failed to fetch graph data", "error");
+            }
+        };
+
+        // Initialize application state
+        async function initApp() {
+            // Check if token is passed in URL query parameter
+            const urlParams = new URLSearchParams(window.location.search);
+            const urlToken = urlParams.get('token');
+            if (urlToken) {
+                localStorage.setItem('epochdb_token', urlToken);
+                // Clean URL query parameter so it doesn't leak in history/bookmarks
+                window.history.replaceState({}, document.title, window.location.pathname);
+            }
+
+            try {
+                const health = await fetch('/healthz').then(r => r.json());
+                localStorage.setItem('epochdb_mode', health.mode);
+                document.getElementById('server-mode').innerText = health.mode;
+                
+                await loadStats();
+                await loadGraph();
+            } catch (err) {
+                if (err.message === 'Unauthorized') {
+                    showAuthModal(true);
+                } else {
+                    showToast("Server connection error: " + err.message, "error");
+                }
+            }
+        }
+
+        async function loadStats() {
+            try {
+                const stats = await apiRequest('/stats');
+                document.getElementById('stat-memories').innerText = stats.memory_count !== undefined ? stats.memory_count : 'N/A';
+                document.getElementById('stat-l1').innerText = stats.l1_size !== undefined ? stats.l1_size : 'N/A';
+            } catch (err) {
+                console.error("Failed to load stats:", err);
+            }
+        }
+
+        async function apiRequest(endpoint, method = 'GET', body = null) {
+            const mode = localStorage.getItem('epochdb_mode') || 'shard';
+            const token = localStorage.getItem('epochdb_token') || '';
+            const headers = {
+                'Content-Type': 'application/json',
+            };
+            if (token) {
+                if (mode === 'coordinator') {
+                    headers['X-API-Key'] = token;
+                } else {
+                    headers['X-Internal-Token'] = token;
+                }
+            }
+            const config = { method, headers };
+            if (body) {
+                config.body = JSON.stringify(body);
+            }
+            
+            const res = await fetch(endpoint, config);
+            if (res.status === 401) {
+                showAuthModal(true);
+                throw new Error('Unauthorized');
+            }
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || 'API request failed');
+            }
+            return res.json();
+        }
+
+        function showAuthModal(show) {
+            const modal = document.getElementById('auth-modal');
+            if (show) {
+                modal.classList.add('active');
+            } else {
+                modal.classList.remove('active');
+            }
+        }
+
+        function showToast(message, type = 'success') {
+            const toast = document.getElementById('toast');
+            const icon = document.getElementById('toast-icon');
+            const msg = document.getElementById('toast-message');
+            
+            toast.className = 'toast-notification';
+            if (type === 'success') {
+                toast.classList.add('toast-success');
+                icon.innerHTML = '&check;';
+            } else {
+                toast.classList.add('toast-error');
+                icon.innerHTML = '&#9888;';
+            }
+            
+            msg.innerText = message;
+            toast.classList.add('active');
+            setTimeout(() => {
+                toast.classList.remove('active');
+            }, 4000);
+        }
+
+        function renderGraph(graphData) {
+            const container = document.getElementById('graph-canvas');
+            container.innerHTML = '';
+            
+            const rawNodes = graphData.nodes || [];
+            currentEdges = graphData.edges || [];
+            
+            if (rawNodes.length === 0) {
+                container.innerHTML = '<div class="no-data">No entities in the knowledge graph. Remember memories with triples or click "Seed Mock Data" below to build the graph!</div>';
+                return;
+            }
+
+            // Map standard nodes to { id: name } structure for 3D force graph
+            const nodes = rawNodes.map(name => ({ id: name }));
+            currentNodes = rawNodes;
+
+            const isLight = document.body.classList.contains('light-mode');
+            
+            // Build the graph using 3D Force Graph library
+            Graph = ForceGraph3D()(container)
+                .graphData({ nodes, links: currentEdges })
+                .backgroundColor(isLight ? '#ffffff' : '#000000')
+                .nodeLabel('id')
+                .nodeColor(node => isLight ? '#ea580c' : '#f97316')
+                .nodeVal(node => {
+                    const deg = currentEdges.filter(e => {
+                        const src = typeof e.source === 'object' ? e.source.id : e.source;
+                        const tgt = typeof e.target === 'object' ? e.target.id : e.target;
+                        return src === node.id || tgt === node.id;
+                    }).length;
+                    return Math.max(2, deg * 1.5);
+                })
+                .nodeResolution(20)
+                .linkLabel(link => {
+                    const pred = link.predicate || link.type || 'relates';
+                    return `<div style="background: rgba(15,15,15,0.9); border: 1px solid rgba(255,255,255,0.1); color: #fff; padding: 4px 8px; border-radius: 6px; font-size: 11px; font-family: Inter;">${pred}</div>`;
+                })
+                .linkColor(link => isLight ? 'rgba(9, 9, 11, 0.25)' : 'rgba(255, 255, 255, 0.25)')
+                .linkWidth(1.2)
+                .linkDirectionalArrowLength(4.5)
+                .linkDirectionalArrowRelPos(0.95)
+                .linkDirectionalParticles(2)
+                .linkDirectionalParticleWidth(1.5)
+                .linkDirectionalParticleSpeed(0.006)
+                .onNodeClick(node => {
+                    if (node) {
+                        const distance = 80;
+                        const distRatio = 1 + distance/Math.hypot(node.x, node.y, node.z);
+                        Graph.cameraPosition(
+                            { x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio },
+                            node,
+                            1200
+                        );
+                        selectNodeByName(node.id);
+                    } else {
+                        clearFocus();
+                    }
+                });
+
+            // Adjust default forces
+            const repulsion = parseFloat(document.getElementById('slider-repulsion').value);
+            const friction = parseFloat(document.getElementById('slider-friction').value);
+
+            Graph.d3Force('charge').strength(-repulsion);
+            Graph.d3VelocityDecay(friction);
+
+            // Handle window resizing
+            window.addEventListener('resize', () => {
+                const width = document.getElementById('graph-container').clientWidth;
+                const height = document.getElementById('graph-container').clientHeight;
+                Graph.width(width).height(height);
+            });
+            
+            setupAutocomplete();
+        }
+
+        function selectNodeByName(nodeName) {
+            document.getElementById('inspector-panel').style.display = 'block';
+            
+            const inspectorHeader = document.querySelector('#inspector-panel .accordion-header');
+            if (inspectorHeader.classList.contains('collapsed')) {
+                toggleAccordion(inspectorHeader);
+            }
+
+            document.getElementById('node-name').innerText = nodeName;
+            
+            const details = document.getElementById('node-details');
+            details.innerHTML = '';
+            
+            const connections = currentEdges.filter(e => {
+                const src = typeof e.source === 'object' ? e.source.id : e.source;
+                const tgt = typeof e.target === 'object' ? e.target.id : e.target;
+                return src === nodeName || tgt === nodeName;
+            });
+
+            if (connections.length === 0) {
+                details.innerHTML = '<div style="color: var(--text-muted); font-size: 13px;">No connections detected.</div>';
+            } else {
+                const ul = document.createElement('ul');
+                ul.className = 'connections-list';
+                for (const c of connections) {
+                    const li = document.createElement('li');
+                    const srcName = typeof c.source === 'object' ? c.source.id : c.source;
+                    const tgtName = typeof c.target === 'object' ? c.target.id : c.target;
+                    
+                    const isOut = srcName === nodeName;
+                    const relatedNode = isOut ? tgtName : srcName;
+                    
+                    li.innerHTML = `
+                        <span class="relation-badge">${c.type || c.predicate || 'relates'}</span>
+                        ${isOut ? '&rarr;' : '&larr;'}
+                        <span class="node-link" onclick="focusNodeByName('${relatedNode.replace(/'/g, "\\'")}')">${relatedNode}</span>
+                    `;
+                    ul.appendChild(li);
+                }
+                details.appendChild(ul);
+            }
+
+            // Load chronological timeline
+            loadTimeline(nodeName);
+        }
+
+        async function loadTimeline(entityId) {
+            const timelineContainer = document.getElementById('node-timeline');
+            timelineContainer.innerHTML = '<div style="color: var(--text-muted); font-size: 12px; padding: 10px;">Loading timeline...</div>';
+            
+            try {
+                const res = await apiRequest('/get_timeline', 'POST', { entity_id: entityId });
+                const memories = res.memories || [];
+                timelineContainer.innerHTML = '';
+                
+                if (memories.length === 0) {
+                    timelineContainer.innerHTML = '<div style="color: var(--text-muted); font-size: 12px; padding: 10px;">No timeline items found.</div>';
+                    return;
+                }
+
+                const list = document.createElement('div');
+                list.className = 'timeline-list';
+                
+                for (const m of memories) {
+                    const item = document.createElement('div');
+                    item.className = 'timeline-item';
+                    
+                    const dateStr = m.created_at ? new Date(m.created_at * 1000).toLocaleString() : 'Unknown';
+                    
+                    item.innerHTML = `
+                        <div class="timeline-dot"></div>
+                        <div class="timeline-meta">${dateStr}</div>
+                        <div class="timeline-body">${m.payload || m.text}</div>
+                    `;
+                    list.appendChild(item);
+                }
+                timelineContainer.appendChild(list);
+            } catch (err) {
+                console.error("Timeline loading failed:", err);
+                timelineContainer.innerHTML = `<div style="color: var(--error); font-size: 12px; padding: 10px;">Error loading timeline: ${err.message}</div>`;
+            }
+        }
+
+        function setupAutocomplete() {
+            const input = document.getElementById('search-input');
+            const list = document.getElementById('search-results');
+            
+            input.oninput = () => {
+                const query = input.value.trim().toLowerCase();
+                list.innerHTML = '';
+                if (!query) {
+                    list.style.display = 'none';
+                    return;
+                }
+                
+                const matches = currentNodes.filter(n => n.toLowerCase().includes(query));
+                if (matches.length === 0) {
+                    list.style.display = 'none';
+                    return;
+                }
+                
+                for (const m of matches.slice(0, 10)) {
+                    const div = document.createElement('div');
+                    div.className = 'search-results-item';
+                    div.innerText = m;
+                    div.onclick = () => {
+                        input.value = m;
+                        list.style.display = 'none';
+                        focusNodeByName(m);
+                    };
+                    list.appendChild(div);
+                }
+                list.style.display = 'block';
+            };
+            
+            document.addEventListener('click', (e) => {
+                if (e.target !== input && e.target !== list) {
+                    list.style.display = 'none';
+                }
+            });
+        }
+
+        // Start initialization
+        initApp();
+    </script>
+</body>
+</html>

@@ -10,6 +10,7 @@ import httpx
 import numpy as np
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status, Security, Depends
+from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
@@ -81,15 +82,18 @@ async def verify_auth(
     x_api_key: Optional[str] = Security(api_key_header),
     x_internal_token: Optional[str] = Security(internal_token_header)
 ):
+    api_key = os.getenv("API_KEY")
+    internal_auth_token = os.getenv("INTERNAL_AUTH_TOKEN")
+    
     if NODE_MODE == "coordinator":
-        if API_KEY and x_api_key != API_KEY:
+        if api_key and x_api_key != api_key:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing X-API-Key header."
             )
     else:
         token = x_internal_token or x_api_key
-        if INTERNAL_AUTH_TOKEN and token != INTERNAL_AUTH_TOKEN:
+        if internal_auth_token and token != internal_auth_token:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or missing X-Internal-Token header."
@@ -477,7 +481,7 @@ async def delete_memory(payload: DeletePayload):
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/entity_graph", dependencies=[Depends(verify_auth)])
-async def entity_graph(entity_id: str, depth: int = 2):
+async def entity_graph(entity_id: Optional[str] = None, depth: int = 2):
     """
     Retrieves the local entity graph or aggregates the distributed graph.
     """
@@ -485,7 +489,11 @@ async def entity_graph(entity_id: str, depth: int = 2):
         if not client:
             raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
             
-        tasks = [client.get(f"{shard}/entity_graph?entity_id={entity_id}&depth={depth}") for shard in shard_nodes]
+        params = {"depth": depth}
+        if entity_id:
+            params["entity_id"] = entity_id
+            
+        tasks = [client.get(f"{shard}/entity_graph", params=params) for shard in shard_nodes]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         
         merged_nodes = set()
@@ -511,8 +519,28 @@ async def entity_graph(entity_id: str, depth: int = 2):
         if db is None:
             raise HTTPException(status_code=503, detail="Storage engine not ready.")
         try:
-            graph = await db.entity_graph(entity_id, depth)
-            return {"nodes": graph.nodes, "edges": graph.edges}
+            if not entity_id:
+                entities = await db.get_entities()
+                if not entities:
+                    return {"nodes": [], "edges": []}
+                
+                merged_nodes = set()
+                merged_edges = []
+                seen_edges = set()
+                
+                for ent in entities[:30]:
+                    graph = await db.entity_graph(ent, depth=1)
+                    for node in graph.nodes:
+                        merged_nodes.add(node)
+                    for edge in graph.edges:
+                        key = (edge.get("source"), edge.get("target"), edge.get("predicate"), edge.get("memory_id"))
+                        if key not in seen_edges:
+                            seen_edges.add(key)
+                            merged_edges.append(edge)
+                return {"nodes": list(merged_nodes), "edges": merged_edges}
+            else:
+                graph = await db.entity_graph(entity_id, depth)
+                return {"nodes": graph.nodes, "edges": graph.edges}
         except Exception as e:
             logger.error(f"Error retrieving entity graph for {entity_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
@@ -619,6 +647,25 @@ async def compact():
         except Exception as e:
             logger.error(f"Compaction runtime error occurred: {str(e)}")
             raise HTTPException(status_code=500, detail="Compaction execution failure.")
+
+@app.get("/logo.png")
+async def get_logo():
+    logo_path = os.path.join(os.path.dirname(__file__), "logo-epoch.png")
+    if os.path.exists(logo_path):
+        return FileResponse(logo_path)
+    absolute_logo = "/home/jeff/Projects/epochdb-server/src/logo-epoch.png"
+    if os.path.exists(absolute_logo):
+        return FileResponse(absolute_logo)
+    raise HTTPException(status_code=404, detail="Logo not found")
+
+@app.get("/visualize", response_class=HTMLResponse)
+async def visualize():
+    template_path = os.path.join(os.path.dirname(__file__), "visualize.html")
+    if os.path.exists(template_path):
+        with open(template_path, "r", encoding="utf-8") as f:
+            html_content = f.read()
+        return HTMLResponse(content=html_content)
+    raise HTTPException(status_code=404, detail="Visualization template not found")
 
 # -------------------------------------------------------------------------
 # 6. Production Execution Entrypoint
