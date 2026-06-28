@@ -2,6 +2,16 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.3.1] - 2026-06-28
+
+### Added
+- **Visualizer HTML Modularization**: Separated client-side visualizer code into a dedicated, clean `visualize.html` template file.
+- **Brand Logo & Custom Sliders**: Added `/logo.png` route to serve the brand logo, replaced the placeholder infinity icon, and customized range sliders with premium orange CSS rules matching the dashboard's design system.
+- **Robust Client Query Token Integration**: Implemented automatic query string token parameter extraction, local storage persistence, and page history cleaning, ensuring persistent session state and data recovery across server restarts.
+
+### Changed
+- **Changelogs & Dependencies**: Updated dependency on `epochdb` to `==1.3.1` to incorporate database timeline recovery and AsyncEpochDB argument bug fixes.
+
 ## [0.3.0] - 2026-06-27
 
 ### Added
