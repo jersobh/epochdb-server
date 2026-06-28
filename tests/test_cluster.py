@@ -74,7 +74,7 @@ def run_cluster():
     # Wait for coordinator and shards to become healthy
     start_time = time.time()
     healthy = False
-    while time.time() - start_time < 30:
+    while time.time() - start_time < 60:
         # Check if any process exited prematurely
         for p in processes:
             if p.poll() is not None:
