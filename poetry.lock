@@ -444,14 +444,14 @@ sanitizer = ["nvidia-cuda-sanitizer-api (==13.0.85.*) ; sys_platform == \"linux\
 
 [[package]]
 name = "epochdb"
-version = "1.3.0"
+version = "1.3.1"
 description = "An agentic memory engine designed for lossless, tiered verbatim storage and multi-hop retrieval."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "epochdb-1.3.0-py3-none-any.whl", hash = "sha256:3702da0370eed9fd63cc565c4c23824c936b12d0c0380b9b502c1462b7edf785"},
-    {file = "epochdb-1.3.0.tar.gz", hash = "sha256:2c3dc66f469cc1d01138134448e3aeb6112c4c1c030e43924a450d1fd62d279c"},
+    {file = "epochdb-1.3.1-py3-none-any.whl", hash = "sha256:6beabc89c38518197ffa24aec3ee22d41954271f454d8df3438fa8fa545a001e"},
+    {file = "epochdb-1.3.1.tar.gz", hash = "sha256:256125890f8b0508dcb0059506dce1f993a59db3f5a33505f1dc6a416a5e2b23"},
 ]
 
 [package.dependencies]
@@ -469,7 +469,7 @@ zstandard = "*"
 
 [package.extras]
 all = ["google-genai (>=2.8.0,<3.0.0)", "langgraph", "sentence-transformers"]
-dev = ["google-genai (>=2.8.0,<3.0.0)", "langgraph", "pytest", "sentence-transformers"]
+dev = ["google-genai (>=2.8.0,<3.0.0)", "langgraph", "pytest", "pytest-cov", "sentence-transformers"]
 embeddings = ["sentence-transformers"]
 google = ["google-genai (>=2.8.0,<3.0.0)"]
 langgraph = ["langgraph"]
@@ -2683,4 +2683,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "ee8e804ac92bdfd7fabad02e74512c1010f644b21732d40733d323dc98e6a214"
+content-hash = "2d4c28bf6465d509b3fc6a8dc4b697a6c8ea8da1d6d0dca6db7e4f6112ff4cac"
