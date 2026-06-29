@@ -50,6 +50,12 @@ A server instance runs in one of two modes depending on environment variables:
 * **Query Re-ranking**: For semantic queries, the coordinator queries all shards in parallel and aggregates, merges, and re-ranks the results by cosine similarity score before returning the top `k` candidates.
 * **Graph Merging**: For `/entity_graph`, nodes and edges are retrieved from all shards and merged (set union) dynamically.
 
+### 3. Security & Internal Tokens
+* **Gateway Authentication**: The coordinator gateway enforces token-based authentication using the `X-API-Key` request header (configured via the `API_KEY` environment variable).
+* **Inter-Node Shard Security**: Shard nodes enforce authentication via the `X-Internal-Token` header (configured via the `INTERNAL_AUTH_TOKEN` environment variable).
+* **Header Propagation**: The coordinator gateway automatically propagates the `X-Internal-Token` to all downstream shard communication.
+* **Client SDK Integration**: The client-side wrapper `AsyncRemoteEpochDB` accepts an optional `api_key` parameter at initialization and automatically attaches the correct `X-API-Key` and `X-Internal-Token` headers.
+
 ---
 
 ## Get Started
@@ -113,6 +119,8 @@ Environment variables used by the server:
 - `NODE_MODE`: `"shard"` (default) or `"coordinator"`.
 - `SHARD_NODES`: Comma-separated list of backend shard URLs (e.g. `http://shard0:8080,http://shard1:8080`). Required in coordinator mode.
 - `STORAGE_DIR`: Local data storage directory (default: `./shared_memory`).
+- `API_KEY`: Client access API Key for the coordinator gateway (enforces `X-API-Key` header authentication).
+- `INTERNAL_AUTH_TOKEN`: Secure token used for inter-node communication between the coordinator and shards (enforces `X-Internal-Token` header authentication).
 
 ---
 
@@ -239,6 +247,10 @@ Retrieves aggregated metrics.
 ### 9. `POST /compact`
 Compact all cluster nodes.
 * **Response**: `{ "status": "compaction completed" }`
+
+### 10. `GET /visualize`
+Serves an interactive 3D Force-Directed Graph dashboard representing the stored entity/memory graph.
+* **Response**: Clean modularized HTML page (`visualize.html`) loading visualizer assets.
 
 ---
 
