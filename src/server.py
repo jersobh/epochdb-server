@@ -520,7 +520,8 @@ async def entity_graph(entity_id: Optional[str] = None, depth: int = 2):
             raise HTTPException(status_code=503, detail="Storage engine not ready.")
         try:
             if not entity_id:
-                entities = await db.get_entities()
+                engine = await db._get_db()
+                entities = await asyncio.to_thread(engine.get_entities)
                 if not entities:
                     return {"nodes": [], "edges": []}
                 
