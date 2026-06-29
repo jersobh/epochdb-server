@@ -144,8 +144,16 @@ def test_entity_graph_and_timeline():
         )
         assert resp.status_code == 201
         
-        # Query entity graph
+        # Query entity graph with specific entity_id
         resp = client.get("/entity_graph?entity_id=Apple&depth=1", headers=headers)
+        assert resp.status_code == 200
+        graph_data = resp.json()
+        assert "nodes" in graph_data
+        assert "edges" in graph_data
+        assert "Apple" in graph_data["nodes"]
+        
+        # Query entity graph without specific entity_id (returns default/all entities)
+        resp = client.get("/entity_graph", headers=headers)
         assert resp.status_code == 200
         graph_data = resp.json()
         assert "nodes" in graph_data
