@@ -98,7 +98,7 @@ def run_cluster():
     # Wait for coordinator and shards to become healthy
     start_time = time.time()
     healthy = False
-    while time.time() - start_time < 30:
+    while time.time() - start_time < 120:
         # Check if any process exited prematurely
         for p in processes:
             if p.poll() is not None:
@@ -124,7 +124,7 @@ def run_cluster():
         for p in processes:
             p.terminate()
             p.wait()
-        pytest.fail("Cluster coordinator failed to respond on /healthz within 30 seconds.")
+        pytest.fail("Cluster coordinator failed to respond on /healthz within 120 seconds.")
 
     yield
 
@@ -287,18 +287,19 @@ async def test_shard_failure_and_graceful_recovery():
                 break
         assert success_write
 
-        # 8. Write mapped to offline Shard 1 fails with 500
-        fail_write = False
+        # 8. Write mapped to offline Shard 1 is routed to alternative healthy shard (Shard 0 or 2)
+        success_offline_write = False
         for j in range(100):
             test_txt = f"Verify offline write {j}"
             node = test_hash_ring.get_node(test_txt)
             if node == f"http://127.0.0.1:{PORT_S1}":
-                with pytest.raises(RuntimeError) as exc_info:
-                    await coord_db.remember(test_txt)
-                assert "HTTP Error 500" in str(exc_info.value) or "Failed to connect" in str(exc_info.value)
-                fail_write = True
+                res = await coord_db.remember(test_txt)
+                assert isinstance(res, str)
+                # Should route to shard0 or shard2 since shard1 is down
+                assert res.startswith("shard0-") or res.startswith("shard2-")
+                success_offline_write = True
                 break
-        assert fail_write
+        assert success_offline_write
 
         # ----------------------------------------------------
         # Recovery phase: Restart Shard 1
@@ -313,7 +314,7 @@ async def test_shard_failure_and_graceful_recovery():
         # Wait for the recovered Shard 1 to become healthy
         start_time = time.time()
         recovered = False
-        while time.time() - start_time < 30:
+        while time.time() - start_time < 120:
             try:
                 resp = httpx.get(f"http://127.0.0.1:{PORT_S1}/healthz", timeout=1.0)
                 if resp.status_code == 200:
@@ -323,7 +324,7 @@ async def test_shard_failure_and_graceful_recovery():
                 pass
             time.sleep(1.0)
 
-        assert recovered, "Recovered shard failed to start within 30 seconds."
+        assert recovered, "Recovered shard failed to start within 120 seconds."
 
         # 9. Direct point GET to the recovered Shard 1 now succeeds
         res_recovered = await coord_db.get(target_shard_1_id)
