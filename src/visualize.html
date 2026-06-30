@@ -1294,7 +1294,7 @@
                     return;
                 }
                 lastGraphHash = hash;
-                renderGraph(data);
+                renderGraph(data, force);
             } catch (err) {
                 console.error("Failed to load entity graph:", err);
                 showToast("Failed to fetch graph data", "error");
@@ -1711,13 +1711,17 @@
             }, 4000);
         }
 
-        function renderGraph(graphData) {
+        function renderGraph(graphData, force = false) {
             const container = document.getElementById('graph-canvas');
             
             const rawNodes = graphData.nodes || [];
             currentEdges = graphData.edges || [];
             
             if (rawNodes.length === 0) {
+                if (!force && Graph) {
+                    // Do not wipe the active graph if a background polling tick returned empty data
+                    return;
+                }
                 container.innerHTML = '<div class="no-data">No entities in the knowledge graph. Remember memories with triples or click "Seed Test Data" below to build the graph!</div>';
                 Graph = null;
                 return;
