@@ -842,7 +842,7 @@
                         <option value="3">3 Hops</option>
                     </select>
                 </div>
-                <button class="btn" onclick="loadGraph()">Filter Graph</button>
+                <button class="btn" onclick="loadGraph(true)">Filter Graph</button>
             </div>
         </div>
 
@@ -966,6 +966,7 @@
         let mouseX = 0;
         let mouseY = 0;
         let myChart = null;
+        let lastGraphHash = null;
 
         // Capture mouse moves globally for tooltips if needed
         document.addEventListener('mousemove', (e) => {
@@ -1013,7 +1014,7 @@
                 showToast("Memory ingested successfully!", "success");
                 document.getElementById('ingest-text').value = '';
                 document.getElementById('ingest-triples').value = '';
-                await loadGraph();
+                await loadGraph(true);
                 await loadStats();
             } catch (err) {
                 showToast("Ingest failed: " + err.message, "error");
@@ -1064,7 +1065,7 @@
                     await apiRequest('/remember', 'POST', item);
                 }
                 showToast("Successfully seeded test data!", "success");
-                await loadGraph();
+                await loadGraph(true);
                 await loadStats();
             } catch (err) {
                 showToast("Seeding failed: " + err.message, "error");
@@ -1156,7 +1157,7 @@
                     await selectNodeByName(activeNodeName);
                 }
                 
-                await loadGraph();
+                await loadGraph(true);
                 await loadStats();
             } catch (err) {
                 showToast("Delete failed: " + err.message, "error");
@@ -1258,14 +1259,26 @@
                 showToast("Initiating database compaction...", "success");
                 await apiRequest('/compact', 'POST');
                 showToast("Database compacted successfully!", "success");
-                loadGraph();
+                loadGraph(true);
                 loadStats();
             } catch (err) {
                 showToast("Compaction failed: " + err.message, "error");
             }
         };
 
-        window.loadGraph = async function() {
+        function getGraphHash(graphData) {
+            if (!graphData) return '';
+            const nodes = [...(graphData.nodes || [])].sort();
+            const edges = [...(graphData.edges || [])].map(e => {
+                const s = typeof e.source === 'object' ? e.source.id : e.source;
+                const t = typeof e.target === 'object' ? e.target.id : e.target;
+                const p = e.predicate || e.type || 'relates';
+                return `${s}->${p}->${t}`;
+            }).sort();
+            return JSON.stringify({ nodes, edges });
+        }
+
+        window.loadGraph = async function(force = false) {
             const centerNode = document.getElementById('subgraph-node').value.trim();
             const depth = document.getElementById('subgraph-depth').value;
             
@@ -1276,6 +1289,11 @@
             
             try {
                 const data = await apiRequest(url);
+                const hash = getGraphHash(data);
+                if (!force && hash === lastGraphHash) {
+                    return;
+                }
+                lastGraphHash = hash;
                 renderGraph(data);
             } catch (err) {
                 console.error("Failed to load entity graph:", err);
@@ -1298,7 +1316,7 @@
                 document.getElementById('server-mode').innerText = health.mode;
                 
                 await loadStats();
-                await loadGraph();
+                await loadGraph(true);
 
                 // Setup dynamic auto-polling every 5 seconds
                 setInterval(async () => {
