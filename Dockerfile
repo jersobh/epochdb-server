@@ -17,7 +17,7 @@ ENV PYTHONPATH=/app
 RUN pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cpu \
     --extra-index-url https://pypi.org/simple \
-    "epochdb==1.3.0" \
+    "epochdb==1.3.1" \
     "uvicorn>=0.49.0,<0.50.0" \
     "fastapi>=0.138.1,<0.139.0" \
     "pydantic>=2.13.4,<3.0.0" \
