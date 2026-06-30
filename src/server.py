@@ -29,6 +29,79 @@ logging.basicConfig(
 logger = logging.getLogger("epochdb_production_server")
 
 # -------------------------------------------------------------------------
+# System Resource Profiling Helpers
+# -------------------------------------------------------------------------
+_last_cpu_times = {"total": 0.0, "idle": 0.0}
+
+def get_cpu_usage() -> float:
+    global _last_cpu_times
+    try:
+        with open("/proc/stat", "r") as f:
+            lines = f.readlines()
+        for line in lines:
+            if line.startswith("cpu "):
+                parts = [float(x) for x in line.split()[1:]]
+                idle = parts[3] + parts[4]
+                total = sum(parts)
+                
+                diff_total = total - _last_cpu_times["total"]
+                diff_idle = idle - _last_cpu_times["idle"]
+                
+                _last_cpu_times["total"] = total
+                _last_cpu_times["idle"] = idle
+                
+                if diff_total <= 0:
+                    return 0.0
+                return round(max(0.0, min(100.0, (1.0 - diff_idle / diff_total) * 100.0)), 2)
+    except Exception:
+        pass
+    return 0.0
+
+def get_ram_usage() -> Dict[str, float]:
+    try:
+        meminfo = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    key = parts[0].rstrip(":")
+                    val = float(parts[1])
+                    meminfo[key] = val
+        total = meminfo.get("MemTotal", 0.0) / 1024.0 / 1024.0
+        free = meminfo.get("MemFree", 0.0) / 1024.0 / 1024.0
+        buffers = meminfo.get("Buffers", 0.0) / 1024.0 / 1024.0
+        cached = meminfo.get("Cached", 0.0) / 1024.0 / 1024.0
+        available = meminfo.get("MemAvailable", (free + buffers + cached)) / 1024.0 / 1024.0
+        used = total - available
+        percent = (used / total * 100.0) if total > 0 else 0.0
+        return {
+            "total": round(total, 2),
+            "available": round(available, 2),
+            "used": round(used, 2),
+            "percent": round(percent, 2)
+        }
+    except Exception:
+        pass
+    return {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}
+
+def get_disk_usage(path: str = ".") -> Dict[str, float]:
+    try:
+        stat = os.statvfs(path)
+        total = (stat.f_blocks * stat.f_frsize) / (1024 ** 3)
+        available = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
+        used = total - available
+        percent = (used / total * 100.0) if total > 0 else 0.0
+        return {
+            "total": round(total, 2),
+            "available": round(available, 2),
+            "used": round(used, 2),
+            "percent": round(percent, 2)
+        }
+    except Exception:
+        pass
+    return {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}
+
+# -------------------------------------------------------------------------
 # 2. Clustering Configuration & Consistent Hashing Ring
 # -------------------------------------------------------------------------
 class ConsistentHashRing:
@@ -70,6 +143,97 @@ NODE_MODE = os.getenv("NODE_MODE", "shard").lower()
 shard_nodes_str = os.getenv("SHARD_NODES", "")
 shard_nodes = [s.strip() for s in shard_nodes_str.split(",") if s.strip()]
 hash_ring = ConsistentHashRing(shard_nodes) if shard_nodes else None
+
+SHARD_METRICS_CACHE: Dict[str, Any] = {}
+
+async def poll_shards_loop():
+    """
+    Background loop that runs on the coordinator to poll shards for health and metrics.
+    """
+    logger.info("Starting background health polling loop for shards...")
+    while True:
+        if client:
+            try:
+                tasks = [client.get(f"{shard}/stats", timeout=2.0) for shard in shard_nodes]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                for shard, resp in zip(shard_nodes, responses):
+                    if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                            SHARD_METRICS_CACHE[shard] = {
+                                "status": "healthy",
+                                "memory_count": data.get("memory_count", 0),
+                                "l1_size": data.get("l1_size", 0),
+                                "l2_size": data.get("l2_size", 0),
+                                "entity_count": data.get("entity_count", 0),
+                                "cpu": data.get("cpu", 0.0),
+                                "ram": data.get("ram", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
+                                "disk": data.get("disk", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
+                            }
+                        except Exception as e:
+                            SHARD_METRICS_CACHE[shard] = {
+                                "status": "unhealthy",
+                                "error": f"Failed to parse stats: {str(e)}",
+                                "cpu": 0.0,
+                                "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                                "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                            }
+                    else:
+                        err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                        SHARD_METRICS_CACHE[shard] = {
+                            "status": "unhealthy",
+                            "error": err_msg,
+                            "cpu": 0.0,
+                            "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                            "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                        }
+            except Exception as e:
+                logger.error(f"Error in poll_shards_loop execution: {e}")
+        await asyncio.sleep(5)
+
+def get_healthy_shard(key: str) -> str:
+    """
+    Selects the target shard for a key using consistent hashing.
+    If the target node is unhealthy or overloaded (CPU/RAM/Disk > 90%),
+    it routes to the next healthy alternative shard in the ring.
+    """
+    if not shard_nodes:
+        raise HTTPException(status_code=500, detail="No shards available to route write request.")
+    
+    primary_node = hash_ring.get_node(key)
+    
+    def is_node_good(node: str) -> bool:
+        metrics = SHARD_METRICS_CACHE.get(node)
+        if not metrics:
+            return True
+        if metrics.get("status") != "healthy":
+            return False
+        
+        cpu = metrics.get("cpu", 0.0)
+        ram_pct = metrics.get("ram", {}).get("percent", 0.0)
+        disk_pct = metrics.get("disk", {}).get("percent", 0.0)
+        
+        if cpu > 90.0 or ram_pct > 90.0 or disk_pct > 90.0:
+            return False
+        return True
+
+    if is_node_good(primary_node):
+        return primary_node
+
+    for node in shard_nodes:
+        if node != primary_node and is_node_good(node):
+            logger.warning(f"Routing key '{key[:20]}...' to healthy fallback node {node} instead of overloaded/unhealthy {primary_node}")
+            return node
+
+    for node in shard_nodes:
+        metrics = SHARD_METRICS_CACHE.get(node)
+        if metrics and metrics.get("status") == "healthy":
+            logger.warning(f"Routing to overloaded but alive fallback node {node}")
+            return node
+
+    logger.warning(f"All nodes unhealthy/offline. Routing to default consistent-hashing node {primary_node}")
+    return primary_node
+
 
 # Security credentials and API key headers configuration
 API_KEY = os.getenv("API_KEY")
@@ -138,7 +302,13 @@ async def lifespan(app: FastAPI):
         if INTERNAL_AUTH_TOKEN:
             headers["X-Internal-Token"] = INTERNAL_AUTH_TOKEN
         client = httpx.AsyncClient(headers=headers, timeout=30.0)
+        polling_task = asyncio.create_task(poll_shards_loop())
         yield
+        polling_task.cancel()
+        try:
+            await polling_task
+        except asyncio.CancelledError:
+            pass
         await client.aclose()
         logger.info("Coordinator HTTP client session closed cleanly.")
     else:
@@ -242,34 +412,77 @@ async def remember(payload: MemoryPayload):
             raise HTTPException(status_code=500, detail="No shard nodes available to route write request.")
         
         target_shard = None
-        atom_id = payload.id
+        original_predefined_id = payload.id
         
-        if atom_id:
-            # If predefined ID is provided and contains a valid prefix, route to that shard
-            target_shard = get_shard_for_id(atom_id)
-            if not target_shard:
-                # Prepend prefix if it's not prefixed
-                target_shard = hash_ring.get_node(payload.text)
-                shard_idx = shard_nodes.index(target_shard)
-                atom_id = f"shard{shard_idx}-{atom_id}"
-        else:
-            # Generate prefixed UUID
-            target_shard = hash_ring.get_node(payload.text)
-            shard_idx = shard_nodes.index(target_shard)
-            atom_id = f"shard{shard_idx}-{uuid.uuid4().hex}"
+        max_attempts = 3
+        attempt = 0
+        tried_nodes = set()
+        
+        while attempt < max_attempts:
+            attempt += 1
             
-        try:
-            target_payload = {
-                "text": payload.text,
-                "metadata": payload.metadata,
-                "id": atom_id
-            }
-            res = await client.post(f"{target_shard}/remember", json=target_payload)
-            res.raise_for_status()
-            return {"status": "success", "id": atom_id}
-        except Exception as e:
-            logger.error(f"Failed to forward write to shard {target_shard}: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to forward write to shard: {str(e)}")
+            if original_predefined_id:
+                # If predefined ID is provided and contains a valid prefix, route to that shard
+                target_shard = get_shard_for_id(original_predefined_id)
+                if target_shard:
+                    atom_id = original_predefined_id
+                else:
+                    # Prepend prefix using health-based routing
+                    target_shard = get_healthy_shard(payload.text)
+                    shard_idx = shard_nodes.index(target_shard)
+                    atom_id = f"shard{shard_idx}-{original_predefined_id}"
+            else:
+                # Generate prefixed UUID, using health-based routing
+                target_shard = get_healthy_shard(payload.text)
+                shard_idx = shard_nodes.index(target_shard)
+                atom_id = f"shard{shard_idx}-{uuid.uuid4().hex}"
+                
+            # If the chosen target shard has already failed in this request cycle, fallback
+            if target_shard in tried_nodes:
+                alternative = None
+                for node in shard_nodes:
+                    if node not in tried_nodes:
+                        metrics = SHARD_METRICS_CACHE.get(node)
+                        if metrics and metrics.get("status") == "healthy":
+                            alternative = node
+                            break
+                if not alternative:
+                    for node in shard_nodes:
+                        if node not in tried_nodes:
+                            alternative = node
+                            break
+                if alternative:
+                    target_shard = alternative
+                    shard_idx = shard_nodes.index(target_shard)
+                    if original_predefined_id:
+                        atom_id = f"shard{shard_idx}-{original_predefined_id}"
+                    else:
+                        atom_id = f"shard{shard_idx}-{uuid.uuid4().hex}"
+                else:
+                    break
+                    
+            tried_nodes.add(target_shard)
+            
+            try:
+                target_payload = {
+                    "text": payload.text,
+                    "metadata": payload.metadata,
+                    "id": atom_id
+                }
+                res = await client.post(f"{target_shard}/remember", json=target_payload)
+                res.raise_for_status()
+                return {"status": "success", "id": atom_id}
+            except Exception as e:
+                logger.error(f"Failed to forward write to shard {target_shard} on attempt {attempt}: {e}")
+                # Immediately update cache to mark shard offline to prevent picking it again
+                SHARD_METRICS_CACHE[target_shard] = {
+                    "status": "offline",
+                    "cpu": 0.0,
+                    "ram": {"percent": 0.0},
+                    "disk": {"percent": 0.0}
+                }
+                if attempt >= max_attempts:
+                    raise HTTPException(status_code=500, detail=f"Failed to forward write to shard: {str(e)}")
             
     else:
         # Shard Mode (Storage Node)
@@ -520,7 +733,8 @@ async def entity_graph(entity_id: Optional[str] = None, depth: int = 2):
             raise HTTPException(status_code=503, detail="Storage engine not ready.")
         try:
             if not entity_id:
-                entities = await db.get_entities()
+                engine = await db._get_db()
+                entities = await asyncio.to_thread(engine.get_entities)
                 if not entities:
                     return {"nodes": [], "edges": []}
                 
@@ -598,25 +812,69 @@ async def stats():
         total_l2_size = 0
         total_entity_count = 0
         
-        for resp in responses:
+        shards_metrics = {}
+        for shard, resp in zip(shard_nodes, responses):
             if isinstance(resp, httpx.Response) and resp.status_code == 200:
-                data = resp.json()
-                total_memory_count += data.get("memory_count", 0)
-                total_l1_size += data.get("l1_size", 0)
-                total_l2_size += data.get("l2_size", 0)
-                total_entity_count += data.get("entity_count", 0)
+                try:
+                    data = resp.json()
+                    total_memory_count += data.get("memory_count", 0)
+                    total_l1_size += data.get("l1_size", 0)
+                    total_l2_size += data.get("l2_size", 0)
+                    total_entity_count += data.get("entity_count", 0)
+                    
+                    shards_metrics[shard] = {
+                        "status": "healthy",
+                        "memory_count": data.get("memory_count", 0),
+                        "l1_size": data.get("l1_size", 0),
+                        "l2_size": data.get("l2_size", 0),
+                        "entity_count": data.get("entity_count", 0),
+                        "cpu": data.get("cpu", 0.0),
+                        "ram": data.get("ram", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
+                        "disk": data.get("disk", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
+                    }
+                except Exception as e:
+                    shards_metrics[shard] = {
+                        "status": "unhealthy",
+                        "error": f"Failed to parse response: {str(e)}",
+                        "cpu": 0.0,
+                        "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                        "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                    }
+            else:
+                err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                shards_metrics[shard] = {
+                    "status": "unhealthy",
+                    "error": err_msg,
+                    "cpu": 0.0,
+                    "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                    "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                }
                 
+        coord_system = {
+            "cpu": get_cpu_usage(),
+            "ram": get_ram_usage(),
+            "disk": get_disk_usage(os.getenv("STORAGE_DIR", "."))
+        }
+        
         return {
+            "mode": "coordinator",
             "memory_count": total_memory_count,
             "l1_size": total_l1_size,
             "l2_size": total_l2_size,
-            "entity_count": total_entity_count
+            "entity_count": total_entity_count,
+            "system": coord_system,
+            "shards": shards_metrics
         }
     else:
         if db is None:
             raise HTTPException(status_code=503, detail="Storage engine not ready.")
         try:
-            return await db.stats()
+            db_stats = await db.stats()
+            db_stats["mode"] = "shard"
+            db_stats["cpu"] = get_cpu_usage()
+            db_stats["ram"] = get_ram_usage()
+            db_stats["disk"] = get_disk_usage(os.getenv("STORAGE_DIR", "./shared_memory"))
+            return db_stats
         except Exception as e:
             logger.error(f"Unable to safely pull analytical parameters: {str(e)}")
             raise HTTPException(status_code=500, detail="Stats access blocked.")
