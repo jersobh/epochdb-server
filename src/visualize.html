@@ -8,6 +8,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <script src="https://unpkg.com/3d-force-graph"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --bg-color: #000000;
@@ -71,6 +72,125 @@
         #graph-canvas {
             width: 100%;
             height: 100%;
+        }
+
+        /* Warning Alert Banner styling */
+        .warning-banner {
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.2) 0%, rgba(249, 115, 22, 0.2) 100%);
+            border: 1px solid rgba(239, 68, 68, 0.4);
+            border-radius: 12px;
+            padding: 12px 16px;
+            color: var(--text-main);
+            font-size: 12px;
+            line-height: 1.4;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            box-shadow: 0 4px 15px rgba(239, 68, 68, 0.15);
+            animation: pulse-border 2s infinite ease-in-out;
+        }
+
+        @keyframes pulse-border {
+            0%, 100% { border-color: rgba(239, 68, 68, 0.4); }
+            50% { border-color: rgba(249, 115, 22, 0.8); }
+        }
+
+        .warning-title {
+            font-weight: 700;
+            color: var(--error);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            text-transform: uppercase;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+        }
+        
+        .warning-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        /* Node Metrics Card & Progress Bars */
+        .node-metrics-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 14px;
+            margin-top: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        
+        .node-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .node-status-badge {
+            font-size: 10px;
+            font-weight: 700;
+            padding: 2px 6px;
+            border-radius: 4px;
+            text-transform: uppercase;
+        }
+
+        .status-online {
+            background: rgba(34, 197, 94, 0.15);
+            color: var(--success);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+        }
+
+        .status-offline {
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--error);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+
+        .status-overloaded {
+            background: rgba(249, 115, 22, 0.15);
+            color: var(--accent);
+            border: 1px solid rgba(249, 115, 22, 0.3);
+            animation: pulse-opacity 1.5s infinite;
+        }
+        
+        @keyframes pulse-opacity {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        .metric-row {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .metric-info {
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .metric-bar-outer {
+            width: 100%;
+            height: 6px;
+            background: var(--btn-bg);
+            border-radius: 3px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .metric-bar-inner {
+            height: 100%;
+            border-radius: 3px;
+            width: 0%;
+            transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
         }
 
         .sidebar {
@@ -651,6 +771,9 @@
             <button class="theme-toggle-btn" id="theme-toggle" onclick="toggleTheme()" title="Switch Theme">&#9788;</button>
         </div>
 
+        <!-- Cluster Warnings Alert Banner -->
+        <div id="cluster-warnings-container" style="display: none; margin-bottom: 8px;"></div>
+
         <!-- Ingest Memory Accordion -->
         <div class="accordion-item">
             <div class="accordion-header" onclick="toggleAccordion(this)">Ingest Memory</div>
@@ -771,7 +894,7 @@
         <div class="accordion-item">
             <div class="accordion-header" onclick="toggleAccordion(this)">System Metrics</div>
             <div class="accordion-content card">
-                <div class="stats-grid">
+                <div class="stats-grid" style="grid-template-columns: 1fr 1fr; gap: 10px; display: grid;">
                     <div class="stat-box">
                         <div class="stat-value" id="stat-memories">0</div>
                         <div class="stat-label">Memories</div>
@@ -780,6 +903,22 @@
                         <div class="stat-value" id="stat-l1">0</div>
                         <div class="stat-label">L1 Cache</div>
                     </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="stat-l2">0</div>
+                        <div class="stat-label">L2 Cache</div>
+                    </div>
+                    <div class="stat-box">
+                        <div class="stat-value" id="stat-entities">0</div>
+                        <div class="stat-label">Entities</div>
+                    </div>
+                </div>
+                
+                <!-- Node-by-Node Metrics Progress Bars -->
+                <div id="nodes-metrics-container"></div>
+                
+                <!-- Cluster Performance Charts -->
+                <div class="chart-container" id="chart-panel" style="margin-top: 15px; position: relative; height: 180px; width: 100%; display: none;">
+                    <canvas id="metricsChart"></canvas>
                 </div>
             </div>
         </div>
@@ -788,8 +927,12 @@
         <div class="accordion-item">
             <div class="accordion-header collapsed" onclick="toggleAccordion(this)">Admin Operations</div>
             <div class="accordion-content card collapsed">
-                <button class="btn btn-secondary" onclick="triggerCompaction()" style="margin-bottom: 8px;">Trigger Compaction</button>
-                <button class="btn" onclick="seedMockData()">Seed Mock Data</button>
+                <button class="btn btn-secondary" onclick="triggerCompaction()" style="margin-bottom: 8px; width: 100%;">Trigger Compaction</button>
+                <button class="btn" id="seed-test-data-btn" onclick="seedTestData()" style="width: 100%;">Seed Test Data</button>
+                <div style="display: flex; align-items: center; gap: 8px; margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 10px;">
+                    <input type="checkbox" id="hard-delete-toggle" checked style="cursor: pointer; width: 16px; height: 16px; accent-color: var(--accent);">
+                    <label for="hard-delete-toggle" style="cursor: pointer; font-size: 12px; color: var(--text-muted); user-select: none;">Hard delete memories on remove</label>
+                </div>
             </div>
         </div>
     </div>
@@ -816,13 +959,13 @@
         <div class="toast-icon" id="toast-icon">&check;</div>
         <div id="toast-message">Operation successful</div>
     </div>
-
     <script>
         let Graph = null;
         let currentNodes = [];
         let currentEdges = [];
         let mouseX = 0;
         let mouseY = 0;
+        let myChart = null;
 
         // Capture mouse moves globally for tooltips if needed
         document.addEventListener('mousemove', (e) => {
@@ -877,8 +1020,8 @@
             }
         };
 
-        // Seed Mock Data
-        window.seedMockData = async function() {
+        // Seed Test Data
+        window.seedTestData = async function() {
             const mockData = [
                 { text: "Albert Einstein was a theoretical physicist born in Germany.", metadata: { triples: [["Albert Einstein", "is_a", "theoretical physicist"], ["Albert Einstein", "born_in", "Germany"]] } },
                 { text: "Albert Einstein formulated the theory of relativity in 1905 and 1915.", metadata: { triples: [["Albert Einstein", "formulated", "theory of relativity"]] } },
@@ -916,11 +1059,11 @@
             ];
 
             try {
-                showToast("Seeding mock memories...", "success");
+                showToast("Seeding test memories...", "success");
                 for (const item of mockData) {
                     await apiRequest('/remember', 'POST', item);
                 }
-                showToast("Successfully seeded mock data!", "success");
+                showToast("Successfully seeded test data!", "success");
                 await loadGraph();
                 await loadStats();
             } catch (err) {
@@ -958,10 +1101,8 @@
                     
                     const scorePercent = Math.round((r.score || 0) * 100);
                     const scoreColor = `hsl(${scorePercent * 1.2}, 70%, 45%)`;
-                    
                     const dateStr = r.created_at ? new Date(r.created_at * 1000).toLocaleString() : 'Unknown';
                     
-                    // Extract unique entities referenced
                     const entities = [];
                     if (r.metadata && r.metadata.triples) {
                         for (const [s, p, o] of r.metadata.triples) {
@@ -971,11 +1112,15 @@
                     }
 
                     const entityBadges = entities.map(e => `<span class="entity-badge" onclick="focusNodeByName('${e.replace(/'/g, "\\'")}')">${e}</span>`).join(' ');
+                    const deleteBtnHtml = `<button class="delete-btn" onclick="deleteMemory('${r.id}')" title="Delete Memory" style="background: transparent; border: none; color: var(--error); cursor: pointer; font-size: 16px; font-weight: bold; line-height: 1; padding: 2px 6px; border-radius: 4px; transition: background-color 0.2s;">&times;</button>`;
 
                     div.innerHTML = `
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
                             <span style="font-size: 11px; color: var(--text-muted);">${dateStr}</span>
-                            <span style="font-size: 11px; font-weight: 700; color: ${scoreColor}; border: 1px solid ${scoreColor}; padding: 1px 5px; border-radius: 4px;">${scorePercent}% Match</span>
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span style="font-size: 11px; font-weight: 700; color: ${scoreColor}; border: 1px solid ${scoreColor}; padding: 1px 5px; border-radius: 4px;">${scorePercent}% Match</span>
+                                ${deleteBtnHtml}
+                            </div>
                         </div>
                         <div style="font-size: 13px; line-height: 1.4; color: var(--text-main); margin-bottom: 8px;">${r.text || r.payload}</div>
                         ${entityBadges ? `<div style="display: flex; flex-wrap: wrap; gap: 4px; border-top: 1px solid var(--border-color); padding-top: 6px;">${entityBadges}</div>` : ''}
@@ -984,6 +1129,37 @@
                 }
             } catch (err) {
                 container.innerHTML = `<div style="color: var(--error); font-size: 13px;">Search failed: ${err.message}</div>`;
+            }
+        };
+
+        // Delete memory atom
+        window.deleteMemory = async function(memoryId) {
+            const isHard = document.getElementById('hard-delete-toggle') ? document.getElementById('hard-delete-toggle').checked : true;
+            const deleteType = isHard ? "hard delete (permanent removal)" : "soft delete (mark as deleted)";
+            if (!confirm(`Are you sure you want to execute a ${deleteType} on this memory?`)) {
+                return;
+            }
+            try {
+                showToast("Deleting memory...", "success");
+                await apiRequest('/delete', 'POST', { memory_id: memoryId, hard: isHard });
+                showToast("Memory deleted successfully!", "success");
+                
+                // Refresh semantic search if a query exists
+                const query = document.getElementById('query-input').value.trim();
+                if (query) {
+                    await semanticSearch();
+                }
+                
+                // Refresh timeline if the inspector is active
+                const activeNodeName = document.getElementById('node-name').innerText;
+                if (activeNodeName && document.getElementById('inspector-panel').style.display !== 'none') {
+                    await selectNodeByName(activeNodeName);
+                }
+                
+                await loadGraph();
+                await loadStats();
+            } catch (err) {
+                showToast("Delete failed: " + err.message, "error");
             }
         };
 
@@ -1001,7 +1177,7 @@
             }
         };
 
-        // Initialize Theme preference from localStorage on start
+        // Initialize Theme preference
         const savedTheme = localStorage.getItem('epochdb_theme') || 'dark';
         if (savedTheme === 'light') {
             document.body.classList.add('light-mode');
@@ -1018,6 +1194,17 @@
                 Graph.backgroundColor(isLight ? '#ffffff' : '#000000');
                 Graph.linkColor(link => isLight ? 'rgba(9, 9, 11, 0.25)' : 'rgba(255, 255, 255, 0.25)');
             }
+            // Update charts colors on theme switch
+            if (myChart) {
+                const gridColor = isLight ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.06)';
+                const textColor = isLight ? '#09090b' : '#f4f4f5';
+                myChart.options.scales.x.grid.color = gridColor;
+                myChart.options.scales.y.grid.color = gridColor;
+                myChart.options.scales.x.ticks.color = textColor;
+                myChart.options.scales.y.ticks.color = textColor;
+                myChart.options.plugins.legend.labels.color = textColor;
+                myChart.update();
+            }
         };
 
         function updateThemeButton(isLight) {
@@ -1031,7 +1218,6 @@
             }
         }
 
-        // Expose helper functions globally
         window.focusNodeByName = function(name) {
             if (Graph) {
                 const nodes = Graph.graphData().nodes;
@@ -1099,12 +1285,10 @@
 
         // Initialize application state
         async function initApp() {
-            // Check if token is passed in URL query parameter
             const urlParams = new URLSearchParams(window.location.search);
             const urlToken = urlParams.get('token');
             if (urlToken) {
                 localStorage.setItem('epochdb_token', urlToken);
-                // Clean URL query parameter so it doesn't leak in history/bookmarks
                 window.history.replaceState({}, document.title, window.location.pathname);
             }
 
@@ -1115,6 +1299,15 @@
                 
                 await loadStats();
                 await loadGraph();
+
+                // Setup dynamic auto-polling every 5 seconds
+                setInterval(async () => {
+                    if (!document.hidden) {
+                        await loadStats();
+                        await loadGraph();
+                    }
+                }, 5000);
+
             } catch (err) {
                 if (err.message === 'Unauthorized') {
                     showAuthModal(true);
@@ -1127,11 +1320,317 @@
         async function loadStats() {
             try {
                 const stats = await apiRequest('/stats');
-                document.getElementById('stat-memories').innerText = stats.memory_count !== undefined ? stats.memory_count : 'N/A';
-                document.getElementById('stat-l1').innerText = stats.l1_size !== undefined ? stats.l1_size : 'N/A';
+                document.getElementById('stat-memories').innerText = stats.memory_count !== undefined ? stats.memory_count : '0';
+                document.getElementById('stat-l1').innerText = stats.l1_size !== undefined ? stats.l1_size : '0';
+                document.getElementById('stat-l2').innerText = stats.l2_size !== undefined ? stats.l2_size : '0';
+                document.getElementById('stat-entities').innerText = stats.entity_count !== undefined ? stats.entity_count : '0';
+
+                // Conditional display of Seed button
+                const seedBtn = document.getElementById('seed-test-data-btn');
+                if (seedBtn) {
+                    if (stats.memory_count === 0) {
+                        seedBtn.style.display = 'block';
+                    } else {
+                        seedBtn.style.display = 'none';
+                    }
+                }
+
+                // Render metrics and warnings
+                const warningsContainer = document.getElementById('cluster-warnings-container');
+                const metricsContainer = document.getElementById('nodes-metrics-container');
+                
+                let warningsHtml = '';
+                let updatedCardIds = new Set();
+
+                let chartLabels = [];
+                let cpuData = [];
+                let ramData = [];
+                let diskData = [];
+
+                if (stats.mode === 'coordinator' && stats.shards) {
+                    const shards = stats.shards;
+                    
+                    if (stats.system) {
+                        const coord = stats.system;
+                        chartLabels.push('Coordinator');
+                        cpuData.push(coord.cpu || 0);
+                        ramData.push(coord.ram ? coord.ram.percent : 0);
+                        diskData.push(coord.disk ? coord.disk.percent : 0);
+
+                        const cardId = updateNodeMetricDOM('Coordinator (Gateway)', 'healthy', coord.cpu, coord.ram, coord.disk);
+                        updatedCardIds.add(cardId);
+                    }
+
+                    for (const [shardUrl, shardData] of Object.entries(shards)) {
+                        const name = shardUrl.replace('http://', '').replace(':8080', '');
+                        const status = shardData.status || 'unhealthy';
+                        
+                        if (status !== 'healthy') {
+                            warningsHtml += `<div class="warning-item">&bull; <strong>${name}</strong> is offline / unreachable.</div>`;
+                            const cardId = updateNodeMetricDOM(name, 'offline');
+                            updatedCardIds.add(cardId);
+                            
+                            chartLabels.push(name);
+                            cpuData.push(0);
+                            ramData.push(0);
+                            diskData.push(0);
+                        } else {
+                            const cpu = shardData.cpu || 0.0;
+                            const ram = shardData.ram || {};
+                            const disk = shardData.disk || {};
+
+                            if (cpu > 90.0) {
+                                warningsHtml += `<div class="warning-item">&bull; <strong>${name}</strong> CPU usage is critical (${cpu}%).</div>`;
+                            }
+                            if (ram.percent > 90.0) {
+                                warningsHtml += `<div class="warning-item">&bull; <strong>${name}</strong> RAM usage is critical (${ram.percent}%).</div>`;
+                            }
+                            if (disk.percent > 90.0) {
+                                warningsHtml += `<div class="warning-item">&bull; <strong>${name}</strong> Disk space is low (${disk.percent}% used).</div>`;
+                            }
+
+                            const cardId = updateNodeMetricDOM(name, status, cpu, ram, disk);
+                            updatedCardIds.add(cardId);
+                            
+                            chartLabels.push(name);
+                            cpuData.push(cpu);
+                            ramData.push(ram.percent || 0);
+                            diskData.push(disk.percent || 0);
+                        }
+                    }
+                } else {
+                    const cpu = stats.cpu || 0.0;
+                    const ram = stats.ram || {};
+                    const disk = stats.disk || {};
+                    const status = 'healthy';
+
+                    if (cpu > 90.0) {
+                        warningsHtml += `<div class="warning-item">&bull; CPU usage is critical (${cpu}%).</div>`;
+                    }
+                    if (ram.percent > 90.0) {
+                        warningsHtml += `<div class="warning-item">&bull; RAM usage is critical (${ram.percent}%).</div>`;
+                    }
+                    if (disk.percent > 90.0) {
+                        warningsHtml += `<div class="warning-item">&bull; Disk space is low (${disk.percent}% used).</div>`;
+                    }
+
+                    const cardId = updateNodeMetricDOM('Local Node', status, cpu, ram, disk);
+                    updatedCardIds.add(cardId);
+
+                    chartLabels.push('Local Node');
+                    cpuData.push(cpu);
+                    ramData.push(ram.percent || 0);
+                    diskData.push(disk.percent || 0);
+                }
+
+                if (warningsHtml) {
+                    warningsContainer.innerHTML = `
+                        <div class="warning-banner">
+                            <div class="warning-title">
+                                <span>&#9888;</span> Cluster Alerts
+                            </div>
+                            <div>${warningsHtml}</div>
+                        </div>
+                    `;
+                    warningsContainer.style.display = 'block';
+                } else {
+                    warningsContainer.style.display = 'none';
+                }
+
+                // Remove any stale node cards that are no longer active
+                metricsContainer.querySelectorAll('.node-metrics-card').forEach(card => {
+                    if (!updatedCardIds.has(card.id)) {
+                        card.remove();
+                    }
+                });
+
+                document.getElementById('chart-panel').style.display = 'block';
+                updateChart(chartLabels, cpuData, ramData, diskData);
+
             } catch (err) {
                 console.error("Failed to load stats:", err);
             }
+        }
+
+        function updateNodeMetricDOM(name, status, cpu = 0, ram = {}, disk = {}) {
+            const container = document.getElementById('nodes-metrics-container');
+            const cardId = `node-card-${name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+            let card = document.getElementById(cardId);
+            
+            let statusText = 'Online';
+            let statusBadgeClass = 'status-online';
+            if (status === 'offline') {
+                statusText = 'Offline';
+                statusBadgeClass = 'status-offline';
+            } else if (cpu > 90.0 || ram.percent > 90.0 || disk.percent > 90.0) {
+                statusText = 'Overloaded';
+                statusBadgeClass = 'status-overloaded';
+            }
+
+            const ramUsed = ram.used !== undefined ? ram.used : 0;
+            const ramTotal = ram.total !== undefined ? ram.total : 0;
+            const ramPercent = ram.percent !== undefined ? ram.percent : 0;
+
+            const diskUsed = disk.used !== undefined ? disk.used : 0;
+            const diskTotal = disk.total !== undefined ? disk.total : 0;
+            const diskPercent = disk.percent !== undefined ? disk.percent : 0;
+
+            if (!card) {
+                const div = document.createElement('div');
+                div.className = 'node-metrics-card';
+                div.id = cardId;
+                
+                div.innerHTML = `
+                    <div class="node-header">
+                        <span>${name}</span>
+                        <span class="node-status-badge ${statusBadgeClass}" id="${cardId}-status">${statusText}</span>
+                    </div>
+                    <div id="${cardId}-bars" style="${status === 'offline' ? 'display: none;' : ''}">
+                        <div class="metric-row" style="margin-top: 8px;">
+                            <div class="metric-info">
+                                <span>CPU Usage</span>
+                                <span id="${cardId}-cpu-text">${cpu}%</span>
+                            </div>
+                            <div class="metric-bar-outer">
+                                <div class="metric-bar-inner" id="${cardId}-cpu-bar" style="width: ${cpu}%; background-color: ${getMetricColor(cpu)};"></div>
+                            </div>
+                        </div>
+                        <div class="metric-row" style="margin-top: 8px;">
+                            <div class="metric-info">
+                                <span>RAM (Used/Total)</span>
+                                <span id="${cardId}-ram-text">${ramUsed}GB / ${ramTotal}GB (${ramPercent}%)</span>
+                            </div>
+                            <div class="metric-bar-outer">
+                                <div class="metric-bar-inner" id="${cardId}-ram-bar" style="width: ${ramPercent}%; background-color: ${getMetricColor(ramPercent)};"></div>
+                            </div>
+                        </div>
+                        <div class="metric-row" style="margin-top: 8px;">
+                            <div class="metric-info">
+                                <span>Storage</span>
+                                <span id="${cardId}-disk-text">${diskUsed}GB / ${diskTotal}GB (${diskPercent}%)</span>
+                            </div>
+                            <div class="metric-bar-outer">
+                                <div class="metric-bar-inner" id="${cardId}-disk-bar" style="width: ${diskPercent}%; background-color: ${getMetricColor(diskPercent)};"></div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                container.appendChild(div);
+            } else {
+                const statusBadge = document.getElementById(`${cardId}-status`);
+                statusBadge.innerText = statusText;
+                statusBadge.className = `node-status-badge ${statusBadgeClass}`;
+                
+                const barsContainer = document.getElementById(`${cardId}-bars`);
+                if (status === 'offline') {
+                    barsContainer.style.display = 'none';
+                } else {
+                    barsContainer.style.display = 'block';
+                    
+                    document.getElementById(`${cardId}-cpu-text`).innerText = `${cpu}%`;
+                    const cpuBar = document.getElementById(`${cardId}-cpu-bar`);
+                    cpuBar.style.width = `${cpu}%`;
+                    cpuBar.style.backgroundColor = getMetricColor(cpu);
+                    
+                    document.getElementById(`${cardId}-ram-text`).innerText = `${ramUsed}GB / ${ramTotal}GB (${ramPercent}%)`;
+                    const ramBar = document.getElementById(`${cardId}-ram-bar`);
+                    ramBar.style.width = `${ramPercent}%`;
+                    ramBar.style.backgroundColor = getMetricColor(ramPercent);
+                    
+                    document.getElementById(`${cardId}-disk-text`).innerText = `${diskUsed}GB / ${diskTotal}GB (${diskPercent}%)`;
+                    const diskBar = document.getElementById(`${cardId}-disk-bar`);
+                    diskBar.style.width = `${diskPercent}%`;
+                    diskBar.style.backgroundColor = getMetricColor(diskPercent);
+                }
+            }
+            return cardId;
+        }
+
+        function getMetricColor(value) {
+            if (value > 85.0) return 'var(--error)';
+            if (value > 50.0) return 'var(--accent)';
+            return 'var(--success)';
+        }
+
+        function updateChart(labels, cpu, ram, disk) {
+            const isLight = document.body.classList.contains('light-mode');
+            const gridColor = isLight ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.06)';
+            const textColor = isLight ? '#09090b' : '#f4f4f5';
+
+            if (myChart) {
+                myChart.data.labels = labels;
+                myChart.data.datasets[0].data = cpu;
+                myChart.data.datasets[1].data = ram;
+                myChart.data.datasets[2].data = disk;
+                myChart.options.scales.x.grid.color = gridColor;
+                myChart.options.scales.y.grid.color = gridColor;
+                myChart.options.scales.x.ticks.color = textColor;
+                myChart.options.scales.y.ticks.color = textColor;
+                myChart.options.plugins.legend.labels.color = textColor;
+                myChart.update('none');
+                return;
+            }
+
+            const ctx = document.getElementById('metricsChart').getContext('2d');
+            myChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: 'CPU (%)',
+                            data: cpu,
+                            backgroundColor: 'rgba(249, 115, 22, 0.7)',
+                            borderColor: '#f97316',
+                            borderWidth: 1,
+                            borderRadius: 4
+                        },
+                        {
+                            label: 'RAM (%)',
+                            data: ram,
+                            backgroundColor: 'rgba(34, 197, 94, 0.7)',
+                            borderColor: '#22c55e',
+                            borderWidth: 1,
+                            borderRadius: 4
+                        },
+                        {
+                            label: 'Disk (%)',
+                            data: disk,
+                            backgroundColor: 'rgba(59, 130, 246, 0.7)',
+                            borderColor: '#3b82f6',
+                            borderWidth: 1,
+                            borderRadius: 4
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: {
+                                boxWidth: 10,
+                                font: { family: 'Inter', size: 9 },
+                                color: textColor
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: { color: gridColor },
+                            ticks: { font: { family: 'Inter', size: 9 }, color: textColor }
+                        },
+                        y: {
+                            min: 0,
+                            max: 100,
+                            grid: { color: gridColor },
+                            ticks: { font: { family: 'Inter', size: 9 }, color: textColor }
+                        }
+                    }
+                }
+            });
         }
 
         async function apiRequest(endpoint, method = 'GET', body = null) {
@@ -1196,21 +1695,75 @@
 
         function renderGraph(graphData) {
             const container = document.getElementById('graph-canvas');
-            container.innerHTML = '';
             
             const rawNodes = graphData.nodes || [];
             currentEdges = graphData.edges || [];
             
             if (rawNodes.length === 0) {
-                container.innerHTML = '<div class="no-data">No entities in the knowledge graph. Remember memories with triples or click "Seed Mock Data" below to build the graph!</div>';
+                container.innerHTML = '<div class="no-data">No entities in the knowledge graph. Remember memories with triples or click "Seed Test Data" below to build the graph!</div>';
+                Graph = null;
                 return;
             }
 
-            // Map standard nodes to { id: name } structure for 3D force graph
-            const nodes = rawNodes.map(name => ({ id: name }));
-            currentNodes = rawNodes;
+            // Map standard nodes to { id: name } structure for 3D force graph, preserving positions of existing nodes
+            let existingNodes = {};
+            if (Graph) {
+                const currentGraphData = Graph.graphData();
+                if (currentGraphData && currentGraphData.nodes) {
+                    currentGraphData.nodes.forEach(n => {
+                        existingNodes[n.id] = n;
+                    });
+                }
+            }
 
+            const nodes = rawNodes.map(name => {
+                if (existingNodes[name]) {
+                    return existingNodes[name];
+                }
+                return { id: name };
+            });
+            
+            currentNodes = rawNodes;
             const isLight = document.body.classList.contains('light-mode');
+            
+            // Check if node/edge set has actually changed to avoid simulation jumpiness
+            if (Graph) {
+                const currentGraphData = Graph.graphData();
+                const currentNodesList = (currentGraphData.nodes || []).map(n => n.id).sort();
+                const newNodesList = [...rawNodes].sort();
+                
+                let nodesChanged = JSON.stringify(currentNodesList) !== JSON.stringify(newNodesList);
+                
+                let edgesChanged = false;
+                if ((currentGraphData.links || []).length !== currentEdges.length) {
+                    edgesChanged = true;
+                } else {
+                    const serializeEdge = e => {
+                        const s = typeof e.source === 'object' ? e.source.id : e.source;
+                        const t = typeof e.target === 'object' ? e.target.id : e.target;
+                        const p = e.predicate || e.type || 'relates';
+                        return `${s}->${p}->${t}`;
+                    };
+                    const currentSerialized = currentGraphData.links.map(serializeEdge).sort();
+                    const newSerialized = currentEdges.map(serializeEdge).sort();
+                    edgesChanged = JSON.stringify(currentSerialized) !== JSON.stringify(newSerialized);
+                }
+                
+                if (!nodesChanged && !edgesChanged) {
+                    // No changes to graph structure, skip updating to avoid simulation reheating/shake
+                    setupAutocomplete();
+                    return;
+                }
+            }
+
+            // In-place dataset updates if Graph already initialized
+            if (Graph) {
+                Graph.graphData({ nodes, links: currentEdges });
+                setupAutocomplete();
+                return;
+            }
+
+            container.innerHTML = '';
             
             // Build the graph using 3D Force Graph library
             Graph = ForceGraph3D()(container)
@@ -1253,14 +1806,12 @@
                     }
                 });
 
-            // Adjust default forces
             const repulsion = parseFloat(document.getElementById('slider-repulsion').value);
             const friction = parseFloat(document.getElementById('slider-friction').value);
 
             Graph.d3Force('charge').strength(-repulsion);
             Graph.d3VelocityDecay(friction);
 
-            // Handle window resizing
             window.addEventListener('resize', () => {
                 const width = document.getElementById('graph-container').clientWidth;
                 const height = document.getElementById('graph-container').clientHeight;
@@ -1312,7 +1863,6 @@
                 details.appendChild(ul);
             }
 
-            // Load chronological timeline
             loadTimeline(nodeName);
         }
 
@@ -1338,10 +1888,14 @@
                     item.className = 'timeline-item';
                     
                     const dateStr = m.created_at ? new Date(m.created_at * 1000).toLocaleString() : 'Unknown';
+                    const deleteBtnHtml = `<button class="delete-btn" onclick="deleteMemory('${m.id}')" title="Delete Memory" style="background: transparent; border: none; color: var(--error); cursor: pointer; font-size: 16px; font-weight: bold; line-height: 1; padding: 2px 6px; border-radius: 4px; transition: background-color 0.2s;">&times;</button>`;
                     
                     item.innerHTML = `
                         <div class="timeline-dot"></div>
-                        <div class="timeline-meta">${dateStr}</div>
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                            <div class="timeline-meta">${dateStr}</div>
+                            ${deleteBtnHtml}
+                        </div>
                         <div class="timeline-body">${m.payload || m.text}</div>
                     `;
                     list.appendChild(item);

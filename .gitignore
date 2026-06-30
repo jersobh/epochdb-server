@@ -30,3 +30,8 @@ metadata.json
 # OS-specific
 .DS_Store
 Thumbs.db
+
+# Docs and Node Modules
+docs/node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/

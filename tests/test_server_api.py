@@ -178,11 +178,34 @@ def test_stats_and_compaction():
         stats = resp.json()
         assert "memory_count" in stats
         assert "l1_size" in stats
+        assert "cpu" in stats
+        assert "ram" in stats
+        assert "disk" in stats
         
         # Trigger compact
         resp = client.post("/compact", headers=headers)
         assert resp.status_code == 200
         assert resp.json() == {"status": "compaction completed"}
+
+def test_hard_delete():
+    """Verify hard delete functionality removes the record completely."""
+    headers = {"X-Internal-Token": "test-token-12345"}
+    with TestClient(app) as client:
+        # Ingest memory
+        resp = client.post("/remember", json={"text": "Temporary deletion test text."}, headers=headers)
+        assert resp.status_code == 201
+        mem_id = resp.json()["id"]
+        
+        # Hard delete
+        resp = client.post("/delete", json={"memory_id": mem_id, "hard": True}, headers=headers)
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "success"}
+        
+        # Get should return empty
+        resp = client.post("/get", json={"memory_id": mem_id}, headers=headers)
+        assert resp.status_code == 200
+        assert resp.json() == {}
+
 
 def test_coordinator_mode():
     """Verify coordinator mode routing, consistent hashing, and broadcasting using mocked shard nodes."""
