@@ -102,6 +102,9 @@ def run_cluster():
             p.wait()
         pytest.fail("Cluster coordinator failed to respond on /stats within 30 seconds.")
 
+    # Sleep to allow the coordinator's background health cache to update
+    time.sleep(6.0)
+
     yield
 
     # Clean up subprocesses
