@@ -2,8 +2,6 @@ name: Build and Publish Docker Image
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -73,7 +71,7 @@ jobs:
           type=ref,event=branch
           type=sha,format=short
           type=raw,value=${{ steps.get_version.outputs.version }}
-          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+          type=raw,value=latest,enable=true
 
 
     - name: Build and push Docker image
