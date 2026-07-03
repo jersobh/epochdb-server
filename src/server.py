@@ -16,6 +16,16 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 
 from epochdb import AsyncEpochDB
+from fastapi import Header, Query
+
+try:
+    from auth import verify_scoped_auth, Permission, get_keystore, ScopedAPIKey
+except ImportError:
+    from src.auth import verify_scoped_auth, Permission, get_keystore, ScopedAPIKey
+
+# Export variables for backward compatibility and tests
+API_KEY = os.getenv("API_KEY")
+INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
 
 
 # -------------------------------------------------------------------------
@@ -239,33 +249,45 @@ def get_healthy_shard(key: str) -> str:
     return primary_node
 
 
-# Security credentials and API key headers configuration
-API_KEY = os.getenv("API_KEY")
-INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
+# -------------------------------------------------------------------------
+# Request Context & Scoped Authentication
+# -------------------------------------------------------------------------
+class RequestContext(BaseModel):
+    tenant: Optional[str] = None
+    namespace: Optional[str] = None
+    key_info: ScopedAPIKey
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-internal_token_header = APIKeyHeader(name="X-Internal-Token", auto_error=False)
+def get_context(required_permissions: set[str]):
+    async def context_dependency(
+        x_tenant: Optional[str] = Header(None, alias="X-Tenant"),
+        x_namespace: Optional[str] = Header(None, alias="X-Namespace"),
+        tenant: Optional[str] = Query(None),
+        namespace: Optional[str] = Query(None),
+        key_info: ScopedAPIKey = Depends(verify_scoped_auth(required_permissions))
+    ) -> RequestContext:
+        req_tenant = x_tenant or tenant
+        req_namespace = x_namespace or namespace
+        
+        # Enforce key-level tenant/namespace constraints
+        if key_info.tenant is not None:
+            if req_tenant and req_tenant != key_info.tenant:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="API Key restricted to a different tenant."
+                )
+            req_tenant = key_info.tenant
+            
+        if key_info.namespace is not None:
+            if req_namespace and req_namespace != key_info.namespace:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="API Key restricted to a different namespace."
+                )
+            req_namespace = key_info.namespace
+            
+        return RequestContext(tenant=req_tenant, namespace=req_namespace, key_info=key_info)
+    return context_dependency
 
-async def verify_auth(
-    x_api_key: Optional[str] = Security(api_key_header),
-    x_internal_token: Optional[str] = Security(internal_token_header)
-):
-    api_key = os.getenv("API_KEY")
-    internal_auth_token = os.getenv("INTERNAL_AUTH_TOKEN")
-    
-    if NODE_MODE == "coordinator":
-        if api_key and x_api_key != api_key:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or missing X-API-Key header."
-            )
-    else:
-        token = x_internal_token or x_api_key
-        if internal_auth_token and token != internal_auth_token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or missing X-Internal-Token header."
-            )
 
 
 def get_shard_for_id(memory_id: str) -> Optional[str]:
@@ -286,10 +308,37 @@ def get_shard_for_id(memory_id: str) -> Optional[str]:
 # -------------------------------------------------------------------------
 # 3. Database State & Lifespan Management
 # -------------------------------------------------------------------------
-# Global reference for the async database engine instance (Shard Mode)
+# Database pool map: (tenant, namespace) -> AsyncEpochDB instance (Shard Mode)
+db_pool: Dict[tuple[Optional[str], Optional[str]], AsyncEpochDB] = {}
+# Global reference for default database engine instance for backward compatibility
 db: Optional[AsyncEpochDB] = None
 # Global HTTP client session (Coordinator Mode)
 client: Optional[httpx.AsyncClient] = None
+
+async def get_db_instance(tenant: Optional[str] = None, namespace: Optional[str] = None) -> AsyncEpochDB:
+    key = (tenant, namespace)
+    if key not in db_pool:
+        storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
+        logger.info(f"Initializing AsyncEpochDB for tenant={tenant}, namespace={namespace} under {storage_dir}")
+        engine = AsyncEpochDB(
+            storage_dir=storage_dir,
+            embedding_model="all-MiniLM-L6-v2",
+            wal_sync_interval=0.1,
+            parquet_compression="zstd",
+            parquet_compression_level=3,
+            tenant=tenant,
+            namespace=namespace
+        )
+        await engine._get_db()
+        
+        # Warmup sequence
+        try:
+            await engine.query(text="system boot warmup", k=1)
+        except Exception as e:
+            logger.error(f"Error warming up db instance {key}: {e}")
+            
+        db_pool[key] = engine
+    return db_pool[key]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -316,29 +365,24 @@ async def lifespan(app: FastAPI):
         await client.aclose()
         logger.info("Coordinator HTTP client session closed cleanly.")
     else:
-        logger.info("Initializing high-performance AsyncEpochDB engine in Shard Mode...")
-        storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
+        logger.info("Initializing default AsyncEpochDB engine in Shard Mode...")
         try:
-            async with AsyncEpochDB(
-                storage_dir=storage_dir,
-                embedding_model="all-MiniLM-L6-v2",
-                wal_sync_interval=0.1,
-                parquet_compression="zstd",
-                parquet_compression_level=3
-            ) as engine:
-                db = engine
-                
-                # --- WARM-UP SEQUENCE ---
-                logger.info("Warming up embedding model (this may take a few seconds)...")
-                await db.query(text="system boot warmup", k=1)
-                logger.info("Model warmed up. AsyncEpochDB engine successfully mounted and listening.")
-                
-                yield  # Server begins accepting HTTP requests here
-                
+            # Pre-initialize and warm up default database
+            db = await get_db_instance(None, None)
+            logger.info("Default db warmed up. AsyncEpochDB database pool ready.")
+            yield
         except Exception as e:
             logger.critical(f"Fatal error during engine startup sequence: {str(e)}")
             raise e
         finally:
+            logger.info("Closing all active database instances in pool...")
+            for key, engine in list(db_pool.items()):
+                try:
+                    await engine.close()
+                except Exception as e:
+                    logger.error(f"Failed to close engine instance {key}: {e}")
+            db_pool.clear()
+            logger.info("Database pool context exited cleanly.")
             logger.info("Database context exited cleanly. All resources released.")
 
 # Initialize FastAPI application with lifespan management
@@ -356,11 +400,13 @@ class MemoryPayload(BaseModel):
     text: str = Field(..., description="The factual memory text to write to the engine.")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional structural metadata or graph triples.")
     id: Optional[str] = Field(default=None, description="Optional unique identifier (pre-calculated or forwarded).")
+    memory_type: Optional[str] = Field(default=None, description="Optional memory type: 'general', 'episodic', 'profile', or 'working'.")
 
 class QueryPayload(BaseModel):
     query: str = Field(..., description="The semantic search or multi-hop lookup query string.")
     k: int = Field(default=1, ge=1, le=100, description="The number of candidate matches to return.")
     filters: Optional[Dict[str, Any]] = Field(default=None, description="MongoDB-style metadata filter evaluation parameters.")
+    memory_type: Optional[str] = Field(default=None, description="Optional filter by memory type: 'general', 'episodic', 'profile', or 'working'.")
 
 class GetPayload(BaseModel):
     memory_id: str = Field(..., description="The unique identifier of the memory to retrieve.")
@@ -403,8 +449,63 @@ async def healthz():
             raise HTTPException(status_code=503, detail="Storage engine not ready.")
         return {"status": "healthy", "mode": "shard"}
 
-@app.post("/remember", status_code=status.HTTP_201_CREATED, dependencies=[Depends(verify_auth)])
-async def remember(payload: MemoryPayload):
+# Helper to build headers when coordinator forwards to shards
+def get_forward_headers(ctx: RequestContext) -> Dict[str, str]:
+    headers = {}
+    if ctx.tenant:
+        headers["X-Tenant"] = ctx.tenant
+    if ctx.namespace:
+        headers["X-Namespace"] = ctx.namespace
+    if INTERNAL_AUTH_TOKEN:
+        headers["X-Internal-Token"] = INTERNAL_AUTH_TOKEN
+    return headers
+
+# Key administration schemas
+class KeyCreatePayload(BaseModel):
+    permissions: List[str]
+    tenant: Optional[str] = None
+    namespace: Optional[str] = None
+    expires_at: Optional[float] = None
+    description: Optional[str] = None
+
+# Key administration routes
+@app.post("/admin/keys", status_code=status.HTTP_201_CREATED)
+async def create_api_key(
+    payload: KeyCreatePayload,
+    ctx: RequestContext = Depends(get_context({Permission.ADMIN}))
+):
+    keystore = get_keystore()
+    key_id, raw_key = keystore.create_key(
+        permissions=payload.permissions,
+        tenant=payload.tenant,
+        namespace=payload.namespace,
+        expires_at=payload.expires_at,
+        description=payload.description
+    )
+    return {"key_id": key_id, "api_key": raw_key}
+
+@app.delete("/admin/keys/{key_id}")
+async def revoke_api_key(
+    key_id: str,
+    ctx: RequestContext = Depends(get_context({Permission.ADMIN}))
+):
+    keystore = get_keystore()
+    success = keystore.revoke_key(key_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Key not found.")
+    return {"status": "success", "message": f"Key {key_id} revoked."}
+
+@app.get("/admin/keys")
+async def list_api_keys(
+    ctx: RequestContext = Depends(get_context({Permission.ADMIN}))
+):
+    keystore = get_keystore()
+    keys = keystore.list_keys()
+    return {"keys": [k.model_dump() for k in keys]}
+
+
+@app.post("/remember", status_code=status.HTTP_201_CREATED)
+async def remember(payload: MemoryPayload, ctx: RequestContext = Depends(get_context({Permission.WRITE}))):
     """
     Appends a new memory atom to the Hot Tier (RAM) and schedules background WAL logging.
     In coordinator mode, routes writes using consistent hashing and ID prefixing.
@@ -471,9 +572,14 @@ async def remember(payload: MemoryPayload):
                 target_payload = {
                     "text": payload.text,
                     "metadata": payload.metadata,
-                    "id": atom_id
+                    "id": atom_id,
+                    "memory_type": payload.memory_type
                 }
-                res = await client.post(f"{target_shard}/remember", json=target_payload)
+                res = await client.post(
+                    f"{target_shard}/remember",
+                    json=target_payload,
+                    headers=get_forward_headers(ctx)
+                )
                 res.raise_for_status()
                 return {"status": "success", "id": atom_id}
             except Exception as e:
@@ -490,11 +596,10 @@ async def remember(payload: MemoryPayload):
             
     else:
         # Shard Mode (Storage Node)
-        if db is None:
-            raise HTTPException(status_code=503, detail="Storage engine not ready.")
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
             if payload.id:
-                engine = await db._get_db()
+                engine = await active_db._get_db()
                 text = payload.text
                 metadata = payload.metadata or {}
                 
@@ -519,18 +624,30 @@ async def remember(payload: MemoryPayload):
                     metadata=metadata,
                     atom_id=payload.id
                 )
+                
+                # Set memory_type on the atom if specified
+                if payload.memory_type:
+                    from epochdb.core.atom import MemoryType
+                    try:
+                        mt = MemoryType(payload.memory_type)
+                        atom = engine.hot_tier.atoms.get(atom_id)
+                        if atom:
+                            atom.memory_type = mt
+                    except ValueError:
+                        pass
+                
                 logger.info(f"Ingested atom with fixed ID {atom_id}: '{text[:40]}...'")
                 return {"status": "success", "id": atom_id}
             else:
-                atom_id = await db.remember(text=payload.text, metadata=payload.metadata)
+                atom_id = await active_db.remember(text=payload.text, metadata=payload.metadata, memory_type=payload.memory_type)
                 logger.info(f"Ingested atom: '{payload.text[:40]}...'")
                 return {"status": "success", "id": atom_id}
         except Exception as e:
             logger.error(f"Failed to commit memory write block: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Internal storage layer mutation rejected: {str(e)}")
 
-@app.post("/get", dependencies=[Depends(verify_auth)])
-async def get_memory(payload: GetPayload):
+@app.post("/get")
+async def get_memory(payload: GetPayload, ctx: RequestContext = Depends(get_context({Permission.READ}))):
     """
     Retrieves a specific memory by its unique ID.
     Coordinator routes directly if ID is prefixed, otherwise broadcasts.
@@ -542,7 +659,11 @@ async def get_memory(payload: GetPayload):
         target_shard = get_shard_for_id(payload.memory_id)
         if target_shard:
             try:
-                res = await client.post(f"{target_shard}/get", json=payload.model_dump())
+                res = await client.post(
+                    f"{target_shard}/get",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                )
                 res.raise_for_status()
                 return res.json()
             except Exception as e:
@@ -550,7 +671,13 @@ async def get_memory(payload: GetPayload):
                 raise HTTPException(status_code=500, detail=str(e))
         else:
             # Broadcast to all shards in parallel
-            tasks = [client.post(f"{shard}/get", json=payload.model_dump()) for shard in shard_nodes]
+            tasks = [
+                client.post(
+                    f"{shard}/get",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                ) for shard in shard_nodes
+            ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             for resp in responses:
                 if isinstance(resp, httpx.Response) and resp.status_code == 200:
@@ -559,10 +686,9 @@ async def get_memory(payload: GetPayload):
                         return data
             return {}
     else:
-        if db is None:
-            raise HTTPException(status_code=503, detail="Storage engine not ready.")
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
-            mem = await db.get(payload.memory_id)
+            mem = await active_db.get(payload.memory_id)
             if mem:
                 return mem._atom.to_dict()
             return {}
@@ -570,8 +696,8 @@ async def get_memory(payload: GetPayload):
             logger.error(f"Error resolving memory retrieval: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/query", dependencies=[Depends(verify_auth)])
-async def query_memories(payload: QueryPayload):
+@app.post("/query")
+async def query_memories(payload: QueryPayload, ctx: RequestContext = Depends(get_context({Permission.READ}))):
     """
     Performs semantic search across the memory database.
     Coordinator parallelizes requests to all shards and merges/re-ranks results.
@@ -580,7 +706,13 @@ async def query_memories(payload: QueryPayload):
         if not client:
             raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
             
-        tasks = [client.post(f"{shard}/query", json=payload.model_dump()) for shard in shard_nodes]
+        tasks = [
+            client.post(
+                f"{shard}/query",
+                json=payload.model_dump(),
+                headers=get_forward_headers(ctx)
+            ) for shard in shard_nodes
+        ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         
         all_results = []
@@ -595,13 +727,17 @@ async def query_memories(payload: QueryPayload):
         all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         return {"results": all_results[:payload.k]}
     else:
-        if db is None:
-            raise HTTPException(status_code=503, detail="Storage engine not ready.")
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
-            results = await db.query(text=payload.query, k=payload.k, filters=payload.filters)
+            results = await active_db.query(
+                text=payload.query,
+                k=payload.k,
+                filters=payload.filters,
+                memory_type=payload.memory_type
+            )
             
             # Retrieve engine to compute exact similarity scores
-            engine = await db._get_db()
+            engine = await active_db._get_db()
             embedder = engine._get_embedder()
             q_emb = await asyncio.to_thread(embedder.encode, payload.query, normalize_embeddings=True)
             q_emb = np.array(q_emb, dtype=np.float32)
@@ -625,8 +761,8 @@ async def query_memories(payload: QueryPayload):
             logger.error(f"Error resolving retrieval operations: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/update", dependencies=[Depends(verify_auth)])
-async def update_memory(payload: UpdatePayload):
+@app.post("/update")
+async def update_memory(payload: UpdatePayload, ctx: RequestContext = Depends(get_context({Permission.WRITE}))):
     """
     Updates memory text or metadata.
     """
@@ -637,7 +773,11 @@ async def update_memory(payload: UpdatePayload):
         target_shard = get_shard_for_id(payload.memory_id)
         if target_shard:
             try:
-                res = await client.post(f"{target_shard}/update", json=payload.model_dump())
+                res = await client.post(
+                    f"{target_shard}/update",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                )
                 res.raise_for_status()
                 return res.json()
             except Exception as e:
@@ -645,24 +785,29 @@ async def update_memory(payload: UpdatePayload):
                 raise HTTPException(status_code=500, detail=str(e))
         else:
             # Broadcast to all
-            tasks = [client.post(f"{shard}/update", json=payload.model_dump()) for shard in shard_nodes]
+            tasks = [
+                client.post(
+                    f"{shard}/update",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                ) for shard in shard_nodes
+            ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             for resp in responses:
                 if isinstance(resp, Exception):
                     logger.error(f"Error updating shard: {resp}")
             return {"status": "success"}
     else:
-        if db is None:
-            raise HTTPException(status_code=503, detail="Storage engine not ready.")
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
-            await db.update(payload.memory_id, payload.text, payload.metadata)
+            await active_db.update(payload.memory_id, payload.text, payload.metadata)
             return {"status": "success"}
         except Exception as e:
             logger.error(f"Error updating memory {payload.memory_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/delete", dependencies=[Depends(verify_auth)])
-async def delete_memory(payload: DeletePayload):
+@app.post("/delete")
+async def delete_memory(payload: DeletePayload, ctx: RequestContext = Depends(get_context({Permission.DELETE}))):
     """
     Deletes memory (hard or soft).
     """
@@ -673,7 +818,11 @@ async def delete_memory(payload: DeletePayload):
         target_shard = get_shard_for_id(payload.memory_id)
         if target_shard:
             try:
-                res = await client.post(f"{target_shard}/delete", json=payload.model_dump())
+                res = await client.post(
+                    f"{target_shard}/delete",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                )
                 res.raise_for_status()
                 return res.json()
             except Exception as e:
@@ -681,24 +830,33 @@ async def delete_memory(payload: DeletePayload):
                 raise HTTPException(status_code=500, detail=str(e))
         else:
             # Broadcast
-            tasks = [client.post(f"{shard}/delete", json=payload.model_dump()) for shard in shard_nodes]
+            tasks = [
+                client.post(
+                    f"{shard}/delete",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                ) for shard in shard_nodes
+            ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             for resp in responses:
                 if isinstance(resp, Exception):
                     logger.error(f"Error deleting shard: {resp}")
             return {"status": "success"}
     else:
-        if db is None:
-            raise HTTPException(status_code=503, detail="Storage engine not ready.")
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
-            await db.delete(payload.memory_id, payload.hard)
+            await active_db.delete(payload.memory_id, payload.hard)
             return {"status": "success"}
         except Exception as e:
             logger.error(f"Error deleting memory {payload.memory_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/entity_graph", dependencies=[Depends(verify_auth)])
-async def entity_graph(entity_id: Optional[str] = None, depth: int = 2):
+@app.get("/entity_graph")
+async def entity_graph(
+    entity_id: Optional[str] = None,
+    depth: int = 2,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
     """
     Retrieves the local entity graph or aggregates the distributed graph.
     """
@@ -710,7 +868,13 @@ async def entity_graph(entity_id: Optional[str] = None, depth: int = 2):
         if entity_id:
             params["entity_id"] = entity_id
             
-        tasks = [client.get(f"{shard}/entity_graph", params=params) for shard in shard_nodes]
+        tasks = [
+            client.get(
+                f"{shard}/entity_graph",
+                params=params,
+                headers=get_forward_headers(ctx)
+            ) for shard in shard_nodes
+        ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         
         merged_nodes = set()
@@ -733,11 +897,10 @@ async def entity_graph(entity_id: Optional[str] = None, depth: int = 2):
                 
         return {"nodes": list(merged_nodes), "edges": merged_edges}
     else:
-        if db is None:
-            raise HTTPException(status_code=503, detail="Storage engine not ready.")
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
             if not entity_id:
-                engine = await db._get_db()
+                engine = await active_db._get_db()
                 entities = await asyncio.to_thread(engine.get_entities)
                 if not entities:
                     return {"nodes": [], "edges": []}
@@ -747,7 +910,7 @@ async def entity_graph(entity_id: Optional[str] = None, depth: int = 2):
                 seen_edges = set()
                 
                 for ent in entities[:30]:
-                    graph = await db.entity_graph(ent, depth=1)
+                    graph = await active_db.entity_graph(ent, depth=1)
                     for node in graph.nodes:
                         merged_nodes.add(node)
                     for edge in graph.edges:
@@ -757,14 +920,14 @@ async def entity_graph(entity_id: Optional[str] = None, depth: int = 2):
                             merged_edges.append(edge)
                 return {"nodes": list(merged_nodes), "edges": merged_edges}
             else:
-                graph = await db.entity_graph(entity_id, depth)
+                graph = await active_db.entity_graph(entity_id, depth)
                 return {"nodes": graph.nodes, "edges": graph.edges}
         except Exception as e:
             logger.error(f"Error retrieving entity graph for {entity_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/get_timeline", dependencies=[Depends(verify_auth)])
-async def get_timeline(payload: TimelinePayload):
+@app.post("/get_timeline")
+async def get_timeline(payload: TimelinePayload, ctx: RequestContext = Depends(get_context({Permission.READ}))):
     """
     Retrieves timeline chronologically.
     """
@@ -772,7 +935,13 @@ async def get_timeline(payload: TimelinePayload):
         if not client:
             raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
             
-        tasks = [client.post(f"{shard}/get_timeline", json=payload.model_dump()) for shard in shard_nodes]
+        tasks = [
+            client.post(
+                f"{shard}/get_timeline",
+                json=payload.model_dump(),
+                headers=get_forward_headers(ctx)
+            ) for shard in shard_nodes
+        ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         
         all_memories = []
@@ -790,17 +959,16 @@ async def get_timeline(payload: TimelinePayload):
         all_memories.sort(key=lambda x: x.get("created_at", 0.0))
         return {"memories": all_memories}
     else:
-        if db is None:
-            raise HTTPException(status_code=503, detail="Storage engine not ready.")
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
-            results = await db.get_timeline(entity_id=payload.entity_id, start=payload.start, end=payload.end)
+            results = await active_db.get_timeline(entity_id=payload.entity_id, start=payload.start, end=payload.end)
             return {"memories": [r._atom.to_dict() for r in results]}
         except Exception as e:
             logger.error(f"Error getting timeline: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/stats", status_code=status.HTTP_200_OK, dependencies=[Depends(verify_auth)])
-async def stats():
+@app.get("/stats")
+async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
     """
     Provides real-time system metrics, cache status, and internal allocation maps.
     """
@@ -808,7 +976,12 @@ async def stats():
         if not client:
             raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
             
-        tasks = [client.get(f"{shard}/stats") for shard in shard_nodes]
+        tasks = [
+            client.get(
+                f"{shard}/stats",
+                headers=get_forward_headers(ctx)
+            ) for shard in shard_nodes
+        ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         
         total_memory_count = 0
@@ -870,10 +1043,9 @@ async def stats():
             "shards": shards_metrics
         }
     else:
-        if db is None:
-            raise HTTPException(status_code=503, detail="Storage engine not ready.")
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
-            db_stats = await db.stats()
+            db_stats = await active_db.stats()
             db_stats["mode"] = "shard"
             db_stats["cpu"] = get_cpu_usage()
             db_stats["ram"] = get_ram_usage()
@@ -883,8 +1055,8 @@ async def stats():
             logger.error(f"Unable to safely pull analytical parameters: {str(e)}")
             raise HTTPException(status_code=500, detail="Stats access blocked.")
 
-@app.post("/compact", status_code=status.HTTP_200_OK, dependencies=[Depends(verify_auth)])
-async def compact():
+@app.post("/compact", status_code=status.HTTP_200_OK)
+async def compact(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
     """
     Administrative endpoint to compress historical Parquet archives, clear soft deletes,
     and release unneeded disk space dynamically.
@@ -893,18 +1065,22 @@ async def compact():
         if not client:
             raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
             
-        tasks = [client.post(f"{shard}/compact") for shard in shard_nodes]
+        tasks = [
+            client.post(
+                f"{shard}/compact",
+                headers=get_forward_headers(ctx)
+            ) for shard in shard_nodes
+        ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         for resp in responses:
             if isinstance(resp, Exception):
                 logger.error(f"Error compacting shard: {resp}")
         return {"status": "compaction completed"}
     else:
-        if db is None:
-            raise HTTPException(status_code=503, detail="Storage engine not ready.")
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
             logger.info("Triggering background historical archive compaction...")
-            await db.compact()
+            await active_db.compact()
             return {"status": "compaction completed"}
         except Exception as e:
             logger.error(f"Compaction runtime error occurred: {str(e)}")
