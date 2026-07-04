@@ -444,14 +444,14 @@ sanitizer = ["nvidia-cuda-sanitizer-api (==13.0.85.*) ; sys_platform == \"linux\
 
 [[package]]
 name = "epochdb"
-version = "1.3.1"
+version = "1.4.0"
 description = "An agentic memory engine designed for lossless, tiered verbatim storage and multi-hop retrieval."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "epochdb-1.3.1-py3-none-any.whl", hash = "sha256:6beabc89c38518197ffa24aec3ee22d41954271f454d8df3438fa8fa545a001e"},
-    {file = "epochdb-1.3.1.tar.gz", hash = "sha256:256125890f8b0508dcb0059506dce1f993a59db3f5a33505f1dc6a416a5e2b23"},
+    {file = "epochdb-1.4.0-py3-none-any.whl", hash = "sha256:205a2779ddfe39dfd8ae410bf7c5cab8f08fa53a533c3ae6403640a7b7d43c65"},
+    {file = "epochdb-1.4.0.tar.gz", hash = "sha256:f2546fc826986df02c733a2d3d6fe7811fd4937ca7059215cd0f97269df57e35"},
 ]
 
 [package.dependencies]
@@ -468,11 +468,12 @@ z3-solver = "*"
 zstandard = "*"
 
 [package.extras]
-all = ["google-genai (>=2.8.0,<3.0.0)", "langgraph", "sentence-transformers"]
-dev = ["google-genai (>=2.8.0,<3.0.0)", "langgraph", "pytest", "pytest-cov", "sentence-transformers"]
+all = ["google-genai (>=2.8.0,<3.0.0)", "langgraph", "mcp[cli] (>=1.0.0)", "sentence-transformers"]
+dev = ["google-genai (>=2.8.0,<3.0.0)", "langgraph", "mcp[cli] (>=1.0.0)", "pytest", "pytest-cov", "sentence-transformers"]
 embeddings = ["sentence-transformers"]
 google = ["google-genai (>=2.8.0,<3.0.0)"]
 langgraph = ["langgraph"]
+mcp = ["mcp[cli] (>=1.0.0)"]
 
 [[package]]
 name = "exceptiongroup"
@@ -2683,4 +2684,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "2d4c28bf6465d509b3fc6a8dc4b697a6c8ea8da1d6d0dca6db7e4f6112ff4cac"
+content-hash = "9e913fcf15a79859ac54d2f39d6913395e53290e5e324e9f04ab360461f2884b"
