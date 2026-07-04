@@ -407,6 +407,12 @@ class QueryPayload(BaseModel):
     k: int = Field(default=1, ge=1, le=100, description="The number of candidate matches to return.")
     filters: Optional[Dict[str, Any]] = Field(default=None, description="MongoDB-style metadata filter evaluation parameters.")
     memory_type: Optional[str] = Field(default=None, description="Optional filter by memory type: 'general', 'episodic', 'profile', or 'working'.")
+    context_window: int = Field(default=0, ge=0, description="Number of chronological context turns to retrieve around the matched memory.")
+
+class AdaptiveQueryPayload(BaseModel):
+    query: str = Field(..., description="The natural language search query.")
+    k: int = Field(default=5, ge=1, le=100, description="The number of candidate matches to return.")
+    context_window: int = Field(default=0, ge=0, description="Number of chronological context turns to retrieve around the matched memory.")
 
 class GetPayload(BaseModel):
     memory_id: str = Field(..., description="The unique identifier of the memory to retrieve.")
@@ -733,7 +739,8 @@ async def query_memories(payload: QueryPayload, ctx: RequestContext = Depends(ge
                 text=payload.query,
                 k=payload.k,
                 filters=payload.filters,
-                memory_type=payload.memory_type
+                memory_type=payload.memory_type,
+                context_window=payload.context_window
             )
             
             # Retrieve engine to compute exact similarity scores
@@ -759,6 +766,58 @@ async def query_memories(payload: QueryPayload, ctx: RequestContext = Depends(ge
             return {"results": formatted_results}
         except Exception as e:
             logger.error(f"Error resolving retrieval operations: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/adaptive_query")
+async def adaptive_query_memories(payload: AdaptiveQueryPayload, ctx: RequestContext = Depends(get_context({Permission.READ}))):
+    """
+    Intelligently routes a query to the optimal engine(s) (semantic, relational, temporal, or quantitative) 
+    using LLM-orchestrated routing (or local rule fallbacks if offline) and retrieves relevant memories.
+    """
+    if NODE_MODE == "coordinator":
+        if not client:
+            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+            
+        tasks = [
+            client.post(
+                f"{shard}/adaptive_query",
+                json=payload.model_dump(),
+                headers=get_forward_headers(ctx)
+            ) for shard in shard_nodes
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        all_results = []
+        for resp in responses:
+            if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                data = resp.json()
+                all_results.extend(data.get("results", []))
+            elif isinstance(resp, Exception):
+                logger.error(f"Error adaptive querying shard: {resp}")
+                
+        all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        return {"results": all_results[:payload.k]}
+    else:
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+        try:
+            results = await active_db.adaptive_query(
+                query=payload.query,
+                k=payload.k,
+                context_window=payload.context_window
+            )
+            
+            formatted_results = []
+            for r in results:
+                formatted_results.append({
+                    "id": r.id,
+                    "text": r.text,
+                    "metadata": r.metadata,
+                    "created_at": r.created_at,
+                    "score": 1.0
+                })
+            return {"results": formatted_results}
+        except Exception as e:
+            logger.error(f"Error resolving adaptive query: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/update")
