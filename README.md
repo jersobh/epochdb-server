@@ -325,6 +325,38 @@ if __name__ == "__main__":
 
 ---
 
+## Performance & Load Testing
+
+The server includes two options for load testing and performance benchmarking:
+
+### Option A: Custom Async Performance Script (Recommended, Zero Setup)
+1. **Self-contained (auto-spins local cluster)**:
+   ```bash
+   poetry run python tests/load_test.py --run-local-cluster --concurrency 10 --duration 30
+   ```
+2. **Against a running cluster (Docker Compose)**:
+   - Start the cluster: `docker compose up -d`
+   - Run the load test:
+     ```bash
+     poetry run python tests/load_test.py --target http://localhost:8080 --api-key test-api-key-12345 --concurrency 10 --duration 30
+     ```
+
+### Option B: Locust Interactive Load Test (Web UI)
+1. Start the cluster: `docker compose up -d`
+2. Run Locust:
+   ```bash
+   API_KEY=test-api-key-12345 poetry run locust -f tests/locustfile.py
+   ```
+3. Open `http://localhost:8089` in your browser to spawn users and view latency graphs.
+
+### Integration Tests (pytest)
+To execute a quick dry-run check of the load test script via pytest:
+```bash
+poetry run pytest tests/load_test.py
+```
+
+---
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](file:///home/jeff/Projects/epochdb-server/LICENSE) file for details.

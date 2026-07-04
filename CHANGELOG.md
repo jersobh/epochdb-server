@@ -2,6 +2,14 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.8.0] - 2026-07-04
+### Added
+- **Distributed Concurrency Load Testing Suite**: Added `tests/load_test.py` and `tests/locustfile.py` to evaluate cluster performance. The custom async script supports auto-seeding, configurable ratios, detailed statistics table (averages, percentiles), and a self-contained local cluster deployment option.
+- **pytest Integration Hook**: Appended integration test case to `load_test.py` to support scanning and dry-runs under standard test frameworks (`pytest tests/load_test.py`).
+- **Dynamic Embedding Provider Config**: Exposes `EMBEDDING_MODEL` and `EMBEDDING_DIM` configuration via environment variables in `src/server.py` and propagates them to downstream database shards, enabling on-the-fly cloud providers (OpenAI, Gemini, etc.).
+- **Docker Compose Integration**: Configured `docker-compose.yml` to automatically inject host embedding variables to the database shards.
+- **Config Templates**: Added `.env.example` to provide dynamic configuration environment templates for both the core library and server.
+
 ## [0.7.0] - 2026-07-04
 ### Added
 - **Zero-Dependency Write-Invalidated Cache**: Implemented an in-memory cache layer directly on the coordinator gateway.
