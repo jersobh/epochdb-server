@@ -7,10 +7,11 @@ import hashlib
 import bisect
 import asyncio
 import httpx
+import json
 import numpy as np
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, status, Security, Depends, Request
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi import FastAPI, HTTPException, status, Security, Depends, Request, Response
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
@@ -155,7 +156,69 @@ shard_nodes_str = os.getenv("SHARD_NODES", "")
 shard_nodes = [s.strip() for s in shard_nodes_str.split(",") if s.strip()]
 hash_ring = ConsistentHashRing(shard_nodes) if shard_nodes else None
 
+class RequestContext(BaseModel):
+    tenant: Optional[str] = None
+    namespace: Optional[str] = None
+    key_info: ScopedAPIKey
+
 SHARD_METRICS_CACHE: Dict[str, Any] = {}
+
+# -------------------------------------------------------------------------
+# Cache Layer Configuration
+# -------------------------------------------------------------------------
+# Key: (tenant, namespace) -> state_version (int)
+CLUSTER_STATE_VERSIONS: Dict[tuple[str, str], int] = {}
+
+# Key: (tenant, namespace) -> Dict[cache_key, (cached_data, ETag)]
+LOCAL_READ_CACHE: Dict[tuple[str, str], Dict[str, tuple[Any, str]]] = {}
+
+def get_state_version(tenant: Optional[str], namespace: Optional[str]) -> int:
+    ctx_key = (tenant or "", namespace or "")
+    if ctx_key not in CLUSTER_STATE_VERSIONS:
+        CLUSTER_STATE_VERSIONS[ctx_key] = 0
+    return CLUSTER_STATE_VERSIONS[ctx_key]
+
+def invalidate_cache(tenant: Optional[str], namespace: Optional[str]):
+    ctx_key = (tenant or "", namespace or "")
+    CLUSTER_STATE_VERSIONS[ctx_key] = CLUSTER_STATE_VERSIONS.get(ctx_key, 0) + 1
+    LOCAL_READ_CACHE[ctx_key] = {}
+    logger.info(f"Invalidated read cache for tenant='{tenant}' namespace='{namespace}'. New version: {CLUSTER_STATE_VERSIONS[ctx_key]}")
+
+def generate_etag(endpoint: str, payload_dict: dict, state_version: int) -> str:
+    # Stable JSON serialization
+    serialized = json.dumps(payload_dict, sort_keys=True)
+    raw = f"{endpoint}:{serialized}:{state_version}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+async def handle_cached_read(
+    endpoint: str,
+    payload: Any,
+    request: Request,
+    response: Response,
+    ctx: RequestContext,
+    fetch_func
+):
+    ctx_key = (ctx.tenant or "", ctx.namespace or "")
+    state_version = get_state_version(ctx.tenant, ctx.namespace)
+    
+    # Standardize payload representation
+    payload_dict = payload.model_dump() if hasattr(payload, "model_dump") else (payload if isinstance(payload, dict) else {"_val": payload})
+    etag = generate_etag(endpoint, payload_dict, state_version)
+    
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+        
+    if ctx_key in LOCAL_READ_CACHE and etag in LOCAL_READ_CACHE[ctx_key]:
+        response.headers["ETag"] = etag
+        return LOCAL_READ_CACHE[ctx_key][etag]
+        
+    res_data = await fetch_func()
+    
+    if ctx_key not in LOCAL_READ_CACHE:
+        LOCAL_READ_CACHE[ctx_key] = {}
+    LOCAL_READ_CACHE[ctx_key][etag] = res_data
+    response.headers["ETag"] = etag
+    return res_data
 
 SSE_LISTENERS: List[asyncio.Queue] = []
 
@@ -265,11 +328,6 @@ def get_healthy_shard(key: str) -> str:
 # -------------------------------------------------------------------------
 # Request Context & Scoped Authentication
 # -------------------------------------------------------------------------
-class RequestContext(BaseModel):
-    tenant: Optional[str] = None
-    namespace: Optional[str] = None
-    key_info: ScopedAPIKey
-
 def get_context(required_permissions: set[str]):
     async def context_dependency(
         x_tenant: Optional[str] = Header(None, alias="X-Tenant"),
@@ -600,6 +658,7 @@ async def remember(payload: MemoryPayload, ctx: RequestContext = Depends(get_con
                     headers=get_forward_headers(ctx)
                 )
                 res.raise_for_status()
+                invalidate_cache(ctx.tenant, ctx.namespace)
                 await broadcast_sse_event("update", {"type": "write", "id": atom_id})
                 return {"status": "success", "id": atom_id}
             except Exception as e:
@@ -657,11 +716,13 @@ async def remember(payload: MemoryPayload, ctx: RequestContext = Depends(get_con
                         pass
                 
                 logger.info(f"Ingested atom with fixed ID {atom_id}: '{text[:40]}...'")
+                invalidate_cache(ctx.tenant, ctx.namespace)
                 await broadcast_sse_event("update", {"type": "write", "id": atom_id})
                 return {"status": "success", "id": atom_id}
             else:
                 atom_id = await active_db.remember(text=payload.text, metadata=payload.metadata, memory_type=payload.memory_type)
                 logger.info(f"Ingested atom: '{payload.text[:40]}...'")
+                invalidate_cache(ctx.tenant, ctx.namespace)
                 await broadcast_sse_event("update", {"type": "write", "id": atom_id})
                 return {"status": "success", "id": atom_id}
         except Exception as e:
@@ -669,172 +730,196 @@ async def remember(payload: MemoryPayload, ctx: RequestContext = Depends(get_con
             raise HTTPException(status_code=500, detail=f"Internal storage layer mutation rejected: {str(e)}")
 
 @app.post("/get")
-async def get_memory(payload: GetPayload, ctx: RequestContext = Depends(get_context({Permission.READ}))):
+async def get_memory(
+    payload: GetPayload,
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
     """
     Retrieves a specific memory by its unique ID.
     Coordinator routes directly if ID is prefixed, otherwise broadcasts.
     """
-    if NODE_MODE == "coordinator":
-        if not client:
-            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
-            
-        target_shard = get_shard_for_id(payload.memory_id)
-        if target_shard:
-            try:
-                res = await client.post(
-                    f"{target_shard}/get",
-                    json=payload.model_dump(),
-                    headers=get_forward_headers(ctx)
-                )
-                res.raise_for_status()
-                return res.json()
-            except Exception as e:
-                logger.error(f"Error forwarding get to shard {target_shard}: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+    async def fetch():
+        if NODE_MODE == "coordinator":
+            if not client:
+                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+                
+            target_shard = get_shard_for_id(payload.memory_id)
+            if target_shard:
+                try:
+                    res = await client.post(
+                        f"{target_shard}/get",
+                        json=payload.model_dump(),
+                        headers=get_forward_headers(ctx)
+                    )
+                    res.raise_for_status()
+                    return res.json()
+                except Exception as e:
+                    logger.error(f"Error forwarding get to shard {target_shard}: {e}")
+                    raise HTTPException(status_code=500, detail=str(e))
+            else:
+                # Broadcast to all shards in parallel
+                tasks = [
+                    client.post(
+                        f"{shard}/get",
+                        json=payload.model_dump(),
+                        headers=get_forward_headers(ctx)
+                    ) for shard in shard_nodes
+                ]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                for resp in responses:
+                    if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                        data = resp.json()
+                        if data and "id" in data:
+                            return data
+                return {}
         else:
-            # Broadcast to all shards in parallel
+            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+            try:
+                mem = await active_db.get(payload.memory_id)
+                if mem:
+                    return mem._atom.to_dict()
+                return {}
+            except Exception as e:
+                logger.error(f"Error resolving memory retrieval: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    return await handle_cached_read("get", payload, request, response, ctx, fetch)
+
+@app.post("/query")
+async def query_memories(
+    payload: QueryPayload,
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Performs semantic search across the memory database.
+    Coordinator parallelizes requests to all shards and merges/re-ranks results.
+    """
+    async def fetch():
+        if NODE_MODE == "coordinator":
+            if not client:
+                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+                
             tasks = [
                 client.post(
-                    f"{shard}/get",
+                    f"{shard}/query",
                     json=payload.model_dump(),
                     headers=get_forward_headers(ctx)
                 ) for shard in shard_nodes
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            all_results = []
             for resp in responses:
                 if isinstance(resp, httpx.Response) and resp.status_code == 200:
                     data = resp.json()
-                    if data and "id" in data:
-                        return data
-            return {}
-    else:
-        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
-        try:
-            mem = await active_db.get(payload.memory_id)
-            if mem:
-                return mem._atom.to_dict()
-            return {}
-        except Exception as e:
-            logger.error(f"Error resolving memory retrieval: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/query")
-async def query_memories(payload: QueryPayload, ctx: RequestContext = Depends(get_context({Permission.READ}))):
-    """
-    Performs semantic search across the memory database.
-    Coordinator parallelizes requests to all shards and merges/re-ranks results.
-    """
-    if NODE_MODE == "coordinator":
-        if not client:
-            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
-            
-        tasks = [
-            client.post(
-                f"{shard}/query",
-                json=payload.model_dump(),
-                headers=get_forward_headers(ctx)
-            ) for shard in shard_nodes
-        ]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        all_results = []
-        for resp in responses:
-            if isinstance(resp, httpx.Response) and resp.status_code == 200:
-                data = resp.json()
-                all_results.extend(data.get("results", []))
-            elif isinstance(resp, Exception):
-                logger.error(f"Error querying shard: {resp}")
+                    all_results.extend(data.get("results", []))
+                elif isinstance(resp, Exception):
+                    logger.error(f"Error querying shard: {resp}")
+                    
+            # Sort by similarity score in descending order
+            all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            return {"results": all_results[:payload.k]}
+        else:
+            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+            try:
+                results = await active_db.query(
+                    text=payload.query,
+                    k=payload.k,
+                    filters=payload.filters,
+                    memory_type=payload.memory_type,
+                    context_window=payload.context_window
+                )
                 
-        # Sort by similarity score in descending order
-        all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        return {"results": all_results[:payload.k]}
-    else:
-        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
-        try:
-            results = await active_db.query(
-                text=payload.query,
-                k=payload.k,
-                filters=payload.filters,
-                memory_type=payload.memory_type,
-                context_window=payload.context_window
-            )
-            
-            # Retrieve engine to compute exact similarity scores
-            engine = await active_db._get_db()
-            embedder = engine._get_embedder()
-            q_emb = await asyncio.to_thread(embedder.encode, payload.query, normalize_embeddings=True)
-            q_emb = np.array(q_emb, dtype=np.float32)
-            
-            formatted_results = []
-            for r in results:
-                score = 0.0
-                if q_emb.any() and r._atom.embedding.any():
-                    score = float(np.dot(r._atom.embedding, q_emb) / (
-                        np.linalg.norm(r._atom.embedding) * np.linalg.norm(q_emb) + 1e-10
-                    ))
-                formatted_results.append({
-                    "id": r.id,
-                    "text": r.text,
-                    "metadata": r.metadata,
-                    "created_at": r.created_at,
-                    "score": score
-                })
-            return {"results": formatted_results}
-        except Exception as e:
-            logger.error(f"Error resolving retrieval operations: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+                # Retrieve engine to compute exact similarity scores
+                engine = await active_db._get_db()
+                embedder = engine._get_embedder()
+                q_emb = await asyncio.to_thread(embedder.encode, payload.query, normalize_embeddings=True)
+                q_emb = np.array(q_emb, dtype=np.float32)
+                
+                formatted_results = []
+                for r in results:
+                    score = 0.0
+                    if q_emb.any() and r._atom.embedding.any():
+                        score = float(np.dot(r._atom.embedding, q_emb) / (
+                            np.linalg.norm(r._atom.embedding) * np.linalg.norm(q_emb) + 1e-10
+                        ))
+                    formatted_results.append({
+                        "id": r.id,
+                        "text": r.text,
+                        "metadata": r.metadata,
+                        "created_at": r.created_at,
+                        "score": score
+                    })
+                return {"results": formatted_results}
+            except Exception as e:
+                logger.error(f"Error resolving retrieval operations: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    return await handle_cached_read("query", payload, request, response, ctx, fetch)
 
 @app.post("/adaptive_query")
-async def adaptive_query_memories(payload: AdaptiveQueryPayload, ctx: RequestContext = Depends(get_context({Permission.READ}))):
+async def adaptive_query_memories(
+    payload: AdaptiveQueryPayload,
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
     """
     Intelligently routes a query to the optimal engine(s) (semantic, relational, temporal, or quantitative) 
     using LLM-orchestrated routing (or local rule fallbacks if offline) and retrieves relevant memories.
     """
-    if NODE_MODE == "coordinator":
-        if not client:
-            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
-            
-        tasks = [
-            client.post(
-                f"{shard}/adaptive_query",
-                json=payload.model_dump(),
-                headers=get_forward_headers(ctx)
-            ) for shard in shard_nodes
-        ]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        all_results = []
-        for resp in responses:
-            if isinstance(resp, httpx.Response) and resp.status_code == 200:
-                data = resp.json()
-                all_results.extend(data.get("results", []))
-            elif isinstance(resp, Exception):
-                logger.error(f"Error adaptive querying shard: {resp}")
+    async def fetch():
+        if NODE_MODE == "coordinator":
+            if not client:
+                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
                 
-        all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        return {"results": all_results[:payload.k]}
-    else:
-        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
-        try:
-            results = await active_db.adaptive_query(
-                query=payload.query,
-                k=payload.k,
-                context_window=payload.context_window
-            )
+            tasks = [
+                client.post(
+                    f"{shard}/adaptive_query",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                ) for shard in shard_nodes
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
             
-            formatted_results = []
-            for r in results:
-                formatted_results.append({
-                    "id": r.id,
-                    "text": r.text,
-                    "metadata": r.metadata,
-                    "created_at": r.created_at,
-                    "score": 1.0
-                })
-            return {"results": formatted_results}
-        except Exception as e:
-            logger.error(f"Error resolving adaptive query: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            all_results = []
+            for resp in responses:
+                if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                    data = resp.json()
+                    all_results.extend(data.get("results", []))
+                elif isinstance(resp, Exception):
+                    logger.error(f"Error adaptive querying shard: {resp}")
+                    
+            all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            return {"results": all_results[:payload.k]}
+        else:
+            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+            try:
+                results = await active_db.adaptive_query(
+                    query=payload.query,
+                    k=payload.k,
+                    context_window=payload.context_window
+                )
+                
+                formatted_results = []
+                for r in results:
+                    formatted_results.append({
+                        "id": r.id,
+                        "text": r.text,
+                        "metadata": r.metadata,
+                        "created_at": r.created_at,
+                        "score": 1.0
+                    })
+                return {"results": formatted_results}
+            except Exception as e:
+                logger.error(f"Error resolving adaptive query: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    return await handle_cached_read("adaptive_query", payload, request, response, ctx, fetch)
 
 @app.post("/update")
 async def update_memory(payload: UpdatePayload, ctx: RequestContext = Depends(get_context({Permission.WRITE}))):
@@ -854,6 +939,7 @@ async def update_memory(payload: UpdatePayload, ctx: RequestContext = Depends(ge
                     headers=get_forward_headers(ctx)
                 )
                 res.raise_for_status()
+                invalidate_cache(ctx.tenant, ctx.namespace)
                 await broadcast_sse_event("update", {"type": "update", "id": payload.memory_id})
                 return res.json()
             except Exception as e:
@@ -872,12 +958,14 @@ async def update_memory(payload: UpdatePayload, ctx: RequestContext = Depends(ge
             for resp in responses:
                 if isinstance(resp, Exception):
                     logger.error(f"Error updating shard: {resp}")
+            invalidate_cache(ctx.tenant, ctx.namespace)
             await broadcast_sse_event("update", {"type": "update", "id": payload.memory_id})
             return {"status": "success"}
     else:
         active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
             await active_db.update(payload.memory_id, payload.text, payload.metadata)
+            invalidate_cache(ctx.tenant, ctx.namespace)
             await broadcast_sse_event("update", {"type": "update", "id": payload.memory_id})
             return {"status": "success"}
         except Exception as e:
@@ -902,6 +990,7 @@ async def delete_memory(payload: DeletePayload, ctx: RequestContext = Depends(ge
                     headers=get_forward_headers(ctx)
                 )
                 res.raise_for_status()
+                invalidate_cache(ctx.tenant, ctx.namespace)
                 await broadcast_sse_event("update", {"type": "delete", "id": payload.memory_id})
                 return res.json()
             except Exception as e:
@@ -920,12 +1009,14 @@ async def delete_memory(payload: DeletePayload, ctx: RequestContext = Depends(ge
             for resp in responses:
                 if isinstance(resp, Exception):
                     logger.error(f"Error deleting shard: {resp}")
+            invalidate_cache(ctx.tenant, ctx.namespace)
             await broadcast_sse_event("update", {"type": "delete", "id": payload.memory_id})
             return {"status": "success"}
     else:
         active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
             await active_db.delete(payload.memory_id, payload.hard)
+            invalidate_cache(ctx.tenant, ctx.namespace)
             await broadcast_sse_event("update", {"type": "delete", "id": payload.memory_id})
             return {"status": "success"}
         except Exception as e:
@@ -934,6 +1025,8 @@ async def delete_memory(payload: DeletePayload, ctx: RequestContext = Depends(ge
 
 @app.get("/entity_graph")
 async def entity_graph(
+    request: Request,
+    response: Response,
     entity_id: Optional[str] = None,
     depth: int = 2,
     ctx: RequestContext = Depends(get_context({Permission.READ}))
@@ -941,112 +1034,125 @@ async def entity_graph(
     """
     Retrieves the local entity graph or aggregates the distributed graph.
     """
-    if NODE_MODE == "coordinator":
-        if not client:
-            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+    payload = {"entity_id": entity_id, "depth": depth}
+
+    async def fetch():
+        if NODE_MODE == "coordinator":
+            if not client:
+                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+                
+            params = {"depth": depth}
+            if entity_id:
+                params["entity_id"] = entity_id
+                
+            tasks = [
+                client.get(
+                    f"{shard}/entity_graph",
+                    params=params,
+                    headers=get_forward_headers(ctx)
+                ) for shard in shard_nodes
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
             
-        params = {"depth": depth}
-        if entity_id:
-            params["entity_id"] = entity_id
+            merged_nodes = set()
+            merged_edges = []
+            seen_edges = set()
             
-        tasks = [
-            client.get(
-                f"{shard}/entity_graph",
-                params=params,
-                headers=get_forward_headers(ctx)
-            ) for shard in shard_nodes
-        ]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        merged_nodes = set()
-        merged_edges = []
-        seen_edges = set()
-        
-        for resp in responses:
-            if isinstance(resp, httpx.Response) and resp.status_code == 200:
-                data = resp.json()
-                for node in data.get("nodes", []):
-                    merged_nodes.add(node)
-                for edge in data.get("edges", []):
-                    # Dedup edges by source, target, predicate, memory_id
-                    key = (edge.get("source"), edge.get("target"), edge.get("predicate"), edge.get("memory_id"))
-                    if key not in seen_edges:
-                        seen_edges.add(key)
-                        merged_edges.append(edge)
-            elif isinstance(resp, Exception):
-                logger.error(f"Error querying entity graph from shard: {resp}")
-                
-        return {"nodes": list(merged_nodes), "edges": merged_edges}
-    else:
-        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
-        try:
-            if not entity_id:
-                engine = await active_db._get_db()
-                entities = await asyncio.to_thread(engine.get_entities)
-                if not entities:
-                    return {"nodes": [], "edges": []}
-                
-                merged_nodes = set()
-                merged_edges = []
-                seen_edges = set()
-                
-                for ent in entities[:30]:
-                    graph = await active_db.entity_graph(ent, depth=1)
-                    for node in graph.nodes:
+            for resp in responses:
+                if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                    data = resp.json()
+                    for node in data.get("nodes", []):
                         merged_nodes.add(node)
-                    for edge in graph.edges:
+                    for edge in data.get("edges", []):
+                        # Dedup edges by source, target, predicate, memory_id
                         key = (edge.get("source"), edge.get("target"), edge.get("predicate"), edge.get("memory_id"))
                         if key not in seen_edges:
                             seen_edges.add(key)
                             merged_edges.append(edge)
-                return {"nodes": list(merged_nodes), "edges": merged_edges}
-            else:
-                graph = await active_db.entity_graph(entity_id, depth)
-                return {"nodes": graph.nodes, "edges": graph.edges}
-        except Exception as e:
-            logger.error(f"Error retrieving entity graph for {entity_id}: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+                elif isinstance(resp, Exception):
+                    logger.error(f"Error querying entity graph from shard: {resp}")
+                    
+            return {"nodes": list(merged_nodes), "edges": merged_edges}
+        else:
+            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+            try:
+                if not entity_id:
+                    engine = await active_db._get_db()
+                    entities = await asyncio.to_thread(engine.get_entities)
+                    if not entities:
+                        return {"nodes": [], "edges": []}
+                    
+                    merged_nodes = set()
+                    merged_edges = []
+                    seen_edges = set()
+                    
+                    for ent in entities[:30]:
+                        graph = await active_db.entity_graph(ent, depth=1)
+                        for node in graph.nodes:
+                            merged_nodes.add(node)
+                        for edge in graph.edges:
+                            key = (edge.get("source"), edge.get("target"), edge.get("predicate"), edge.get("memory_id"))
+                            if key not in seen_edges:
+                                seen_edges.add(key)
+                                merged_edges.append(edge)
+                    return {"nodes": list(merged_nodes), "edges": merged_edges}
+                else:
+                    graph = await active_db.entity_graph(entity_id, depth)
+                    return {"nodes": graph.nodes, "edges": graph.edges}
+            except Exception as e:
+                logger.error(f"Error retrieving entity graph for {entity_id}: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    return await handle_cached_read("entity_graph", payload, request, response, ctx, fetch)
 
 @app.post("/get_timeline")
-async def get_timeline(payload: TimelinePayload, ctx: RequestContext = Depends(get_context({Permission.READ}))):
+async def get_timeline(
+    payload: TimelinePayload,
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
     """
     Retrieves timeline chronologically.
     """
-    if NODE_MODE == "coordinator":
-        if not client:
-            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
-            
-        tasks = [
-            client.post(
-                f"{shard}/get_timeline",
-                json=payload.model_dump(),
-                headers=get_forward_headers(ctx)
-            ) for shard in shard_nodes
-        ]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        all_memories = []
-        seen_ids = set()
-        for resp in responses:
-            if isinstance(resp, httpx.Response) and resp.status_code == 200:
-                data = resp.json()
-                for m in data.get("memories", []):
-                    if m.get("id") not in seen_ids:
-                        seen_ids.add(m.get("id"))
-                        all_memories.append(m)
-            elif isinstance(resp, Exception):
-                logger.error(f"Error getting timeline from shard: {resp}")
+    async def fetch():
+        if NODE_MODE == "coordinator":
+            if not client:
+                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
                 
-        all_memories.sort(key=lambda x: x.get("created_at", 0.0))
-        return {"memories": all_memories}
-    else:
-        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
-        try:
-            results = await active_db.get_timeline(entity_id=payload.entity_id, start=payload.start, end=payload.end)
-            return {"memories": [r._atom.to_dict() for r in results]}
-        except Exception as e:
-            logger.error(f"Error getting timeline: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            tasks = [
+                client.post(
+                    f"{shard}/get_timeline",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                ) for shard in shard_nodes
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            all_memories = []
+            seen_ids = set()
+            for resp in responses:
+                if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                    data = resp.json()
+                    for m in data.get("memories", []):
+                        if m.get("id") not in seen_ids:
+                            seen_ids.add(m.get("id"))
+                            all_memories.append(m)
+                elif isinstance(resp, Exception):
+                    logger.error(f"Error getting timeline from shard: {resp}")
+                    
+            all_memories.sort(key=lambda x: x.get("created_at", 0.0))
+            return {"memories": all_memories}
+        else:
+            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+            try:
+                results = await active_db.get_timeline(entity_id=payload.entity_id, start=payload.start, end=payload.end)
+                return {"memories": [r._atom.to_dict() for r in results]}
+            except Exception as e:
+                logger.error(f"Error getting timeline: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    return await handle_cached_read("get_timeline", payload, request, response, ctx, fetch)
 
 @app.get("/stats")
 async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
@@ -1156,12 +1262,14 @@ async def compact(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))
         for resp in responses:
             if isinstance(resp, Exception):
                 logger.error(f"Error compacting shard: {resp}")
+        invalidate_cache(ctx.tenant, ctx.namespace)
         return {"status": "compaction completed"}
     else:
         active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
             logger.info("Triggering background historical archive compaction...")
             await active_db.compact()
+            invalidate_cache(ctx.tenant, ctx.namespace)
             return {"status": "compaction completed"}
         except Exception as e:
             logger.error(f"Compaction runtime error occurred: {str(e)}")
