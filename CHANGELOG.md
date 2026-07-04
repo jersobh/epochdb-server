@@ -13,6 +13,8 @@ All notable changes to the EpochDB Distributed Server project will be documented
 
 ## [0.5.0] - 2026-07-04
 ### Added
+- **Server-Sent Events (SSE)**: Added `/stream` endpoint to stream database mutation notifications to clients.
+- **Real-Time Visualizer Updates**: Integrated EventSource SSE connection in `visualize.html` to instantly update the graph/stats on writes/deletes, eliminating 5-second HTTP polling traffic.
 - **Adaptive Querying Gateway**: Exposed `/adaptive_query` REST endpoint on coordinator gateway and shards, enabling LLM-orchestrated routing.
 - **Context Window Propagation**: Exposed `context_window` in `/query` and `/adaptive_query` payloads, automatically propagating context parameters downstream to storage shards.
 
