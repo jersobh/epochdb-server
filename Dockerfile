@@ -23,7 +23,8 @@ RUN pip install --no-cache-dir \
     "pydantic>=2.13.4,<3.0.0" \
     "sentence-transformers>=5.6.0,<6.0.0" \
     "httpx>=0.28.0" \
-    "gunicorn>=22.0.0"
+    "gunicorn>=22.0.0" \
+    "sse-starlette>=2.1.0,<4.0.0"
 
 
 
