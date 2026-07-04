@@ -9,7 +9,7 @@ import asyncio
 import httpx
 import numpy as np
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, status, Security, Depends
+from fastapi import FastAPI, HTTPException, status, Security, Depends, Request
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -17,6 +17,7 @@ from typing import List, Dict, Any, Optional
 
 from epochdb import AsyncEpochDB
 from fastapi import Header, Query
+from sse_starlette.sse import EventSourceResponse
 
 try:
     from auth import verify_scoped_auth, Permission, get_keystore, ScopedAPIKey
@@ -155,6 +156,18 @@ shard_nodes = [s.strip() for s in shard_nodes_str.split(",") if s.strip()]
 hash_ring = ConsistentHashRing(shard_nodes) if shard_nodes else None
 
 SHARD_METRICS_CACHE: Dict[str, Any] = {}
+
+SSE_LISTENERS: List[asyncio.Queue] = []
+
+async def broadcast_sse_event(event_type: str, data: dict):
+    """
+    Broadcasts an event to all connected SSE clients.
+    """
+    if not SSE_LISTENERS:
+        return
+    logger.info(f"Broadcasting SSE event '{event_type}' to {len(SSE_LISTENERS)} listeners.")
+    for queue in list(SSE_LISTENERS):
+        await queue.put({"event": event_type, "data": data})
 
 async def poll_shards_loop():
     """
@@ -587,6 +600,7 @@ async def remember(payload: MemoryPayload, ctx: RequestContext = Depends(get_con
                     headers=get_forward_headers(ctx)
                 )
                 res.raise_for_status()
+                await broadcast_sse_event("update", {"type": "write", "id": atom_id})
                 return {"status": "success", "id": atom_id}
             except Exception as e:
                 logger.error(f"Failed to forward write to shard {target_shard} on attempt {attempt}: {e}")
@@ -643,10 +657,12 @@ async def remember(payload: MemoryPayload, ctx: RequestContext = Depends(get_con
                         pass
                 
                 logger.info(f"Ingested atom with fixed ID {atom_id}: '{text[:40]}...'")
+                await broadcast_sse_event("update", {"type": "write", "id": atom_id})
                 return {"status": "success", "id": atom_id}
             else:
                 atom_id = await active_db.remember(text=payload.text, metadata=payload.metadata, memory_type=payload.memory_type)
                 logger.info(f"Ingested atom: '{payload.text[:40]}...'")
+                await broadcast_sse_event("update", {"type": "write", "id": atom_id})
                 return {"status": "success", "id": atom_id}
         except Exception as e:
             logger.error(f"Failed to commit memory write block: {str(e)}")
@@ -838,6 +854,7 @@ async def update_memory(payload: UpdatePayload, ctx: RequestContext = Depends(ge
                     headers=get_forward_headers(ctx)
                 )
                 res.raise_for_status()
+                await broadcast_sse_event("update", {"type": "update", "id": payload.memory_id})
                 return res.json()
             except Exception as e:
                 logger.error(f"Error forwarding update to shard {target_shard}: {e}")
@@ -855,11 +872,13 @@ async def update_memory(payload: UpdatePayload, ctx: RequestContext = Depends(ge
             for resp in responses:
                 if isinstance(resp, Exception):
                     logger.error(f"Error updating shard: {resp}")
+            await broadcast_sse_event("update", {"type": "update", "id": payload.memory_id})
             return {"status": "success"}
     else:
         active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
             await active_db.update(payload.memory_id, payload.text, payload.metadata)
+            await broadcast_sse_event("update", {"type": "update", "id": payload.memory_id})
             return {"status": "success"}
         except Exception as e:
             logger.error(f"Error updating memory {payload.memory_id}: {e}")
@@ -883,6 +902,7 @@ async def delete_memory(payload: DeletePayload, ctx: RequestContext = Depends(ge
                     headers=get_forward_headers(ctx)
                 )
                 res.raise_for_status()
+                await broadcast_sse_event("update", {"type": "delete", "id": payload.memory_id})
                 return res.json()
             except Exception as e:
                 logger.error(f"Error forwarding delete to shard {target_shard}: {e}")
@@ -900,11 +920,13 @@ async def delete_memory(payload: DeletePayload, ctx: RequestContext = Depends(ge
             for resp in responses:
                 if isinstance(resp, Exception):
                     logger.error(f"Error deleting shard: {resp}")
+            await broadcast_sse_event("update", {"type": "delete", "id": payload.memory_id})
             return {"status": "success"}
     else:
         active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
             await active_db.delete(payload.memory_id, payload.hard)
+            await broadcast_sse_event("update", {"type": "delete", "id": payload.memory_id})
             return {"status": "success"}
         except Exception as e:
             logger.error(f"Error deleting memory {payload.memory_id}: {e}")
@@ -1163,6 +1185,31 @@ async def visualize():
             html_content = f.read()
         return HTMLResponse(content=html_content)
     raise HTTPException(status_code=404, detail="Visualization template not found")
+
+@app.get("/stream")
+async def sse_stream(request: Request):
+    """
+    Server-Sent Events endpoint to stream database mutation notifications to clients.
+    """
+    queue = asyncio.Queue()
+    SSE_LISTENERS.append(queue)
+    
+    async def event_generator():
+        try:
+            # Yield initial connection confirmation
+            yield {"event": "connected", "data": "connected"}
+            while True:
+                if await request.is_disconnected():
+                    break
+                event = await queue.get()
+                yield event
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if queue in SSE_LISTENERS:
+                SSE_LISTENERS.remove(queue)
+                
+    return EventSourceResponse(event_generator())
 
 # -------------------------------------------------------------------------
 # 6. Production Execution Entrypoint

@@ -1318,13 +1318,18 @@
                 await loadStats();
                 await loadGraph(true);
 
-                // Setup dynamic auto-polling every 5 seconds
-                setInterval(async () => {
+                // Connect to Server-Sent Events stream for real-time updates
+                const eventSource = new EventSource('/stream');
+                eventSource.addEventListener('update', async (e) => {
+                    console.log("SSE update event received:", e.data);
                     if (!document.hidden) {
                         await loadStats();
                         await loadGraph();
                     }
-                }, 5000);
+                });
+                eventSource.onerror = (err) => {
+                    console.error("SSE connection error:", err);
+                };
 
             } catch (err) {
                 if (err.message === 'Unauthorized') {
