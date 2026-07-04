@@ -168,7 +168,8 @@ Performs semantic search.
   {
     "query": "search query string",
     "k": 5,
-    "filters": { "optional": "metadata-filters" }
+    "filters": { "optional": "metadata-filters" },
+    "context_window": 1
   }
   ```
 * **Response**:
@@ -178,13 +179,38 @@ Performs semantic search.
       {
         "id": "shard1-46bb87d8...",
         "text": "Factual text to store.",
-        "metadata": { "optional": "metadata" },
+        "metadata": { 
+          "optional": "metadata",
+          "context_neighbors": [
+            {
+              "id": "shard1-12345678...",
+              "payload": "First turn: Hello, my name is Bob.",
+              "created_at": 1719541990.123,
+              "memory_type": "episodic",
+              "metadata": {}
+            },
+            ...
+          ]
+        },
         "created_at": 1719542000.123,
         "score": 0.892
       }
     ]
   }
   ```
+
+### 3a. `POST /adaptive_query`
+Intelligently routes the query using LLM-orchestration (supporting Gemini, OpenAI, and Anthropic) or local rules offline.
+* **Payload**:
+  ```json
+  {
+    "query": "Where does Jeff live?",
+    "k": 5,
+    "context_window": 1
+  }
+  ```
+* **Response**: Same format as `POST /query`.
+
 
 ### 4. `POST /update`
 Updates an existing memory's text or metadata.
