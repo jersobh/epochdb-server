@@ -8,6 +8,11 @@ services:
       - NODE_MODE=shard
       - STORAGE_DIR=/data
       - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     volumes:
       - shard0_data:/data
     healthcheck:
@@ -26,6 +31,11 @@ services:
       - NODE_MODE=shard
       - STORAGE_DIR=/data
       - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     volumes:
       - shard1_data:/data
     healthcheck:
@@ -44,6 +54,11 @@ services:
       - NODE_MODE=shard
       - STORAGE_DIR=/data
       - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     volumes:
       - shard2_data:/data
     healthcheck:

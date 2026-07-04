@@ -156,6 +156,11 @@ shard_nodes_str = os.getenv("SHARD_NODES", "")
 shard_nodes = [s.strip() for s in shard_nodes_str.split(",") if s.strip()]
 hash_ring = ConsistentHashRing(shard_nodes) if shard_nodes else None
 
+# Dynamic embedding configuration (defaults to local offline all-MiniLM-L6-v2)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
+
+
 class RequestContext(BaseModel):
     tenant: Optional[str] = None
     namespace: Optional[str] = None
@@ -393,7 +398,8 @@ async def get_db_instance(tenant: Optional[str] = None, namespace: Optional[str]
         logger.info(f"Initializing AsyncEpochDB for tenant={tenant}, namespace={namespace} under {storage_dir}")
         engine = AsyncEpochDB(
             storage_dir=storage_dir,
-            embedding_model="all-MiniLM-L6-v2",
+            embedding_model=EMBEDDING_MODEL,
+            dim=EMBEDDING_DIM,
             wal_sync_interval=0.1,
             parquet_compression="zstd",
             parquet_compression_level=3,
