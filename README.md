@@ -6,7 +6,7 @@
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/jersobh/epochdb-server)](https://github.com/jersobh/epochdb-server/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-EpochDB Distributed Server is an asynchronous, high-concurrency memory and vector database server designed for agentic workloads. It supports multi-node clustering with automatic horizontal sharding, consistent hashing write distribution, and direct prefix-based routing.
+**EpochDB Distributed Server** is an asynchronous, high-concurrency memory and vector database server designed for agentic workloads. Built on top of the core [EpochDB Agentic Memory Engine](https://github.com/jersobh/epochdb), it supports multi-node clustering with automatic horizontal sharding, consistent hashing write distribution, and direct prefix-based routing.
 
 
 ---
@@ -35,7 +35,7 @@ The cluster follows a MongoDB-style coordinator/gateway and storage shard archit
 ### 1. Node Roles (`NODE_MODE`)
 A server instance runs in one of two modes depending on environment variables:
 1. **Shard Mode (Storage Node)**:
-   - Hosts a local `AsyncEpochDB` engine.
+   - Hosts a local `AsyncEpochDB` instance (leveraging the core [EpochDB](https://github.com/jersobh/epochdb) library).
    - Manages physical SQLite files, WAL buffers, Parquet archives, and HNSW vector indexes locally.
    - Saves data under a configured `STORAGE_DIR`.
 2. **Coordinator Mode (Router/Gateway Node)**:
