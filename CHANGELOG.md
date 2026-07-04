@@ -2,6 +2,11 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.5.0] - 2026-07-04
+### Added
+- **Adaptive Querying Gateway**: Exposed `/adaptive_query` REST endpoint on coordinator gateway and shards, enabling LLM-orchestrated routing.
+- **Context Window Propagation**: Exposed `context_window` in `/query` and `/adaptive_query` payloads, automatically propagating context parameters downstream to storage shards.
+
 ## [0.3.1] - 2026-06-28
 
 ### Added
