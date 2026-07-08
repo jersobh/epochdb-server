@@ -20,18 +20,11 @@ def cleanup():
     yield
     shutil.rmtree(temp_dir, ignore_errors=True)
 
-class MockResponse:
+import httpx
+
+class MockResponse(httpx.Response):
     def __init__(self, status_code, json_data):
-        self.status_code = status_code
-        self._json_data = json_data
-        
-    def json(self):
-        return self._json_data
-        
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            import httpx
-            raise httpx.HTTPStatusError("Error", request=None, response=None)
+        super().__init__(status_code, json=json_data)
 
 class MockAsyncClient:
     async def post(self, url, **kwargs):
