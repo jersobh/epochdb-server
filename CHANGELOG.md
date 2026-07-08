@@ -2,6 +2,14 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.9.0] - 2026-07-08
+### Added
+- **Extended Replica Set Replication**:
+  - Implemented configurable Write Consistency Levels (`ONE`, `QUORUM`, `ALL`) to guarantee durability across replica sets.
+  - Implemented Point Read (`/get`) multi-replica queries with active background **Read Repair** to automatically heal stale or missing replica states.
+  - Implemented cluster-wide partition resets (`/admin/reset`) broadcasting administrative actions across all shards and replicas in the cluster.
+  - Added new integration tests validating consistency levels and Read Repair logic.
+
 ## [0.8.0] - 2026-07-04
 ### Added
 - **Distributed Concurrency Load Testing Suite**: Added `tests/load_test.py` and `tests/locustfile.py` to evaluate cluster performance. The custom async script supports auto-seeding, configurable ratios, detailed statistics table (averages, percentiles), and a self-contained local cluster deployment option.

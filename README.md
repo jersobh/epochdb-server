@@ -117,7 +117,7 @@ docker run -d \
 
 Environment variables used by the server:
 - `NODE_MODE`: `"shard"` (default) or `"coordinator"`.
-- `SHARD_NODES`: Comma-separated list of backend shard URLs (e.g. `http://shard0:8080,http://shard1:8080`). Required in coordinator mode.
+- `SHARD_NODES`: Comma-separated list of backend shard URLs (e.g. `http://shard0:8080,http://shard1:8080`). To configure replica sets (high-availability replication groups), join replica URLs within a shard group using `+` (e.g., `http://shard0-a:8080+http://shard0-b:8080,http://shard1-a:8080+http://shard1-b:8080`). Required in coordinator mode.
 - `STORAGE_DIR`: Local data storage directory (default: `./shared_memory`).
 - `API_KEY`: Client access API Key for the coordinator gateway (enforces `X-API-Key` header authentication).
 - `INTERNAL_AUTH_TOKEN`: Secure token used for inter-node communication between the coordinator and shards (enforces `X-Internal-Token` header authentication).
