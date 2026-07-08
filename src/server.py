@@ -706,6 +706,12 @@ async def healthz():
                     raise HTTPException(status_code=503, detail="One or more backend shards are unhealthy or warming up.")
         return {"status": "healthy", "mode": "coordinator"}
     else:
+        global db
+        if db is None:
+            try:
+                db = await get_db_instance(None, None)
+            except Exception as e:
+                logger.error(f"Failed to initialize storage engine in healthz: {e}")
         if db is None:
             raise HTTPException(status_code=503, detail="Storage engine not ready.")
         return {"status": "healthy", "mode": "shard"}
@@ -737,11 +743,17 @@ async def admin_list_databases(ctx: RequestContext = Depends(get_context({Permis
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only supported in Shard Mode.")
     
     storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
-    dbs = []
+    db_keys = set()
     
-    # Check default partition
+    # 1. Gather active databases from memory pool
+    for key in db_pool.keys():
+        db_keys.add(key)
+    if db is not None:
+        db_keys.add((None, None))
+        
+    # 2. Gather databases from filesystem scan
     if os.path.exists(os.path.join(storage_dir, "metadata.json")):
-        dbs.append({"tenant": None, "namespace": None})
+        db_keys.add((None, None))
         
     # Check namespaces directly under storage_dir
     ns_dir = os.path.join(storage_dir, "ns")
@@ -749,7 +761,7 @@ async def admin_list_databases(ctx: RequestContext = Depends(get_context({Permis
         try:
             for namespace in os.listdir(ns_dir):
                 if os.path.isdir(os.path.join(ns_dir, namespace)):
-                    dbs.append({"tenant": None, "namespace": namespace})
+                    db_keys.add((None, namespace))
         except Exception as e:
             logger.error(f"Error listing namespace directory: {e}")
             
@@ -762,17 +774,18 @@ async def admin_list_databases(ctx: RequestContext = Depends(get_context({Permis
                 if os.path.isdir(tenant_path):
                     # Check if tenant has default namespace db
                     if os.path.exists(os.path.join(tenant_path, "metadata.json")):
-                        dbs.append({"tenant": tenant, "namespace": None})
+                        db_keys.add((tenant, None))
                     
                     # Check namespaces within tenant
                     tenant_ns_dir = os.path.join(tenant_path, "ns")
                     if os.path.exists(tenant_ns_dir):
                         for namespace in os.listdir(tenant_ns_dir):
                             if os.path.isdir(os.path.join(tenant_ns_dir, namespace)):
-                                dbs.append({"tenant": tenant, "namespace": namespace})
+                                db_keys.add((tenant, namespace))
         except Exception as e:
             logger.error(f"Error listing tenants directory: {e}")
             
+    dbs = [{"tenant": t, "namespace": ns} for t, ns in db_keys]
     return {"databases": dbs}
 
 
@@ -827,10 +840,6 @@ async def admin_reset_database(
             logger.error(f"Error closing db instance for reset: {e}")
         del db_pool[key]
         
-    global db
-    if payload.tenant is None and payload.namespace is None:
-        db = None
-        
     # 2. Delete storage files
     storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
     if payload.tenant:
@@ -851,6 +860,10 @@ async def admin_reset_database(
                 detail=f"Failed to clear partition storage: {str(e)}"
             )
             
+    global db
+    if payload.tenant is None and payload.namespace is None:
+        db = await get_db_instance(None, None)
+        
     invalidate_cache(payload.tenant, payload.namespace)
     return {"status": "success", "message": f"Database partition reset successfully."}
 
