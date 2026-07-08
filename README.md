@@ -78,6 +78,17 @@ This will run:
 - `shard2` at `http://localhost:8083`
 - `coordinator` gateway at `http://localhost:8080` (public interface)
 
+### Production Cloud Deployment (Kubernetes & Terraform)
+
+For production deployments on AWS (EKS), GCP (GKE), or Azure (AKS), you can use the Kubernetes manifests and Terraform templates provided in the [deploy/](deploy/) directory.
+
+This sets up:
+- A `StatefulSet` with stable internal hostnames for the sharded storage nodes.
+- A stateless `Deployment` for the coordinator gateway.
+- A public cloud `LoadBalancer` to expose the gateway.
+
+Please refer to the comprehensive [Multi-Cloud Deployment Guide](deploy/README.md) for step-by-step setup instructions.
+
 ### Running from Docker Hub Image
 
 You can pull and run a node directly from the Docker Hub registry:
