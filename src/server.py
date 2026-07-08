@@ -8,6 +8,7 @@ import bisect
 import asyncio
 import httpx
 import json
+import time
 import numpy as np
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status, Security, Depends, Request, Response
@@ -153,7 +154,32 @@ class ConsistentHashRing:
 # Read cluster environment configuration
 NODE_MODE = os.getenv("NODE_MODE", "shard").lower()
 shard_nodes_str = os.getenv("SHARD_NODES", "")
-shard_nodes = [s.strip() for s in shard_nodes_str.split(",") if s.strip()]
+
+from enum import Enum
+
+class ConsistencyLevel(str, Enum):
+    ONE = "one"
+    QUORUM = "quorum"
+    ALL = "all"
+
+def get_consistency_level(request: Request) -> ConsistencyLevel:
+    header_val = request.headers.get("x-consistency-level") or request.query_params.get("consistency")
+    if header_val:
+        try:
+            return ConsistencyLevel(header_val.lower())
+        except ValueError:
+            pass
+    return ConsistencyLevel.ONE
+
+shard_groups = []
+if shard_nodes_str:
+    for group_str in shard_nodes_str.split(","):
+        if group_str.strip():
+            replicas = [r.strip() for r in group_str.split("+") if r.strip()]
+            if replicas:
+                shard_groups.append(replicas)
+
+shard_nodes = [group[0] for group in shard_groups] if shard_groups else []
 hash_ring = ConsistentHashRing(shard_nodes) if shard_nodes else None
 
 # Dynamic embedding configuration (defaults to local offline all-MiniLM-L6-v2)
@@ -167,6 +193,29 @@ class RequestContext(BaseModel):
     key_info: ScopedAPIKey
 
 SHARD_METRICS_CACHE: Dict[str, Any] = {}
+
+def get_replica_group_for_node(node: str) -> List[str]:
+    for group in shard_groups:
+        if node in group:
+            return group
+    return [node]
+
+def get_healthy_replica_for_group(group: List[str]) -> Optional[str]:
+    for node in group:
+        metrics = SHARD_METRICS_CACHE.get(node)
+        if not metrics or metrics.get("status") == "healthy":
+            return node
+    return group[0] if group else None
+
+def get_all_healthy_replicas_for_group(group: List[str]) -> List[str]:
+    healthy = []
+    for node in group:
+        metrics = SHARD_METRICS_CACHE.get(node)
+        if not metrics or metrics.get("status") == "healthy":
+            healthy.append(node)
+    if not healthy and group:
+        healthy.append(group[0])
+    return healthy
 
 # -------------------------------------------------------------------------
 # Cache Layer Configuration
@@ -237,21 +286,94 @@ async def broadcast_sse_event(event_type: str, data: dict):
     for queue in list(SSE_LISTENERS):
         await queue.put({"event": event_type, "data": data})
 
+# Track syncing nodes
+SYNCING_NODES = set()
+
+async def sync_node_data(recovering_node: str, source_node: str):
+    """
+    Synchronizes all databases from source_node to recovering_node.
+    """
+    logger.info(f"Triggering recovery sync for node {recovering_node} from source {source_node}...")
+    try:
+        headers = {}
+        if INTERNAL_AUTH_TOKEN:
+            headers["X-Internal-Token"] = INTERNAL_AUTH_TOKEN
+        
+        async with httpx.AsyncClient(headers=headers, timeout=120.0) as sync_client:
+            res = await sync_client.get(f"{source_node}/admin/databases")
+            res.raise_for_status()
+            databases = res.json().get("databases", [])
+            
+            for db_info in databases:
+                tenant = db_info.get("tenant")
+                namespace = db_info.get("namespace")
+                logger.info(f"Syncing database (tenant={tenant}, namespace={namespace}) from {source_node} to {recovering_node}...")
+                
+                timeline_payload = {
+                    "entity_id": None,
+                    "start": None,
+                    "end": None
+                }
+                req_headers = {}
+                if tenant:
+                    req_headers["X-Tenant"] = tenant
+                if namespace:
+                    req_headers["X-Namespace"] = namespace
+                    
+                timeline_res = await sync_client.post(
+                    f"{source_node}/get_timeline",
+                    json=timeline_payload,
+                    headers=req_headers
+                )
+                timeline_res.raise_for_status()
+                memories = timeline_res.json().get("memories", [])
+                
+                reset_res = await sync_client.post(
+                    f"{recovering_node}/admin/reset",
+                    json={"tenant": tenant, "namespace": namespace}
+                )
+                reset_res.raise_for_status()
+                
+                for m in memories:
+                    target_payload = {
+                        "text": m.get("payload") or m.get("text"),
+                        "metadata": m.get("metadata", {}),
+                        "id": m.get("id"),
+                        "memory_type": m.get("memory_type")
+                    }
+                    write_res = await sync_client.post(
+                        f"{recovering_node}/remember",
+                        json=target_payload,
+                        headers=req_headers
+                    )
+                    write_res.raise_for_status()
+                    
+            logger.info(f"Sync complete for recovering node {recovering_node} from source {source_node}.")
+    except Exception as e:
+        logger.error(f"Sync task failed for node {recovering_node} from source {source_node}: {e}")
+        raise e
+
 async def poll_shards_loop():
     """
     Background loop that runs on the coordinator to poll shards for health and metrics.
     """
     logger.info("Starting background health polling loop for shards...")
+    all_replica_nodes = []
+    for group in shard_groups:
+        all_replica_nodes.extend(group)
+        
     while True:
         if client:
             try:
-                tasks = [client.get(f"{shard}/stats", timeout=2.0) for shard in shard_nodes]
+                tasks = [client.get(f"{shard}/stats", timeout=2.0) for shard in all_replica_nodes]
                 responses = await asyncio.gather(*tasks, return_exceptions=True)
-                for shard, resp in zip(shard_nodes, responses):
+                for shard, resp in zip(all_replica_nodes, responses):
                     if isinstance(resp, httpx.Response) and resp.status_code == 200:
                         try:
                             data = resp.json()
-                            SHARD_METRICS_CACHE[shard] = {
+                            prev_status = SHARD_METRICS_CACHE.get(shard, {}).get("status")
+                            
+                            metrics = {
                                 "status": "healthy",
                                 "memory_count": data.get("memory_count", 0),
                                 "l1_size": data.get("l1_size", 0),
@@ -261,6 +383,48 @@ async def poll_shards_loop():
                                 "ram": data.get("ram", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
                                 "disk": data.get("disk", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
                             }
+                            
+                            # Trigger background synchronization if node was previously offline/unhealthy
+                            logger.info(f"poll_shards_loop: shard={shard} prev_status={prev_status} syncing={shard in SYNCING_NODES}")
+                            if prev_status not in ("healthy", "synchronizing") and shard not in SYNCING_NODES:
+                                group = get_replica_group_for_node(shard)
+                                source_node = None
+                                for sibling in group:
+                                    if sibling != shard:
+                                        sib_metrics = SHARD_METRICS_CACHE.get(sibling)
+                                        sib_status = sib_metrics.get("status") if sib_metrics else None
+                                        logger.info(f"poll_shards_loop: checking sibling={sibling} status={sib_status}")
+                                        if sib_metrics and sib_status == "healthy":
+                                            source_node = sibling
+                                            break
+                                            
+                                logger.info(f"poll_shards_loop: shard={shard} selected source_node={source_node}")
+                                if source_node:
+                                    metrics["status"] = "synchronizing"
+                                    SHARD_METRICS_CACHE[shard] = metrics
+                                    SYNCING_NODES.add(shard)
+                                    
+                                    async def run_sync_task(node=shard, src=source_node):
+                                        try:
+                                            await sync_node_data(node, src)
+                                            if node in SHARD_METRICS_CACHE:
+                                                SHARD_METRICS_CACHE[node]["status"] = "healthy"
+                                            logger.info(f"Node {node} successfully recovered and synchronized.")
+                                        except Exception as e:
+                                            if node in SHARD_METRICS_CACHE:
+                                                SHARD_METRICS_CACHE[node]["status"] = "unhealthy"
+                                            logger.error(f"Failed to synchronize recovering node {node}: {e}")
+                                        finally:
+                                            SYNCING_NODES.discard(node)
+                                            
+                                    asyncio.create_task(run_sync_task())
+                                else:
+                                    logger.info(f"poll_shards_loop: marking shard={shard} healthy immediately because no source_node was found")
+                                    SHARD_METRICS_CACHE[shard] = metrics
+                            else:
+                                if prev_status == "synchronizing":
+                                    metrics["status"] = "synchronizing"
+                                SHARD_METRICS_CACHE[shard] = metrics
                         except Exception as e:
                             SHARD_METRICS_CACHE[shard] = {
                                 "status": "unhealthy",
@@ -285,46 +449,45 @@ async def poll_shards_loop():
 def get_healthy_shard(key: str) -> str:
     """
     Selects the target shard for a key using consistent hashing.
-    If the target node is unhealthy or overloaded (CPU/RAM/Disk > 90%),
-    it routes to the next healthy alternative shard in the ring.
+    If the target shard group is unhealthy or overloaded (CPU/RAM/Disk > 90%),
+    it routes to the next healthy alternative shard group in the ring.
     """
     if not shard_nodes:
         raise HTTPException(status_code=500, detail="No shards available to route write request.")
     
     primary_node = hash_ring.get_node(key)
     
-    def is_node_good(node: str) -> bool:
-        metrics = SHARD_METRICS_CACHE.get(node)
-        if not metrics:
-            return True
-        if metrics.get("status") != "healthy":
-            return False
-        
-        # During pytest, ignore CPU/RAM resource threshold routing to ensure deterministic hash distribution
-        if os.getenv("PYTEST_CURRENT_TEST"):
-            return True
-            
-        cpu = metrics.get("cpu", 0.0)
-        ram_pct = metrics.get("ram", {}).get("percent", 0.0)
-        disk_pct = metrics.get("disk", {}).get("percent", 0.0)
-        
-        if cpu > 90.0 or ram_pct > 90.0 or disk_pct > 90.0:
-            return False
-        return True
+    def is_group_good(node: str) -> bool:
+        group = get_replica_group_for_node(node)
+        for rep in group:
+            metrics = SHARD_METRICS_CACHE.get(rep)
+            if not metrics:
+                return True
+            if metrics.get("status") == "healthy":
+                if os.getenv("PYTEST_CURRENT_TEST"):
+                    return True
+                cpu = metrics.get("cpu", 0.0)
+                ram_pct = metrics.get("ram", {}).get("percent", 0.0)
+                disk_pct = metrics.get("disk", {}).get("percent", 0.0)
+                if cpu <= 90.0 and ram_pct <= 90.0 and disk_pct <= 90.0:
+                    return True
+        return False
 
-    if is_node_good(primary_node):
+    if is_group_good(primary_node):
         return primary_node
 
     for node in shard_nodes:
-        if node != primary_node and is_node_good(node):
-            logger.warning(f"Routing key '{key[:20]}...' to healthy fallback node {node} instead of overloaded/unhealthy {primary_node}")
+        if node != primary_node and is_group_good(node):
+            logger.warning(f"Routing key '{key[:20]}...' to healthy fallback shard group {node} instead of overloaded/unhealthy {primary_node}")
             return node
 
     for node in shard_nodes:
-        metrics = SHARD_METRICS_CACHE.get(node)
-        if metrics and metrics.get("status") == "healthy":
-            logger.warning(f"Routing to overloaded but alive fallback node {node}")
-            return node
+        group = get_replica_group_for_node(node)
+        for rep in group:
+            metrics = SHARD_METRICS_CACHE.get(rep)
+            if metrics and metrics.get("status") == "healthy":
+                logger.warning(f"Routing to overloaded but alive fallback shard group {node}")
+                return node
 
     logger.warning(f"All nodes unhealthy/offline. Routing to default consistent-hashing node {primary_node}")
     return primary_node
@@ -391,9 +554,24 @@ db: Optional[AsyncEpochDB] = None
 # Global HTTP client session (Coordinator Mode)
 client: Optional[httpx.AsyncClient] = None
 
+# Locks for database initialization to prevent race conditions
+db_init_locks: Dict[tuple[Optional[str], Optional[str]], asyncio.Lock] = {}
+db_init_locks_lock = asyncio.Lock()
+
 async def get_db_instance(tenant: Optional[str] = None, namespace: Optional[str] = None) -> AsyncEpochDB:
     key = (tenant, namespace)
-    if key not in db_pool:
+    if key in db_pool:
+        return db_pool[key]
+        
+    async with db_init_locks_lock:
+        if key not in db_init_locks:
+            db_init_locks[key] = asyncio.Lock()
+        lock = db_init_locks[key]
+        
+    async with lock:
+        if key in db_pool:
+            return db_pool[key]
+            
         storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
         logger.info(f"Initializing AsyncEpochDB for tenant={tenant}, namespace={namespace} under {storage_dir}")
         engine = AsyncEpochDB(
@@ -415,7 +593,7 @@ async def get_db_instance(tenant: Optional[str] = None, namespace: Optional[str]
             logger.error(f"Error warming up db instance {key}: {e}")
             
         db_pool[key] = engine
-    return db_pool[key]
+        return engine
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -543,6 +721,140 @@ def get_forward_headers(ctx: RequestContext) -> Dict[str, str]:
         headers["X-Internal-Token"] = INTERNAL_AUTH_TOKEN
     return headers
 
+
+# Shard database partitions administration schemas and routes
+class ResetPayload(BaseModel):
+    tenant: Optional[str] = None
+    namespace: Optional[str] = None
+
+@app.get("/admin/databases")
+async def admin_list_databases(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
+    """
+    Lists all local database partitions (tenants and namespaces) on this shard.
+    Only supported in Shard Mode.
+    """
+    if NODE_MODE == "coordinator":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only supported in Shard Mode.")
+    
+    storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
+    dbs = []
+    
+    # Check default partition
+    if os.path.exists(os.path.join(storage_dir, "metadata.json")):
+        dbs.append({"tenant": None, "namespace": None})
+        
+    # Check namespaces directly under storage_dir
+    ns_dir = os.path.join(storage_dir, "ns")
+    if os.path.exists(ns_dir):
+        try:
+            for namespace in os.listdir(ns_dir):
+                if os.path.isdir(os.path.join(ns_dir, namespace)):
+                    dbs.append({"tenant": None, "namespace": namespace})
+        except Exception as e:
+            logger.error(f"Error listing namespace directory: {e}")
+            
+    # Check tenants
+    tenants_dir = os.path.join(storage_dir, "tenants")
+    if os.path.exists(tenants_dir):
+        try:
+            for tenant in os.listdir(tenants_dir):
+                tenant_path = os.path.join(tenants_dir, tenant)
+                if os.path.isdir(tenant_path):
+                    # Check if tenant has default namespace db
+                    if os.path.exists(os.path.join(tenant_path, "metadata.json")):
+                        dbs.append({"tenant": tenant, "namespace": None})
+                    
+                    # Check namespaces within tenant
+                    tenant_ns_dir = os.path.join(tenant_path, "ns")
+                    if os.path.exists(tenant_ns_dir):
+                        for namespace in os.listdir(tenant_ns_dir):
+                            if os.path.isdir(os.path.join(tenant_ns_dir, namespace)):
+                                dbs.append({"tenant": tenant, "namespace": namespace})
+        except Exception as e:
+            logger.error(f"Error listing tenants directory: {e}")
+            
+    return {"databases": dbs}
+
+
+@app.post("/admin/reset")
+async def admin_reset_database(
+    payload: ResetPayload,
+    ctx: RequestContext = Depends(get_context({Permission.ADMIN}))
+):
+    """
+    Resets and completely deletes a database partition (tenant and namespace) on this shard.
+    Only supported in Shard Mode.
+    """
+    if NODE_MODE == "coordinator":
+        if not client:
+            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+        
+        all_replica_nodes = []
+        for group in shard_groups:
+            all_replica_nodes.extend(group)
+            
+        tasks = [
+            client.post(
+                f"{node}/admin/reset",
+                json=payload.model_dump(),
+                headers=get_forward_headers(ctx)
+            ) for node in all_replica_nodes
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        errors = []
+        for node, resp in zip(all_replica_nodes, responses):
+            if isinstance(resp, Exception) or (isinstance(resp, httpx.Response) and resp.status_code != 200):
+                err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                logger.error(f"Reset failed on node {node}: {err_msg}")
+                errors.append(f"{node}: {err_msg}")
+                
+        if errors:
+            raise HTTPException(status_code=500, detail=f"Failed to reset partition on all replica nodes: {', '.join(errors)}")
+            
+        invalidate_cache(payload.tenant, payload.namespace)
+        return {"status": "success", "message": f"Cluster-wide database partition reset successfully."}
+        
+    key = (payload.tenant, payload.namespace)
+    logger.info(f"Admin reset request received for tenant={payload.tenant}, namespace={payload.namespace}")
+    
+    # 1. Close and remove the database instance from pool
+    if key in db_pool:
+        db_instance = db_pool[key]
+        try:
+            await db_instance.close()
+        except Exception as e:
+            logger.error(f"Error closing db instance for reset: {e}")
+        del db_pool[key]
+        
+    global db
+    if payload.tenant is None and payload.namespace is None:
+        db = None
+        
+    # 2. Delete storage files
+    storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
+    if payload.tenant:
+        storage_dir = os.path.join(storage_dir, "tenants", payload.tenant)
+    if payload.namespace:
+        storage_dir = os.path.join(storage_dir, "ns", payload.namespace)
+    storage_dir = os.path.abspath(storage_dir)
+    
+    if os.path.exists(storage_dir):
+        try:
+            import shutil
+            shutil.rmtree(storage_dir)
+            logger.info(f"Deleted storage directory {storage_dir}")
+        except Exception as e:
+            logger.error(f"Failed to delete storage directory {storage_dir}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to clear partition storage: {str(e)}"
+            )
+            
+    invalidate_cache(payload.tenant, payload.namespace)
+    return {"status": "success", "message": f"Database partition reset successfully."}
+
+
 # Key administration schemas
 class KeyCreatePayload(BaseModel):
     permissions: List[str]
@@ -588,7 +900,7 @@ async def list_api_keys(
 
 
 @app.post("/remember", status_code=status.HTTP_201_CREATED)
-async def remember(payload: MemoryPayload, ctx: RequestContext = Depends(get_context({Permission.WRITE}))):
+async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext = Depends(get_context({Permission.WRITE}))):
     """
     Appends a new memory atom to the Hot Tier (RAM) and schedules background WAL logging.
     In coordinator mode, routes writes using consistent hashing and ID prefixing.
@@ -658,35 +970,66 @@ async def remember(payload: MemoryPayload, ctx: RequestContext = Depends(get_con
                     "id": atom_id,
                     "memory_type": payload.memory_type
                 }
-                res = await client.post(
-                    f"{target_shard}/remember",
-                    json=target_payload,
-                    headers=get_forward_headers(ctx)
-                )
-                res.raise_for_status()
-                invalidate_cache(ctx.tenant, ctx.namespace)
-                await broadcast_sse_event("update", {"type": "write", "id": atom_id})
-                return {"status": "success", "id": atom_id}
+                group = get_replica_group_for_node(target_shard)
+                tasks = [
+                    client.post(
+                        f"{node}/remember",
+                        json=target_payload,
+                        headers=get_forward_headers(ctx)
+                    ) for node in group
+                ]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                success_nodes = []
+                failures = []
+                for node, resp in zip(group, responses):
+                    if isinstance(resp, httpx.Response) and resp.status_code == 201:
+                        success_nodes.append(node)
+                    else:
+                        err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                        logger.warning(f"Replication write failed to node {node}: {err_msg}")
+                        failures.append((node, err_msg))
+                        SHARD_METRICS_CACHE[node] = {
+                            "status": "offline",
+                            "cpu": 0.0,
+                            "ram": {"percent": 0.0},
+                            "disk": {"percent": 0.0}
+                        }
+                
+                consistency = get_consistency_level(request)
+                n = len(group)
+                if consistency == ConsistencyLevel.ALL:
+                    required_success = n
+                elif consistency == ConsistencyLevel.QUORUM:
+                    required_success = n // 2 + 1
+                else:
+                    required_success = 1
+                
+                if len(success_nodes) >= required_success:
+                    invalidate_cache(ctx.tenant, ctx.namespace)
+                    await broadcast_sse_event("update", {"type": "write", "id": atom_id})
+                    return {"status": "success", "id": atom_id}
+                else:
+                    last_err = failures[-1][1] if failures else "Unknown error"
+                    raise Exception(f"Write consistency check failed. Required: {consistency.value} ({required_success}), got: {len(success_nodes)} success(es). Last error: {last_err}")
             except Exception as e:
-                logger.error(f"Failed to forward write to shard {target_shard} on attempt {attempt}: {e}")
-                # Immediately update cache to mark shard offline to prevent picking it again
-                SHARD_METRICS_CACHE[target_shard] = {
-                    "status": "offline",
-                    "cpu": 0.0,
-                    "ram": {"percent": 0.0},
-                    "disk": {"percent": 0.0}
-                }
+                logger.error(f"Failed to forward write to shard set {target_shard} on attempt {attempt}: {e}")
                 if attempt >= max_attempts:
-                    raise HTTPException(status_code=500, detail=f"Failed to forward write to shard: {str(e)}")
+                    raise HTTPException(status_code=500, detail=f"Failed to forward write to shard set: {str(e)}")
             
     else:
         # Shard Mode (Storage Node)
         active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
+            if payload.metadata is None:
+                payload.metadata = {}
+            if "_updated_at" not in payload.metadata:
+                payload.metadata["_updated_at"] = time.time()
+                
             if payload.id:
                 engine = await active_db._get_db()
                 text = payload.text
-                metadata = payload.metadata or {}
+                metadata = payload.metadata
                 
                 # Manual embedding generation to support predefined atom_id
                 if engine._model_name:
@@ -753,25 +1096,97 @@ async def get_memory(
                 
             target_shard = get_shard_for_id(payload.memory_id)
             if target_shard:
-                try:
-                    res = await client.post(
-                        f"{target_shard}/get",
-                        json=payload.model_dump(),
-                        headers=get_forward_headers(ctx)
-                    )
-                    res.raise_for_status()
-                    return res.json()
-                except Exception as e:
-                    logger.error(f"Error forwarding get to shard {target_shard}: {e}")
-                    raise HTTPException(status_code=500, detail=str(e))
-            else:
-                # Broadcast to all shards in parallel
+                group = get_replica_group_for_node(target_shard)
                 tasks = [
                     client.post(
-                        f"{shard}/get",
+                        f"{node}/get",
                         json=payload.model_dump(),
                         headers=get_forward_headers(ctx)
-                    ) for shard in shard_nodes
+                    ) for node in group
+                ]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                valid_replies = []
+                failures = []
+                for node, resp in zip(group, responses):
+                    if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                        valid_replies.append((node, resp.json()))
+                    else:
+                        err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                        failures.append((node, err_msg))
+                        
+                n = len(group)
+                consistency = get_consistency_level(request)
+                if consistency == ConsistencyLevel.ALL:
+                    required_success = n
+                elif consistency == ConsistencyLevel.QUORUM:
+                    required_success = n // 2 + 1
+                else:
+                    required_success = 1
+                    
+                if len(valid_replies) < required_success:
+                    last_err = failures[-1][1] if failures else "Unknown read failure"
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Read consistency check failed. Required: {consistency.value} ({required_success}), got: {len(valid_replies)} valid replies. Last error: {last_err}"
+                    )
+                    
+                memories_found = [(node, data) for node, data in valid_replies if data and "id" in data]
+                
+                if not memories_found:
+                    return {}
+                    
+                # A memory is newer if it has a higher _updated_at in metadata, or fallback to created_at
+                def get_timestamp(data):
+                    meta = data.get("metadata") or {}
+                    return meta.get("_updated_at") or data.get("created_at") or 0.0
+                    
+                latest_node, latest_data = max(memories_found, key=lambda x: get_timestamp(x[1]))
+                latest_ts = get_timestamp(latest_data)
+                
+                stale_replicas = []
+                for node, data in valid_replies:
+                    if not data or "id" not in data:
+                        stale_replicas.append(node)
+                    elif get_timestamp(data) < latest_ts:
+                        stale_replicas.append(node)
+                        
+                if stale_replicas:
+                    logger.info(f"Read Repair triggered: repairing stale/missing memory {payload.memory_id} on replicas: {stale_replicas}")
+                    async def run_read_repair(target_nodes=stale_replicas, memory_data=latest_data):
+                        repair_payload = {
+                            "text": memory_data.get("payload") or memory_data.get("text"),
+                            "metadata": memory_data.get("metadata", {}),
+                            "id": memory_data.get("id"),
+                            "memory_type": memory_data.get("memory_type")
+                        }
+                        headers = get_forward_headers(ctx)
+                        for node in target_nodes:
+                            try:
+                                res = await client.post(f"{node}/remember", json=repair_payload, headers=headers)
+                                if res.status_code == 201:
+                                    logger.info(f"Successfully repaired memory {memory_data.get('id')} on node {node}")
+                                else:
+                                    logger.error(f"Failed to repair memory on node {node}: status {res.status_code}")
+                            except Exception as re_err:
+                                logger.error(f"Read repair request failed for node {node}: {re_err}")
+                                
+                    asyncio.create_task(run_read_repair())
+                    
+                return latest_data
+            else:
+                # Broadcast to all shards in parallel (one healthy replica per shard group)
+                target_nodes = []
+                for group in shard_groups:
+                    node = get_healthy_replica_for_group(group)
+                    if node:
+                        target_nodes.append(node)
+                tasks = [
+                    client.post(
+                        f"{node}/get",
+                        json=payload.model_dump(),
+                        headers=get_forward_headers(ctx)
+                    ) for node in target_nodes
                 ]
                 responses = await asyncio.gather(*tasks, return_exceptions=True)
                 for resp in responses:
@@ -791,7 +1206,11 @@ async def get_memory(
                 logger.error(f"Error resolving memory retrieval: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
-    return await handle_cached_read("get", payload, request, response, ctx, fetch)
+    consistency = get_consistency_level(request)
+    if consistency in (ConsistencyLevel.QUORUM, ConsistencyLevel.ALL):
+        return await fetch()
+    else:
+        return await handle_cached_read("get", payload, request, response, ctx, fetch)
 
 @app.post("/query")
 async def query_memories(
@@ -809,12 +1228,17 @@ async def query_memories(
             if not client:
                 raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
                 
+            target_nodes = []
+            for group in shard_groups:
+                node = get_healthy_replica_for_group(group)
+                if node:
+                    target_nodes.append(node)
             tasks = [
                 client.post(
-                    f"{shard}/query",
+                    f"{node}/query",
                     json=payload.model_dump(),
                     headers=get_forward_headers(ctx)
-                ) for shard in shard_nodes
+                ) for node in target_nodes
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             
@@ -883,12 +1307,17 @@ async def adaptive_query_memories(
             if not client:
                 raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
                 
+            target_nodes = []
+            for group in shard_groups:
+                node = get_healthy_replica_for_group(group)
+                if node:
+                    target_nodes.append(node)
             tasks = [
                 client.post(
-                    f"{shard}/adaptive_query",
+                    f"{node}/adaptive_query",
                     json=payload.model_dump(),
                     headers=get_forward_headers(ctx)
-                ) for shard in shard_nodes
+                ) for node in target_nodes
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             
@@ -928,7 +1357,7 @@ async def adaptive_query_memories(
     return await handle_cached_read("adaptive_query", payload, request, response, ctx, fetch)
 
 @app.post("/update")
-async def update_memory(payload: UpdatePayload, ctx: RequestContext = Depends(get_context({Permission.WRITE}))):
+async def update_memory(payload: UpdatePayload, request: Request, ctx: RequestContext = Depends(get_context({Permission.WRITE}))):
     """
     Updates memory text or metadata.
     """
@@ -938,39 +1367,76 @@ async def update_memory(payload: UpdatePayload, ctx: RequestContext = Depends(ge
             
         target_shard = get_shard_for_id(payload.memory_id)
         if target_shard:
-            try:
-                res = await client.post(
-                    f"{target_shard}/update",
-                    json=payload.model_dump(),
-                    headers=get_forward_headers(ctx)
-                )
-                res.raise_for_status()
-                invalidate_cache(ctx.tenant, ctx.namespace)
-                await broadcast_sse_event("update", {"type": "update", "id": payload.memory_id})
-                return res.json()
-            except Exception as e:
-                logger.error(f"Error forwarding update to shard {target_shard}: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
-        else:
-            # Broadcast to all
+            group = get_replica_group_for_node(target_shard)
             tasks = [
                 client.post(
-                    f"{shard}/update",
+                    f"{node}/update",
                     json=payload.model_dump(),
                     headers=get_forward_headers(ctx)
-                ) for shard in shard_nodes
+                ) for node in group
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
-            for resp in responses:
-                if isinstance(resp, Exception):
-                    logger.error(f"Error updating shard: {resp}")
+            
+            success_nodes = []
+            failures = []
+            for node, resp in zip(group, responses):
+                if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                    success_nodes.append(node)
+                else:
+                    err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                    logger.warning(f"Replication update failed on replica {node}: {err_msg}")
+                    failures.append((node, err_msg))
+                    SHARD_METRICS_CACHE[node] = {
+                        "status": "offline",
+                        "cpu": 0.0,
+                        "ram": {"percent": 0.0},
+                        "disk": {"percent": 0.0}
+                    }
+                    
+            consistency = get_consistency_level(request)
+            n = len(group)
+            if consistency == ConsistencyLevel.ALL:
+                required_success = n
+            elif consistency == ConsistencyLevel.QUORUM:
+                required_success = n // 2 + 1
+            else:
+                required_success = 1
+                
+            if len(success_nodes) >= required_success:
+                invalidate_cache(ctx.tenant, ctx.namespace)
+                await broadcast_sse_event("update", {"type": "update", "id": payload.memory_id})
+                return {"status": "success"}
+            else:
+                last_err = failures[-1][1] if failures else "Unknown error"
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Update consistency check failed. Required: {consistency.value} ({required_success}), got: {len(success_nodes)}. Last error: {last_err}"
+                )
+        else:
+            # Broadcast to all replica groups
+            target_nodes = []
+            for group in shard_groups:
+                target_nodes.extend(get_all_healthy_replicas_for_group(group))
+            tasks = [
+                client.post(
+                    f"{node}/update",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                ) for node in target_nodes
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for node, resp in zip(target_nodes, responses):
+                if isinstance(resp, Exception) or (isinstance(resp, httpx.Response) and resp.status_code != 200):
+                    logger.error(f"Error updating replica {node}: {resp}")
             invalidate_cache(ctx.tenant, ctx.namespace)
             await broadcast_sse_event("update", {"type": "update", "id": payload.memory_id})
             return {"status": "success"}
     else:
         active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
-            await active_db.update(payload.memory_id, payload.text, payload.metadata)
+            meta = dict(payload.metadata) if payload.metadata is not None else {}
+            meta["_updated_at"] = time.time()
+            await active_db.update(payload.memory_id, payload.text, meta)
             invalidate_cache(ctx.tenant, ctx.namespace)
             await broadcast_sse_event("update", {"type": "update", "id": payload.memory_id})
             return {"status": "success"}
@@ -979,7 +1445,7 @@ async def update_memory(payload: UpdatePayload, ctx: RequestContext = Depends(ge
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/delete")
-async def delete_memory(payload: DeletePayload, ctx: RequestContext = Depends(get_context({Permission.DELETE}))):
+async def delete_memory(payload: DeletePayload, request: Request, ctx: RequestContext = Depends(get_context({Permission.DELETE}))):
     """
     Deletes memory (hard or soft).
     """
@@ -989,32 +1455,67 @@ async def delete_memory(payload: DeletePayload, ctx: RequestContext = Depends(ge
             
         target_shard = get_shard_for_id(payload.memory_id)
         if target_shard:
-            try:
-                res = await client.post(
-                    f"{target_shard}/delete",
-                    json=payload.model_dump(),
-                    headers=get_forward_headers(ctx)
-                )
-                res.raise_for_status()
-                invalidate_cache(ctx.tenant, ctx.namespace)
-                await broadcast_sse_event("update", {"type": "delete", "id": payload.memory_id})
-                return res.json()
-            except Exception as e:
-                logger.error(f"Error forwarding delete to shard {target_shard}: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
-        else:
-            # Broadcast
+            group = get_replica_group_for_node(target_shard)
             tasks = [
                 client.post(
-                    f"{shard}/delete",
+                    f"{node}/delete",
                     json=payload.model_dump(),
                     headers=get_forward_headers(ctx)
-                ) for shard in shard_nodes
+                ) for node in group
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
-            for resp in responses:
-                if isinstance(resp, Exception):
-                    logger.error(f"Error deleting shard: {resp}")
+            
+            success_nodes = []
+            failures = []
+            for node, resp in zip(group, responses):
+                if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                    success_nodes.append(node)
+                else:
+                    err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                    logger.warning(f"Replication delete failed on replica {node}: {err_msg}")
+                    failures.append((node, err_msg))
+                    SHARD_METRICS_CACHE[node] = {
+                        "status": "offline",
+                        "cpu": 0.0,
+                        "ram": {"percent": 0.0},
+                        "disk": {"percent": 0.0}
+                    }
+                    
+            consistency = get_consistency_level(request)
+            n = len(group)
+            if consistency == ConsistencyLevel.ALL:
+                required_success = n
+            elif consistency == ConsistencyLevel.QUORUM:
+                required_success = n // 2 + 1
+            else:
+                required_success = 1
+                
+            if len(success_nodes) >= required_success:
+                invalidate_cache(ctx.tenant, ctx.namespace)
+                await broadcast_sse_event("update", {"type": "delete", "id": payload.memory_id})
+                return {"status": "success"}
+            else:
+                last_err = failures[-1][1] if failures else "Unknown error"
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Delete consistency check failed. Required: {consistency.value} ({required_success}), got: {len(success_nodes)}. Last error: {last_err}"
+                )
+        else:
+            # Broadcast to all replica groups
+            target_nodes = []
+            for group in shard_groups:
+                target_nodes.extend(get_all_healthy_replicas_for_group(group))
+            tasks = [
+                client.post(
+                    f"{node}/delete",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                ) for node in target_nodes
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for node, resp in zip(target_nodes, responses):
+                if isinstance(resp, Exception) or (isinstance(resp, httpx.Response) and resp.status_code != 200):
+                    logger.error(f"Error deleting replica {node}: {resp}")
             invalidate_cache(ctx.tenant, ctx.namespace)
             await broadcast_sse_event("update", {"type": "delete", "id": payload.memory_id})
             return {"status": "success"}
@@ -1051,12 +1552,17 @@ async def entity_graph(
             if entity_id:
                 params["entity_id"] = entity_id
                 
+            target_nodes = []
+            for group in shard_groups:
+                node = get_healthy_replica_for_group(group)
+                if node:
+                    target_nodes.append(node)
             tasks = [
                 client.get(
-                    f"{shard}/entity_graph",
+                    f"{node}/entity_graph",
                     params=params,
                     headers=get_forward_headers(ctx)
-                ) for shard in shard_nodes
+                ) for node in target_nodes
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             
@@ -1126,12 +1632,17 @@ async def get_timeline(
             if not client:
                 raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
                 
+            target_nodes = []
+            for group in shard_groups:
+                node = get_healthy_replica_for_group(group)
+                if node:
+                    target_nodes.append(node)
             tasks = [
                 client.post(
-                    f"{shard}/get_timeline",
+                    f"{node}/get_timeline",
                     json=payload.model_dump(),
                     headers=get_forward_headers(ctx)
-                ) for shard in shard_nodes
+                ) for node in target_nodes
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             
@@ -1169,11 +1680,15 @@ async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
         if not client:
             raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
             
+        all_replica_nodes = []
+        for group in shard_groups:
+            all_replica_nodes.extend(group)
+            
         tasks = [
             client.get(
-                f"{shard}/stats",
+                f"{node}/stats",
                 headers=get_forward_headers(ctx)
-            ) for shard in shard_nodes
+            ) for node in all_replica_nodes
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -1182,18 +1697,26 @@ async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
         total_l2_size = 0
         total_entity_count = 0
         
+        group_representatives = []
+        for group in shard_groups:
+            node = get_healthy_replica_for_group(group)
+            if node:
+                group_representatives.append(node)
+                
         shards_metrics = {}
-        for shard, resp in zip(shard_nodes, responses):
+        for node, resp in zip(all_replica_nodes, responses):
             if isinstance(resp, httpx.Response) and resp.status_code == 200:
                 try:
                     data = resp.json()
-                    total_memory_count += data.get("memory_count", 0)
-                    total_l1_size += data.get("l1_size", 0)
-                    total_l2_size += data.get("l2_size", 0)
-                    total_entity_count += data.get("entity_count", 0)
+                    if node in group_representatives:
+                        total_memory_count += data.get("memory_count", 0)
+                        total_l1_size += data.get("l1_size", 0)
+                        total_l2_size += data.get("l2_size", 0)
+                        total_entity_count += data.get("entity_count", 0)
                     
-                    shards_metrics[shard] = {
-                        "status": "healthy",
+                    cached_status = SHARD_METRICS_CACHE.get(node, {}).get("status", "healthy")
+                    shards_metrics[node] = {
+                        "status": cached_status,
                         "memory_count": data.get("memory_count", 0),
                         "l1_size": data.get("l1_size", 0),
                         "l2_size": data.get("l2_size", 0),
@@ -1203,7 +1726,7 @@ async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
                         "disk": data.get("disk", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
                     }
                 except Exception as e:
-                    shards_metrics[shard] = {
+                    shards_metrics[node] = {
                         "status": "unhealthy",
                         "error": f"Failed to parse response: {str(e)}",
                         "cpu": 0.0,
@@ -1212,7 +1735,7 @@ async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
                     }
             else:
                 err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
-                shards_metrics[shard] = {
+                shards_metrics[node] = {
                     "status": "unhealthy",
                     "error": err_msg,
                     "cpu": 0.0,
@@ -1258,11 +1781,14 @@ async def compact(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))
         if not client:
             raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
             
+        target_nodes = []
+        for group in shard_groups:
+            target_nodes.extend(get_all_healthy_replicas_for_group(group))
         tasks = [
             client.post(
-                f"{shard}/compact",
+                f"{node}/compact",
                 headers=get_forward_headers(ctx)
-            ) for shard in shard_nodes
+            ) for node in target_nodes
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         for resp in responses:
