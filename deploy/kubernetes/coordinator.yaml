@@ -1,0 +1,91 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: epochdb-coordinator-service
+  namespace: epochdb
+  labels:
+    app: epochdb-coordinator
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  selector:
+    app: epochdb-coordinator
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: epochdb-coordinator
+  namespace: epochdb
+  labels:
+    app: epochdb-coordinator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: epochdb-coordinator
+  template:
+    metadata:
+      labels:
+        app: epochdb-coordinator
+    spec:
+      containers:
+      - name: coordinator
+        image: jersobh/epochdb:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: NODE_MODE
+          valueFrom:
+            configMapKeyRef:
+              name: epochdb-config
+              key: NODE_MODE_COORDINATOR
+        - name: SHARD_NODES
+          value: "http://epochdb-shard-0.epochdb-shard-service:8080,http://epochdb-shard-1.epochdb-shard-service:8080,http://epochdb-shard-2.epochdb-shard-service:8080"
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: epochdb-secrets
+              key: API_KEY
+        - name: INTERNAL_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: epochdb-secrets
+              key: INTERNAL_AUTH_TOKEN
+        # Standard configuration for API Keys if external models are used (e.g. OpenAI/Gemini)
+        # - name: OPENAI_API_KEY
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: epochdb-secrets
+        #       key: OPENAI_API_KEY
+        #       optional: true
+        # - name: GEMINI_API_KEY
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: epochdb-secrets
+        #       key: GEMINI_API_KEY
+        #       optional: true
+        resources:
+          limits:
+            cpu: "2"
+            memory: 2Gi
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10

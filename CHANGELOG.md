@@ -2,6 +2,13 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.9.1] - 2026-07-08
+### Added
+- **Multi-Cloud Deployment Blueprints**:
+  - Added Terraform templates to provision managed Kubernetes clusters on AWS (EKS), GCP (GKE), and Azure (AKS).
+  - Added Kubernetes manifests including a dedicated Namespace, ConfigMap/Secret credentials, StatefulSet with a Headless Service for sharded storage nodes, and a LoadBalancer-exposed Coordinator Deployment.
+  - Added a comprehensive step-by-step Multi-Cloud Deployment Guide at `deploy/README.md`.
+
 ## [0.9.0] - 2026-07-08
 ### Added
 - **Extended Replica Set Replication**:

@@ -15,7 +15,8 @@ export default defineConfig({
         text: 'Introduction',
         items: [
           { text: 'What is EpochDB?', link: '/guide/what-is-epochdb' },
-          { text: 'Getting Started', link: '/guide/getting-started' }
+          { text: 'Getting Started', link: '/guide/getting-started' },
+          { text: 'Cloud Deployment', link: '/guide/cloud-deployment' }
         ]
       },
       {
