@@ -2,6 +2,10 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.9.3] - 2026-07-08
+### Fixed
+- **Read Repair Test Race Condition**: Added `/admin/toggle_sync` coordinator endpoint to temporarily disable background health synchronization in integration tests, preventing automated recovery loops from racing with test verification assertions.
+
 ## [0.9.2] - 2026-07-08
 ### Fixed
 - **Admin Reset Deletion Order**: Fixed order of operations in `/admin/reset` where storage directory deletion was executed after re-initialization of the default database instance, causing subsequent calls to fail.

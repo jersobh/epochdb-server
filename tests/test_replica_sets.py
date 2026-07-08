@@ -196,6 +196,10 @@ async def test_write_consistency_levels():
     client_b = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PORT_S0_B}", headers=headers)
     
     try:
+        # Disable background sync to prevent automatic recovery sync from racing
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{PORT_COORD}", headers={"X-API-Key": "test-api-key-12345"}) as coord_client:
+            await coord_client.post("/admin/toggle_sync", params={"enabled": "false"})
+
         # Write with consistency = "all" (should succeed since both nodes are online)
         id_all = await coord_db.remember("Durability is important.", consistency="all")
         assert id_all.startswith("shard0-")
@@ -234,6 +238,11 @@ async def test_write_consistency_levels():
             await asyncio.sleep(1.0)
             
     finally:
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{PORT_COORD}", headers={"X-API-Key": "test-api-key-12345"}) as coord_client:
+            try:
+                await coord_client.post("/admin/toggle_sync", params={"enabled": "true"})
+            except Exception:
+                pass
         await client_a.aclose()
         await client_b.aclose()
 
@@ -246,6 +255,10 @@ async def test_read_repair_and_consistency():
     client_b = httpx.AsyncClient(base_url=f"http://127.0.0.1:{PORT_S0_B}", headers=headers)
     
     try:
+        # Disable background sync to prevent automatic recovery sync from racing
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{PORT_COORD}", headers={"X-API-Key": "test-api-key-12345"}) as coord_client:
+            await coord_client.post("/admin/toggle_sync", params={"enabled": "false"})
+
         # 1. Write a memory with ONE consistency
         m_id = await coord_db.remember("Original memory content.", consistency="one")
         await asyncio.sleep(0.5)
@@ -296,6 +309,11 @@ async def test_read_repair_and_consistency():
         assert res_a_new.json().get("payload") == "Updated memory content."
         
     finally:
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{PORT_COORD}", headers={"X-API-Key": "test-api-key-12345"}) as coord_client:
+            try:
+                await coord_client.post("/admin/toggle_sync", params={"enabled": "true"})
+            except Exception:
+                pass
         await client_a.aclose()
         await client_b.aclose()
 
