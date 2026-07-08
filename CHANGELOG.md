@@ -2,6 +2,12 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.9.2] - 2026-07-08
+### Fixed
+- **Admin Reset Deletion Order**: Fixed order of operations in `/admin/reset` where storage directory deletion was executed after re-initialization of the default database instance, causing subsequent calls to fail.
+- **databases Empty Reset List**: Updated `/admin/databases` list operation to scan active in-memory `db_pool` keys, guaranteeing empty or newly reset database partitions are detected and synchronized during recovery loops.
+- **remember Endpoint memory_type Parameter**: Cleaned up the `/remember` endpoint to directly delegate `memory_type` to the underlying engine's `remember` API, removing manual retrieval and property-setting workarounds.
+
 ## [0.9.1] - 2026-07-08
 ### Added
 - **Multi-Cloud Deployment Blueprints**:
