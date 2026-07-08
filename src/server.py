@@ -288,6 +288,7 @@ async def broadcast_sse_event(event_type: str, data: dict):
 
 # Track syncing nodes
 SYNCING_NODES = set()
+BACKGROUND_SYNC_ENABLED = True
 
 async def sync_node_data(recovering_node: str, source_node: str):
     """
@@ -386,7 +387,7 @@ async def poll_shards_loop():
                             
                             # Trigger background synchronization if node was previously offline/unhealthy
                             logger.info(f"poll_shards_loop: shard={shard} prev_status={prev_status} syncing={shard in SYNCING_NODES}")
-                            if prev_status not in ("healthy", "synchronizing") and shard not in SYNCING_NODES:
+                            if BACKGROUND_SYNC_ENABLED and prev_status not in ("healthy", "synchronizing") and shard not in SYNCING_NODES:
                                 group = get_replica_group_for_node(shard)
                                 source_node = None
                                 for sibling in group:
@@ -787,6 +788,24 @@ async def admin_list_databases(ctx: RequestContext = Depends(get_context({Permis
             
     dbs = [{"tenant": t, "namespace": ns} for t, ns in db_keys]
     return {"databases": dbs}
+
+
+@app.post("/admin/toggle_sync")
+async def toggle_sync(
+    enabled: bool,
+    ctx: RequestContext = Depends(get_context({Permission.ADMIN}))
+):
+    """
+    Toggles coordinator's background health check shard data synchronization loop.
+    Only supported in Coordinator Mode.
+    """
+    if NODE_MODE != "coordinator":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only supported in Coordinator Mode.")
+    
+    global BACKGROUND_SYNC_ENABLED
+    BACKGROUND_SYNC_ENABLED = enabled
+    logger.info(f"Background shard synchronization set to {enabled}")
+    return {"status": "success", "enabled": BACKGROUND_SYNC_ENABLED}
 
 
 @app.post("/admin/reset")
