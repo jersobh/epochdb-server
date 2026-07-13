@@ -1327,6 +1327,16 @@
                         await loadGraph();
                     }
                 });
+                eventSource.addEventListener('stats', async (e) => {
+                    if (!document.hidden) {
+                        try {
+                            const statsData = JSON.parse(e.data);
+                            await loadStats(statsData);
+                        } catch (err) {
+                            console.error("Failed to parse SSE stats data:", err);
+                        }
+                    }
+                });
                 eventSource.onerror = (err) => {
                     console.error("SSE connection error:", err);
                 };
@@ -1340,9 +1350,9 @@
             }
         }
 
-        async function loadStats() {
+        async function loadStats(statsData = null) {
             try {
-                const stats = await apiRequest('/stats');
+                const stats = statsData || await apiRequest('/stats');
                 document.getElementById('stat-memories').innerText = stats.memory_count !== undefined ? stats.memory_count : '0';
                 document.getElementById('stat-l1').innerText = stats.l1_size !== undefined ? stats.l1_size : '0';
                 document.getElementById('stat-l2').innerText = stats.l2_size !== undefined ? stats.l2_size : '0';
