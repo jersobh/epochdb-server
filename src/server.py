@@ -368,11 +368,12 @@ async def poll_shards_loop():
             try:
                 tasks = [client.get(f"{shard}/stats", timeout=2.0) for shard in all_replica_nodes]
                 responses = await asyncio.gather(*tasks, return_exceptions=True)
+                status_changed = False
                 for shard, resp in zip(all_replica_nodes, responses):
+                    prev_status = SHARD_METRICS_CACHE.get(shard, {}).get("status")
                     if isinstance(resp, httpx.Response) and resp.status_code == 200:
                         try:
                             data = resp.json()
-                            prev_status = SHARD_METRICS_CACHE.get(shard, {}).get("status")
                             
                             metrics = {
                                 "status": "healthy",
@@ -410,10 +411,12 @@ async def poll_shards_loop():
                                             await sync_node_data(node, src)
                                             if node in SHARD_METRICS_CACHE:
                                                 SHARD_METRICS_CACHE[node]["status"] = "healthy"
+                                                await broadcast_sse_event("update", {"type": "status_change"})
                                             logger.info(f"Node {node} successfully recovered and synchronized.")
                                         except Exception as e:
                                             if node in SHARD_METRICS_CACHE:
                                                 SHARD_METRICS_CACHE[node]["status"] = "unhealthy"
+                                                await broadcast_sse_event("update", {"type": "status_change"})
                                             logger.error(f"Failed to synchronize recovering node {node}: {e}")
                                         finally:
                                             SYNCING_NODES.discard(node)
@@ -443,6 +446,54 @@ async def poll_shards_loop():
                             "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
                             "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
                         }
+                    
+                    new_status = SHARD_METRICS_CACHE.get(shard, {}).get("status")
+                    if prev_status != new_status:
+                        status_changed = True
+                
+                if status_changed:
+                    await broadcast_sse_event("update", {"type": "status_change"})
+                
+                if SSE_LISTENERS:
+                    total_memory_count = 0
+                    total_l1_size = 0
+                    total_l2_size = 0
+                    total_entity_count = 0
+                    
+                    group_representatives = []
+                    for group in shard_groups:
+                        node = get_healthy_replica_for_group(group)
+                        if node:
+                            group_representatives.append(node)
+                            
+                    shards_metrics = {}
+                    for node in all_replica_nodes:
+                        metrics = SHARD_METRICS_CACHE.get(node)
+                        if metrics:
+                            shards_metrics[node] = metrics
+                            if node in group_representatives:
+                                total_memory_count += metrics.get("memory_count", 0)
+                                total_l1_size += metrics.get("l1_size", 0)
+                                total_l2_size += metrics.get("l2_size", 0)
+                                total_entity_count += metrics.get("entity_count", 0)
+                                
+                    coord_system = {
+                        "cpu": get_cpu_usage(),
+                        "ram": get_ram_usage(),
+                        "disk": get_disk_usage(os.getenv("STORAGE_DIR", "."))
+                    }
+                    
+                    stats_payload = {
+                        "mode": "coordinator",
+                        "memory_count": total_memory_count,
+                        "l1_size": total_l1_size,
+                        "l2_size": total_l2_size,
+                        "entity_count": total_entity_count,
+                        "system": coord_system,
+                        "shards": shards_metrics
+                    }
+                    
+                    await broadcast_sse_event("stats", stats_payload)
             except Exception as e:
                 logger.error(f"Error in poll_shards_loop execution: {e}")
         await asyncio.sleep(5)
@@ -1871,10 +1922,11 @@ async def sse_stream(request: Request):
             # Yield initial connection confirmation
             yield {"event": "connected", "data": "connected"}
             while True:
-                if await request.is_disconnected():
-                    break
                 event = await queue.get()
-                yield event
+                sse_event = event.copy()
+                if isinstance(sse_event.get("data"), (dict, list)):
+                    sse_event["data"] = json.dumps(sse_event["data"])
+                yield sse_event
         except asyncio.CancelledError:
             pass
         finally:
