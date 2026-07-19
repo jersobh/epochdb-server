@@ -185,6 +185,7 @@ hash_ring = ConsistentHashRing(shard_nodes) if shard_nodes else None
 # Dynamic embedding configuration (defaults to local offline all-MiniLM-L6-v2)
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
+GRAPH_HUB_LIMIT = int(os.getenv("GRAPH_HUB_LIMIT", "50"))
 
 
 class RequestContext(BaseModel):
@@ -626,6 +627,7 @@ async def get_db_instance(tenant: Optional[str] = None, namespace: Optional[str]
             
         storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
         logger.info(f"Initializing AsyncEpochDB for tenant={tenant}, namespace={namespace} under {storage_dir}")
+        auto_extract = os.getenv("AUTO_EXTRACT", "true").lower() in ("1", "true", "yes")
         engine = AsyncEpochDB(
             storage_dir=storage_dir,
             embedding_model=EMBEDDING_MODEL,
@@ -634,7 +636,8 @@ async def get_db_instance(tenant: Optional[str] = None, namespace: Optional[str]
             parquet_compression="zstd",
             parquet_compression_level=3,
             tenant=tenant,
-            namespace=namespace
+            namespace=namespace,
+            auto_extract=auto_extract,
         )
         await engine._get_db()
         
@@ -715,6 +718,7 @@ class QueryPayload(BaseModel):
     filters: Optional[Dict[str, Any]] = Field(default=None, description="MongoDB-style metadata filter evaluation parameters.")
     memory_type: Optional[str] = Field(default=None, description="Optional filter by memory type: 'general', 'episodic', 'profile', or 'working'.")
     context_window: int = Field(default=0, ge=0, description="Number of chronological context turns to retrieve around the matched memory.")
+    expand_hops: int = Field(default=0, ge=0, le=10, description="Relational KG expansion hops during retrieval.")
 
 class AdaptiveQueryPayload(BaseModel):
     query: str = Field(..., description="The natural language search query.")
@@ -1124,9 +1128,53 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                     
                 triples = metadata.get("triples") or []
                 if not triples:
-                    extracted = await asyncio.to_thread(engine.extract_entities, text)
-                    triples = [(str(e), "mentions", str(e)) for e in extracted]
-                    
+                    def _extract_triples_for_ingest() -> list:
+                        from epochdb.core.fact_extractor import FactExtractor
+
+                        if getattr(engine, "auto_extract", False):
+                            if engine._fact_extractor is None:
+                                engine._fact_extractor = FactExtractor(
+                                    engine, engine.extraction_model
+                                )
+                            return engine._fact_extractor.extract(text)
+
+                        extracted = engine.extract_entities(text)
+                        if extracted:
+                            return [(str(e), "mentions", str(e)) for e in extracted]
+
+                        # Match LocalFactExtractor fallback for brand-new knowledge graphs.
+                        words = [w.strip(".,!?;:()\"'") for w in text.split() if w.strip()]
+                        nouns = [w for w in words if w and w[0].isupper()]
+                        if not nouns:
+                            nouns = [w for w in words if len(w) > 3][:3]
+                        return [(str(n), "mentions", str(n)) for n in nouns if n]
+
+                    triples = await asyncio.to_thread(_extract_triples_for_ingest)
+
+                # If the atom already exists (hot or cold), replace triples in-place.
+                existing = payload.id in engine.hot_tier.atoms
+                if not existing:
+                    for epoch_id in engine.cold_tier.get_all_epochs():
+                        if engine.cold_tier.load_atom_metadata(epoch_id, [payload.id]):
+                            existing = True
+                            break
+
+                if existing:
+                    atom_id = await asyncio.to_thread(
+                        engine.replace_memory,
+                        payload.id,
+                        text,
+                        embedding,
+                        [tuple(t) for t in triples],
+                        metadata,
+                    )
+                    logger.info(
+                        f"Replaced triples for atom {atom_id}: '{text[:40]}...'"
+                    )
+                    invalidate_cache(ctx.tenant, ctx.namespace)
+                    await broadcast_sse_event("update", {"type": "write", "id": atom_id})
+                    return {"status": "success", "id": atom_id}
+
                 atom_id = await asyncio.to_thread(
                     engine.add_memory,
                     payload=text,
@@ -1344,7 +1392,8 @@ async def query_memories(
                     k=payload.k,
                     filters=payload.filters,
                     memory_type=payload.memory_type,
-                    context_window=payload.context_window
+                    context_window=payload.context_window,
+                    expand_hops=payload.expand_hops,
                 )
                 
                 # Retrieve engine to compute exact similarity scores
@@ -1673,15 +1722,17 @@ async def entity_graph(
             try:
                 if not entity_id:
                     engine = await active_db._get_db()
-                    entities = await asyncio.to_thread(engine.get_entities)
-                    if not entities:
+                    hub_entities = await asyncio.to_thread(
+                        engine.get_hub_entities, GRAPH_HUB_LIMIT
+                    )
+                    if not hub_entities:
                         return {"nodes": [], "edges": []}
                     
                     merged_nodes = set()
                     merged_edges = []
                     seen_edges = set()
                     
-                    for ent in entities[:30]:
+                    for ent in hub_entities:
                         graph = await active_db.entity_graph(ent, depth=1)
                         for node in graph.nodes:
                             merged_nodes.add(node)
