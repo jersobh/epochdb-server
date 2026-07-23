@@ -740,14 +740,14 @@ all = ["adbc-driver-manager", "fsspec", "ipython", "numpy", "pandas", "pyarrow"]
 
 [[package]]
 name = "epochdb"
-version = "1.6.2"
+version = "1.7.0"
 description = "An agentic memory engine designed for lossless, tiered verbatim storage and multi-hop retrieval."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "epochdb-1.6.2-py3-none-any.whl", hash = "sha256:b46cd08187cec53cd5d7ede95a55e8bcd0e21e5373e10146f0dd05cc5a98a81e"},
-    {file = "epochdb-1.6.2.tar.gz", hash = "sha256:32b614f942a8a2165907159f2f8ec25f6cbbf069e1fbd80c3a510df10542fac5"},
+    {file = "epochdb-1.7.0-py3-none-any.whl", hash = "sha256:4160cf3aa6099929bf82a2122c66de565f3d8a060c5c1fc21a9493644b6bf75c"},
+    {file = "epochdb-1.7.0.tar.gz", hash = "sha256:920a2d94289c1ea42c0389c8618910efeaf530ce433d83c567172a9ca504184e"},
 ]
 
 [package.dependencies]
@@ -764,8 +764,9 @@ z3-solver = "*"
 zstandard = "*"
 
 [package.extras]
-all = ["google-genai (>=2.8.0,<3.0.0)", "langgraph", "mcp[cli] (>=1.0.0)", "sentence-transformers"]
-dev = ["google-genai (>=2.8.0,<3.0.0)", "langgraph", "mcp[cli] (>=1.0.0)", "pytest", "pytest-cov", "sentence-transformers"]
+all = ["duckdb (>=1.0.0)", "google-genai (>=2.8.0,<3.0.0)", "langgraph", "mcp[cli] (>=1.0.0)", "sentence-transformers"]
+dev = ["duckdb (>=1.0.0)", "google-genai (>=2.8.0,<3.0.0)", "langgraph", "mcp[cli] (>=1.0.0)", "pytest", "pytest-cov", "sentence-transformers"]
+duckdb = ["duckdb (>=1.0.0)"]
 embeddings = ["sentence-transformers"]
 google = ["google-genai (>=2.8.0,<3.0.0)"]
 langgraph = ["langgraph"]
@@ -3816,4 +3817,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "85debc33549b6b6a6df2d0d57ac11daed59a9cf692b7274b5c6202a3473e9d30"
+content-hash = "feb812a25f982d0e3c4021541309993d1210f4fe9aed2e50095c83c2b3a71b8d"
