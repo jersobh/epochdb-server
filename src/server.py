@@ -1941,6 +1941,29 @@ async def compact(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))
             logger.error(f"Compaction runtime error occurred: {str(e)}")
             raise HTTPException(status_code=500, detail="Compaction execution failure.")
 
+
+class SQLQueryPayload(BaseModel):
+    query: str
+
+
+@app.post("/v1/analytics/query", status_code=status.HTTP_200_OK)
+async def analytics_query(
+    payload: SQLQueryPayload,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Executes a DuckDB SQL analytical query over Cold Tier Parquet archives.
+    The table `cold_tier` is automatically available representing all parquet files.
+    """
+    active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+    try:
+        results = await active_db.query_sql(payload.query)
+        return {"status": "success", "data": results, "count": len(results)}
+    except Exception as e:
+        logger.error(f"Analytics SQL query error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"SQL Query failed: {str(e)}")
+
+
 @app.get("/logo.png")
 async def get_logo():
     logo_path = os.path.join(os.path.dirname(__file__), "logo-epoch.png")

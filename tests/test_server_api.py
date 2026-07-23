@@ -295,3 +295,21 @@ def test_visualize_endpoint():
         assert "EpochDB" in resp.text
         assert "3d-force-graph" in resp.text.lower()
 
+
+def test_analytics_query_endpoint():
+    """Verify that POST /v1/analytics/query executes DuckDB queries over Cold Tier Parquet archives."""
+    with TestClient(app) as client:
+        headers = {"X-API-Key": "test-token-12345"}
+        resp = client.post("/remember", json={"text": "Water boils at 100 degrees Celsius.", "triples": [["Water", "boils_at", "100C"]]}, headers=headers)
+        assert resp.status_code == 201
+
+        resp = client.post("/compact", headers=headers)
+        assert resp.status_code == 200
+
+        resp = client.post("/v1/analytics/query", json={"query": "SELECT COUNT(*) as count FROM cold_tier"}, headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "success"
+        assert "data" in data
+
+

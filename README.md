@@ -289,6 +289,11 @@ Compact all cluster nodes.
 Serves an interactive 3D Force-Directed Graph dashboard representing the stored entity/memory graph.
 * **Response**: Clean modularized HTML page (`visualize.html`) loading visualizer assets.
 
+### 11. `POST /v1/analytics/query`
+Execute a DuckDB SQL analytical query over Cold Tier Parquet archives.
+* **Payload**: `{ "query": "SELECT COUNT(*) as total FROM cold_tier" }`
+* **Response**: `{ "status": "success", "data": [{ "total": 42 }], "count": 1 }`
+
 ---
 
 ## Caching & ETag Performance Optimization

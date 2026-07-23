@@ -2,6 +2,11 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.9.6] - 2026-07-23
+### Added
+- **DuckDB Analytics SQL Endpoint**: Added `POST /v1/analytics/query` REST API route allowing clients to execute DuckDB SQL queries over historical memory archives.
+- **Dependency bump**: Updated `epochdb` dependency requirement to `>=1.7.0` and added `duckdb (>=1.5.5,<2.0.0)`.
+
 ## [0.9.5]
 ### Changed
 - **Dependency bump**: Updated `epochdb` dependency requirement to `>=1.6.2` to pull in fixes for query candidate overwriting and compaction deduplication.
