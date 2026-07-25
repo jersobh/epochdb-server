@@ -13,7 +13,7 @@ os.environ["STORAGE_DIR"] = temp_dir
 
 # Ensure project root is in path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from src.server import app
+from src.server import app, SERVER_VERSION
 
 @pytest.fixture(scope="module", autouse=True)
 def cleanup():
@@ -70,7 +70,7 @@ def test_healthz():
     with TestClient(app) as client:
         resp = client.get("/healthz")
         assert resp.status_code == 200
-        assert resp.json() == {"status": "healthy", "mode": "shard"}
+        assert resp.json() == {"status": "healthy", "mode": "shard", "version": SERVER_VERSION}
 
 def test_crud_lifecycle():
     """Verify standard CRUD lifecycle on shard node endpoints (remember, get, query, update, delete)."""
@@ -227,7 +227,7 @@ def test_coordinator_mode():
             # Test Healthz
             resp = client.get("/healthz")
             assert resp.status_code == 200
-            assert resp.json() == {"status": "healthy", "mode": "coordinator"}
+            assert resp.json() == {"status": "healthy", "mode": "coordinator", "version": SERVER_VERSION}
             
             # Test Remember
             resp = client.post("/remember", json={"text": "Hello shard world"}, headers=headers)
