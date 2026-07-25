@@ -29,6 +29,7 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
+SERVER_VERSION = "0.9.7"
 
 
 # -------------------------------------------------------------------------
@@ -760,7 +761,7 @@ async def healthz():
                 if isinstance(resp, Exception) or resp.status_code != 200:
                     logger.warning(f"Shard health probe failed: {shard_url} -> {resp}")
                     raise HTTPException(status_code=503, detail="One or more backend shards are unhealthy or warming up.")
-        return {"status": "healthy", "mode": "coordinator"}
+        return {"status": "healthy", "mode": "coordinator", "version": SERVER_VERSION}
     else:
         global db
         if db is None:
@@ -770,7 +771,7 @@ async def healthz():
                 logger.error(f"Failed to initialize storage engine in healthz: {e}")
         if db is None:
             raise HTTPException(status_code=503, detail="Storage engine not ready.")
-        return {"status": "healthy", "mode": "shard"}
+        return {"status": "healthy", "mode": "shard", "version": SERVER_VERSION}
 
 # Helper to build headers when coordinator forwards to shards
 def get_forward_headers(ctx: RequestContext) -> Dict[str, str]:

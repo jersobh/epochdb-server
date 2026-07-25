@@ -768,6 +768,7 @@
             </div>
             <div class="logo-text">EpochDB</div>
             <span class="mode-badge" id="server-mode">Shard</span>
+            <span class="mode-badge" id="server-version" style="background: var(--bg-tertiary); color: var(--text-muted); font-size: 11px; margin-left: 4px;">v0.9.7</span>
             <button class="theme-toggle-btn" id="theme-toggle" onclick="toggleTheme()" title="Switch Theme">&#9788;</button>
         </div>
 
@@ -1327,6 +1328,9 @@
                 const health = await fetch('/healthz').then(r => r.json());
                 localStorage.setItem('epochdb_mode', health.mode);
                 document.getElementById('server-mode').innerText = health.mode;
+                if (health.version) {
+                    document.getElementById('server-version').innerText = 'v' + health.version;
+                }
                 
                 await loadStats();
                 await loadGraph(true);
