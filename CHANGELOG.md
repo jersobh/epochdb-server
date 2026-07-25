@@ -2,6 +2,13 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.10.0] - 2026-07-25
+### Added
+- **Scope Autocomplete API**: Added `GET /databases` endpoint to list available tenant and namespace partitions for UI autocompletion.
+- **Visualization Version & Scope UI**:
+  - Integrated datalist autocompletion for Tenants and Namespaces in `visualize.html`.
+  - Exposed server version in `/healthz` response and added server version badge in `visualize.html` header bar.
+
 ## [0.9.7] - 2026-07-25
 ### Changed
 - **Dependency bump**: Updated `epochdb` dependency requirement to `>=1.8.0`.
