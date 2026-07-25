@@ -846,6 +846,58 @@ async def admin_list_databases(ctx: RequestContext = Depends(get_context({Permis
     return {"databases": dbs}
 
 
+@app.get("/databases")
+async def list_databases(ctx: RequestContext = Depends(get_context({Permission.READ}))):
+    """
+    Lists all available database partitions (tenants and namespaces) for visualization scope autocomplete.
+    """
+    if NODE_MODE == "coordinator":
+        if not client or not shard_nodes:
+            return {"databases": []}
+        target_shard = get_healthy_replica_for_group(shard_groups[0]) if shard_groups else shard_nodes[0]
+        try:
+            resp = await client.get(f"{target_shard}/databases", headers=get_forward_headers(ctx))
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception as e:
+            logger.error(f"Error querying databases from shard: {e}")
+        return {"databases": []}
+    else:
+        storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
+        db_keys = set()
+        for key in db_pool.keys():
+            db_keys.add(key)
+        if db is not None:
+            db_keys.add((None, None))
+        if os.path.exists(os.path.join(storage_dir, "metadata.json")):
+            db_keys.add((None, None))
+        ns_dir = os.path.join(storage_dir, "ns")
+        if os.path.exists(ns_dir):
+            try:
+                for namespace in os.listdir(ns_dir):
+                    if os.path.isdir(os.path.join(ns_dir, namespace)):
+                        db_keys.add((None, namespace))
+            except Exception as e:
+                logger.error(f"Error listing namespace directory: {e}")
+        tenants_dir = os.path.join(storage_dir, "tenants")
+        if os.path.exists(tenants_dir):
+            try:
+                for tenant in os.listdir(tenants_dir):
+                    tenant_path = os.path.join(tenants_dir, tenant)
+                    if os.path.isdir(tenant_path):
+                        if os.path.exists(os.path.join(tenant_path, "metadata.json")):
+                            db_keys.add((tenant, None))
+                        tenant_ns_dir = os.path.join(tenant_path, "ns")
+                        if os.path.exists(tenant_ns_dir):
+                            for namespace in os.listdir(tenant_ns_dir):
+                                if os.path.isdir(os.path.join(tenant_ns_dir, namespace)):
+                                    db_keys.add((tenant, namespace))
+            except Exception as e:
+                logger.error(f"Error listing tenants directory: {e}")
+        dbs = [{"tenant": t, "namespace": ns} for t, ns in db_keys if t is not None or ns is not None]
+        return {"databases": dbs}
+
+
 @app.post("/admin/toggle_sync")
 async def toggle_sync(
     enabled: bool,

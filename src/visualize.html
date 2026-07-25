@@ -833,11 +833,13 @@
             <div class="accordion-content card">
                 <div class="form-group">
                     <label for="subgraph-tenant">Tenant (Optional)</label>
-                    <input type="text" id="subgraph-tenant" name="subgraph_tenant" placeholder="E.g. demo_com" autocomplete="off" onchange="localStorage.setItem('epochdb_tenant', this.value.trim()); loadGraph(true);">
+                    <input type="text" id="subgraph-tenant" name="subgraph_tenant" list="tenants-list" placeholder="E.g. demo_com" autocomplete="off" onchange="localStorage.setItem('epochdb_tenant', this.value.trim()); loadGraph(true);">
+                    <datalist id="tenants-list"></datalist>
                 </div>
                 <div class="form-group">
                     <label for="subgraph-namespace">Namespace (Optional)</label>
-                    <input type="text" id="subgraph-namespace" name="subgraph_namespace" placeholder="E.g. tenant:demo_com:copilot" autocomplete="off" onchange="localStorage.setItem('epochdb_namespace', this.value.trim()); loadGraph(true);">
+                    <input type="text" id="subgraph-namespace" name="subgraph_namespace" list="namespaces-list" placeholder="E.g. tenant:demo_com:copilot" autocomplete="off" onchange="localStorage.setItem('epochdb_namespace', this.value.trim()); loadGraph(true);">
+                    <datalist id="namespaces-list"></datalist>
                 </div>
                 <div class="form-group">
                     <label for="subgraph-node">Center Entity</label>
@@ -1310,6 +1312,30 @@
             }
         };
 
+        async function loadAvailableScopes() {
+            try {
+                const data = await apiRequest('/databases');
+                if (data && data.databases) {
+                    const tenants = new Set();
+                    const namespaces = new Set();
+                    data.databases.forEach(db => {
+                        if (db.tenant) tenants.add(db.tenant);
+                        if (db.namespace) namespaces.add(db.namespace);
+                    });
+                    const tenantDatalist = document.getElementById('tenants-list');
+                    const nsDatalist = document.getElementById('namespaces-list');
+                    if (tenantDatalist) {
+                        tenantDatalist.innerHTML = Array.from(tenants).map(t => `<option value="${t}">`).join('');
+                    }
+                    if (nsDatalist) {
+                        nsDatalist.innerHTML = Array.from(namespaces).map(ns => `<option value="${ns}">`).join('');
+                    }
+                }
+            } catch (err) {
+                console.warn("Could not fetch available databases/namespaces:", err);
+            }
+        }
+
         // Initialize application state
         async function initApp() {
             const urlParams = new URLSearchParams(window.location.search);
@@ -1332,8 +1358,9 @@
                     document.getElementById('server-version').innerText = 'v' + health.version;
                 }
                 
-                await loadStats();
-                await loadGraph(true);
+            await loadAvailableScopes();
+            await loadStats();
+            await loadGraph(true);
 
                 // Connect to Server-Sent Events stream for real-time updates
                 const eventSource = new EventSource('/stream');
