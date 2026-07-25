@@ -2,6 +2,14 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.9.7] - 2026-07-25
+### Changed
+- **Dependency bump**: Updated `epochdb` dependency requirement to `>=1.8.0`.
+- **Pairwise Entity Graph Extraction**: Updated `/remember` memory fallback entity extraction to generate pairwise co-occurrence triples `(entity1, "co_occurs_with", entity2)` between distinct entities.
+- **Visualization Scope Controls & Input Autofill Fix**:
+  - Added Tenant and Namespace input fields to the Subgraph Filter panel in `visualize.html`, sending `X-Tenant` / `X-Namespace` headers on API requests.
+  - Added `name` attributes and `autocomplete="off"` to inputs in `visualize.html` to prevent browser autofill and auto-filtering on page refresh.
+
 ## [0.9.6] - 2026-07-23
 ### Added
 - **DuckDB Analytics SQL Endpoint**: Added `POST /v1/analytics/query` REST API route allowing clients to execute DuckDB SQL queries over historical memory archives.
