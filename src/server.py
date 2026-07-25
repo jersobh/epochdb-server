@@ -1138,16 +1138,37 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                                 )
                             return engine._fact_extractor.extract(text)
 
+                        def _pair_triples(items: list) -> list:
+                            seen = set()
+                            entities = []
+                            for item in items:
+                                s = str(item)
+                                if s and s not in seen:
+                                    seen.add(s)
+                                    entities.append(s)
+                            if len(entities) >= 2:
+                                res = []
+                                for i in range(len(entities) - 1):
+                                    res.append((entities[i], "co_occurs_with", entities[i + 1]))
+                                if len(entities) > 2:
+                                    res.append((entities[0], "co_occurs_with", entities[-1]))
+                                return res
+                            elif len(entities) == 1:
+                                return [(entities[0], "mentions", entities[0])]
+                            return []
+
                         extracted = engine.extract_entities(text)
                         if extracted:
-                            return [(str(e), "mentions", str(e)) for e in extracted]
+                            res = _pair_triples(extracted)
+                            if res:
+                                return res
 
                         # Match LocalFactExtractor fallback for brand-new knowledge graphs.
                         words = [w.strip(".,!?;:()\"'") for w in text.split() if w.strip()]
                         nouns = [w for w in words if w and w[0].isupper()]
                         if not nouns:
                             nouns = [w for w in words if len(w) > 3][:3]
-                        return [(str(n), "mentions", str(n)) for n in nouns if n]
+                        return _pair_triples(nouns)
 
                     triples = await asyncio.to_thread(_extract_triples_for_ingest)
 

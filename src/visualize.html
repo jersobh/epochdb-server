@@ -780,11 +780,11 @@
             <div class="accordion-content card">
                 <div class="form-group">
                     <label for="ingest-text">Memory Text</label>
-                    <textarea id="ingest-text" placeholder="Albert Einstein was a theoretical physicist." rows="3" style="resize: none;"></textarea>
+                    <textarea id="ingest-text" name="ingest_text" placeholder="Albert Einstein was a theoretical physicist." rows="3" style="resize: none;" autocomplete="off"></textarea>
                 </div>
                 <div class="form-group">
                     <label for="ingest-triples">Triples (Optional)</label>
-                    <input type="text" id="ingest-triples" placeholder="Albert Einstein, is_a, physicist">
+                    <input type="text" id="ingest-triples" name="ingest_triples" placeholder="Albert Einstein, is_a, physicist" autocomplete="off">
                     <div style="font-size: 10px; color: var(--text-muted); margin-top: 2px;">
                         Format: Subj, pred, obj (semicolon separated for multiples)
                     </div>
@@ -799,12 +799,12 @@
             <div class="accordion-content card collapsed">
                 <div class="form-group">
                     <label for="query-input">Search Query</label>
-                    <input type="text" id="query-input" placeholder="E.g. relativity theory">
+                    <input type="text" id="query-input" name="query_input" placeholder="E.g. relativity theory" autocomplete="off">
                 </div>
                 <div class="form-group">
                     <label for="query-k">Limit (k)</label>
                     <div style="display: flex; align-items: center; gap: 8px;">
-                        <input type="range" id="query-k" min="1" max="10" value="3" oninput="document.getElementById('k-val').innerText = this.value" style="flex: 1;">
+                        <input type="range" id="query-k" name="query_k" min="1" max="10" value="3" oninput="document.getElementById('k-val').innerText = this.value" style="flex: 1;">
                         <span id="k-val" style="font-size: 13px; min-width: 15px;">3</span>
                     </div>
                 </div>
@@ -819,7 +819,7 @@
             <div class="accordion-content card">
                 <div class="form-group" style="position: relative;">
                     <label for="search-input">Search / Focus Entity</label>
-                    <input type="text" id="search-input" placeholder="Type entity name..." autocomplete="off">
+                    <input type="text" id="search-input" name="search_input" placeholder="Type entity name..." autocomplete="off">
                     <div class="search-results-list" id="search-results"></div>
                 </div>
                 <button class="btn btn-secondary" onclick="clearFocus()">Reset Zoom</button>
@@ -828,15 +828,23 @@
 
         <!-- Subgraph Filter Accordion -->
         <div class="accordion-item">
-            <div class="accordion-header" onclick="toggleAccordion(this)">Subgraph Filter</div>
+            <div class="accordion-header" onclick="toggleAccordion(this)">Subgraph Filter & Scope</div>
             <div class="accordion-content card">
                 <div class="form-group">
+                    <label for="subgraph-tenant">Tenant (Optional)</label>
+                    <input type="text" id="subgraph-tenant" name="subgraph_tenant" placeholder="E.g. demo_com" autocomplete="off" onchange="localStorage.setItem('epochdb_tenant', this.value.trim()); loadGraph(true);">
+                </div>
+                <div class="form-group">
+                    <label for="subgraph-namespace">Namespace (Optional)</label>
+                    <input type="text" id="subgraph-namespace" name="subgraph_namespace" placeholder="E.g. tenant:demo_com:copilot" autocomplete="off" onchange="localStorage.setItem('epochdb_namespace', this.value.trim()); loadGraph(true);">
+                </div>
+                <div class="form-group">
                     <label for="subgraph-node">Center Entity</label>
-                    <input type="text" id="subgraph-node" placeholder="E.g. Apple (leave blank for all)">
+                    <input type="text" id="subgraph-node" name="subgraph_node" placeholder="E.g. Apple (leave blank for all)" autocomplete="off">
                 </div>
                 <div class="form-group">
                     <label for="subgraph-depth">Depth</label>
-                    <select id="subgraph-depth">
+                    <select id="subgraph-depth" name="subgraph_depth">
                         <option value="1">1 Hop</option>
                         <option value="2" selected>2 Hops</option>
                         <option value="3">3 Hops</option>
@@ -948,7 +956,7 @@
             </div>
             <div class="form-group">
                 <label for="auth-token">Access Token / API Key</label>
-                <input type="password" id="auth-token" placeholder="Enter key...">
+                <input type="password" id="auth-token" name="auth_token" placeholder="Enter key..." autocomplete="off">
             </div>
             <button class="btn" onclick="submitAuth()">Authenticate</button>
         </div>
@@ -1310,6 +1318,11 @@
                 window.history.replaceState({}, document.title, window.location.pathname);
             }
 
+            const tenantEl = document.getElementById('subgraph-tenant');
+            const namespaceEl = document.getElementById('subgraph-namespace');
+            if (tenantEl) tenantEl.value = localStorage.getItem('epochdb_tenant') || '';
+            if (namespaceEl) namespaceEl.value = localStorage.getItem('epochdb_namespace') || '';
+
             try {
                 const health = await fetch('/healthz').then(r => r.json());
                 localStorage.setItem('epochdb_mode', health.mode);
@@ -1348,6 +1361,44 @@
                     showToast("Server connection error: " + err.message, "error");
                 }
             }
+        }
+
+        async function apiRequest(endpoint, method = 'GET', body = null) {
+            const mode = localStorage.getItem('epochdb_mode') || 'shard';
+            const token = localStorage.getItem('epochdb_token') || '';
+            const tenant = (document.getElementById('subgraph-tenant')?.value || localStorage.getItem('epochdb_tenant') || '').trim();
+            const namespace = (document.getElementById('subgraph-namespace')?.value || localStorage.getItem('epochdb_namespace') || '').trim();
+            const headers = {
+                'Content-Type': 'application/json',
+            };
+            if (token) {
+                if (mode === 'coordinator') {
+                    headers['X-API-Key'] = token;
+                } else {
+                    headers['X-Internal-Token'] = token;
+                }
+            }
+            if (tenant) {
+                headers['X-Tenant'] = tenant;
+            }
+            if (namespace) {
+                headers['X-Namespace'] = namespace;
+            }
+            const config = { method, headers };
+            if (body) {
+                config.body = JSON.stringify(body);
+            }
+            
+            const res = await fetch(endpoint, config);
+            if (res.status === 401) {
+                showAuthModal(true);
+                throw new Error('Unauthorized');
+            }
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || 'API request failed');
+            }
+            return res.json();
         }
 
         async function loadStats(statsData = null) {
@@ -1666,35 +1717,6 @@
             });
         }
 
-        async function apiRequest(endpoint, method = 'GET', body = null) {
-            const mode = localStorage.getItem('epochdb_mode') || 'shard';
-            const token = localStorage.getItem('epochdb_token') || '';
-            const headers = {
-                'Content-Type': 'application/json',
-            };
-            if (token) {
-                if (mode === 'coordinator') {
-                    headers['X-API-Key'] = token;
-                } else {
-                    headers['X-Internal-Token'] = token;
-                }
-            }
-            const config = { method, headers };
-            if (body) {
-                config.body = JSON.stringify(body);
-            }
-            
-            const res = await fetch(endpoint, config);
-            if (res.status === 401) {
-                showAuthModal(true);
-                throw new Error('Unauthorized');
-            }
-            if (!res.ok) {
-                const err = await res.json().catch(() => ({}));
-                throw new Error(err.detail || 'API request failed');
-            }
-            return res.json();
-        }
 
         function showAuthModal(show) {
             const modal = document.getElementById('auth-modal');
