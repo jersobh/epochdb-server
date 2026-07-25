@@ -768,6 +768,7 @@
             </div>
             <div class="logo-text">EpochDB</div>
             <span class="mode-badge" id="server-mode">Shard</span>
+            <span class="mode-badge" id="server-version" style="background: var(--bg-tertiary); color: var(--text-muted); font-size: 11px; margin-left: 4px;">v0.10.0</span>
             <button class="theme-toggle-btn" id="theme-toggle" onclick="toggleTheme()" title="Switch Theme">&#9788;</button>
         </div>
 
@@ -832,11 +833,13 @@
             <div class="accordion-content card">
                 <div class="form-group">
                     <label for="subgraph-tenant">Tenant (Optional)</label>
-                    <input type="text" id="subgraph-tenant" name="subgraph_tenant" placeholder="E.g. demo_com" autocomplete="off" onchange="localStorage.setItem('epochdb_tenant', this.value.trim()); loadGraph(true);">
+                    <input type="text" id="subgraph-tenant" name="subgraph_tenant" list="tenants-list" placeholder="E.g. demo_com" autocomplete="off" onchange="localStorage.setItem('epochdb_tenant', this.value.trim()); loadGraph(true);">
+                    <datalist id="tenants-list"></datalist>
                 </div>
                 <div class="form-group">
                     <label for="subgraph-namespace">Namespace (Optional)</label>
-                    <input type="text" id="subgraph-namespace" name="subgraph_namespace" placeholder="E.g. tenant:demo_com:copilot" autocomplete="off" onchange="localStorage.setItem('epochdb_namespace', this.value.trim()); loadGraph(true);">
+                    <input type="text" id="subgraph-namespace" name="subgraph_namespace" list="namespaces-list" placeholder="E.g. tenant:demo_com:copilot" autocomplete="off" onchange="localStorage.setItem('epochdb_namespace', this.value.trim()); loadGraph(true);">
+                    <datalist id="namespaces-list"></datalist>
                 </div>
                 <div class="form-group">
                     <label for="subgraph-node">Center Entity</label>
@@ -1309,6 +1312,30 @@
             }
         };
 
+        async function loadAvailableScopes() {
+            try {
+                const data = await apiRequest('/databases');
+                if (data && data.databases) {
+                    const tenants = new Set();
+                    const namespaces = new Set();
+                    data.databases.forEach(db => {
+                        if (db.tenant) tenants.add(db.tenant);
+                        if (db.namespace) namespaces.add(db.namespace);
+                    });
+                    const tenantDatalist = document.getElementById('tenants-list');
+                    const nsDatalist = document.getElementById('namespaces-list');
+                    if (tenantDatalist) {
+                        tenantDatalist.innerHTML = Array.from(tenants).map(t => `<option value="${t}">`).join('');
+                    }
+                    if (nsDatalist) {
+                        nsDatalist.innerHTML = Array.from(namespaces).map(ns => `<option value="${ns}">`).join('');
+                    }
+                }
+            } catch (err) {
+                console.warn("Could not fetch available databases/namespaces:", err);
+            }
+        }
+
         // Initialize application state
         async function initApp() {
             const urlParams = new URLSearchParams(window.location.search);
@@ -1327,9 +1354,13 @@
                 const health = await fetch('/healthz').then(r => r.json());
                 localStorage.setItem('epochdb_mode', health.mode);
                 document.getElementById('server-mode').innerText = health.mode;
+                if (health.version) {
+                    document.getElementById('server-version').innerText = 'v' + health.version;
+                }
                 
-                await loadStats();
-                await loadGraph(true);
+            await loadAvailableScopes();
+            await loadStats();
+            await loadGraph(true);
 
                 // Connect to Server-Sent Events stream for real-time updates
                 const eventSource = new EventSource('/stream');
