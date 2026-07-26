@@ -1,6 +1,6 @@
 [project]
 name = "epochdb-server"
-version = "0.10.0"
+version = "0.10.2"
 description = "A high-performance, state-aware memory engine designed for lossless, tiered storage, atomic state management, and multi-hop relational reasoning."
 authors = [
     {name = "jersobh",email = "jersobh@gmail.com"}
@@ -9,7 +9,7 @@ license = "MIT"
 package-mode = false
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "epochdb (>=1.8.0)",
+    "epochdb (>=1.8.1)",
     "uvicorn (>=0.49.0,<0.50.0)",
     "fastapi (>=0.138.1,<0.139.0)",
     "pydantic (>=2.13.4,<3.0.0)",

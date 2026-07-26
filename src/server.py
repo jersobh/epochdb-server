@@ -29,7 +29,7 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.10.0"
+SERVER_VERSION = "0.10.2"
 
 
 # -------------------------------------------------------------------------
@@ -1179,51 +1179,70 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                 else:
                     embedding = np.zeros(engine.dim, dtype=np.float32)
                     
-                triples = metadata.get("triples") or []
-                if not triples:
-                    def _extract_triples_for_ingest() -> list:
-                        from epochdb.core.fact_extractor import FactExtractor
+                provided_triples = metadata.get("triples") or []
 
-                        if getattr(engine, "auto_extract", False):
-                            if engine._fact_extractor is None:
-                                engine._fact_extractor = FactExtractor(
-                                    engine, engine.extraction_model
-                                )
-                            return engine._fact_extractor.extract(text)
+                def _extract_triples_for_ingest() -> list:
+                    from epochdb.core.fact_extractor import FactExtractor
 
-                        def _pair_triples(items: list) -> list:
-                            seen = set()
-                            entities = []
-                            for item in items:
-                                s = str(item)
-                                if s and s not in seen:
-                                    seen.add(s)
-                                    entities.append(s)
-                            if len(entities) >= 2:
-                                res = []
-                                for i in range(len(entities) - 1):
-                                    res.append((entities[i], "co_occurs_with", entities[i + 1]))
-                                if len(entities) > 2:
-                                    res.append((entities[0], "co_occurs_with", entities[-1]))
-                                return res
-                            elif len(entities) == 1:
-                                return [(entities[0], "mentions", entities[0])]
-                            return []
+                    if getattr(engine, "auto_extract", False):
+                        if engine._fact_extractor is None:
+                            engine._fact_extractor = FactExtractor(
+                                engine, engine.extraction_model
+                            )
+                        return engine._fact_extractor.extract(text)
 
-                        extracted = engine.extract_entities(text)
-                        if extracted:
-                            res = _pair_triples(extracted)
-                            if res:
-                                return res
+                    def _pair_triples(items: list) -> list:
+                        seen = set()
+                        entities = []
+                        for item in items:
+                            s = str(item)
+                            if s and s not in seen:
+                                seen.add(s)
+                                entities.append(s)
+                        if len(entities) >= 2:
+                            res = []
+                            for i in range(len(entities) - 1):
+                                res.append((entities[i], "co_occurs_with", entities[i + 1]))
+                            if len(entities) > 2:
+                                res.append((entities[0], "co_occurs_with", entities[-1]))
+                            return res
+                        elif len(entities) == 1:
+                            return [(entities[0], "mentions", entities[0])]
+                        return []
 
-                        # Match LocalFactExtractor fallback for brand-new knowledge graphs.
-                        words = [w.strip(".,!?;:()\"'") for w in text.split() if w.strip()]
-                        nouns = [w for w in words if w and w[0].isupper()]
-                        if not nouns:
-                            nouns = [w for w in words if len(w) > 3][:3]
-                        return _pair_triples(nouns)
+                    extracted = engine.extract_entities(text)
+                    if extracted:
+                        res = _pair_triples(extracted)
+                        if res:
+                            return res
 
-                    triples = await asyncio.to_thread(_extract_triples_for_ingest)
+                    # Match LocalFactExtractor fallback for brand-new knowledge graphs.
+                    words = [w.strip(".,!?;:()\"'") for w in text.split() if w.strip()]
+                    nouns = [w for w in words if w and w[0].isupper()]
+                    if not nouns:
+                        nouns = [w for w in words if len(w) > 3][:3]
+                    return _pair_triples(nouns)
+
+                # Always discover entity links when AUTO_EXTRACT is on, and merge
+                # them with any caller-provided structural triples (rebuild/index).
+                if getattr(engine, "auto_extract", False) or not provided_triples:
+                    discovered = await asyncio.to_thread(_extract_triples_for_ingest)
+                else:
+                    discovered = []
+
+                merged = []
+                seen_triples = set()
+                for t in list(provided_triples) + list(discovered or []):
+                    if isinstance(t, (list, tuple)) and len(t) >= 3:
+                        key = (str(t[0]), str(t[1]), str(t[2]))
+                    else:
+                        continue
+                    if key in seen_triples:
+                        continue
+                    seen_triples.add(key)
+                    merged.append(list(key))
+                triples = merged
+                metadata["triples"] = triples
 
                 # If the atom already exists (hot or cold), replace triples in-place.
                 existing = payload.id in engine.hot_tier.atoms

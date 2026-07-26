@@ -2,6 +2,14 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.10.2] - 2026-07-26
+### Fixed
+- **Portable hnswlib boot**: Dockerfile force-rebuilds `hnswlib` from source with `HNSWLIB_NO_NATIVE=1` and `--no-binary=hnswlib`, preventing Illegal Instruction crashes on CPUs without AVX-512.
+- **Stale lock cleanup**: Startup recursively clears `*.lock` under `/data` before gunicorn boots.
+### Changed
+- **Merge AUTO_EXTRACT with provided triples**: `/remember` (fixed-id replace path) discovers entity co-occurrence links when `AUTO_EXTRACT=true` and merges them with caller-supplied structural triples.
+- **Dependency**: Requires `epochdb>=1.8.1` from PyPI (FileLock re-entrancy + triple merge).
+
 ## [0.10.0] - 2026-07-25
 ### Added
 - **Scope Autocomplete API**: Added `GET /databases` endpoint to list available tenant and namespace partitions for UI autocompletion.
