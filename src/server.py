@@ -29,7 +29,7 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.10.2"
+SERVER_VERSION = "0.10.3"
 
 
 # -------------------------------------------------------------------------

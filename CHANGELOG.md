@@ -2,6 +2,10 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.10.3] - 2026-07-26
+### Changed
+- **Dependency**: Requires `epochdb>=1.8.2` (LocalFactExtractor no longer promotes predicates into co-occurrence graph nodes).
+
 ## [0.10.2] - 2026-07-26
 ### Fixed
 - **Portable hnswlib boot**: Dockerfile force-rebuilds `hnswlib` from source with `HNSWLIB_NO_NATIVE=1` and `--no-binary=hnswlib`, preventing Illegal Instruction crashes on CPUs without AVX-512.
