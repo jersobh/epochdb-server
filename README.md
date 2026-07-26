@@ -132,6 +132,9 @@ Environment variables used by the server:
 - `STORAGE_DIR`: Local data storage directory (default: `./shared_memory`).
 - `API_KEY`: Client access API Key for the coordinator gateway (enforces `X-API-Key` header authentication).
 - `INTERNAL_AUTH_TOKEN`: Secure token used for inter-node communication between the coordinator and shards (enforces `X-Internal-Token` header authentication).
+- `COORDINATOR_HTTP_TIMEOUT`: Coordinator→shard request timeout in seconds (default: `120`). Keep it at or above the time a busy shard needs to finish an embedding batch.
+- `COORDINATOR_STATS_TIMEOUT`: Timeout in seconds for the 5s `/stats` health probes (default: `15`). Probe timeouts keep the previous health status instead of flapping shards to `unhealthy`.
+- `LOG_LEVEL`: Root logging level (default: `INFO`). httpx per-request logs are always capped at WARNING.
 
 ---
 

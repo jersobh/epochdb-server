@@ -8,6 +8,12 @@ All notable changes to the EpochDB Distributed Server project will be documented
 - **False offline marking**: Timeouts no longer mark shards `offline` (only hard `ConnectError`), avoiding cascading routing failures while shards are merely busy.
 - **Stats poll flapping**: `/stats` probe timeout raised (`COORDINATOR_STATS_TIMEOUT`, default 15s). Transient stats failures keep the prior health status instead of flipping every shard to `unhealthy` (which triggered `All nodes unhealthy/offline` despite `healthz` 200).
 - **Opaque exception logs**: Shard fan-out errors now use `repr()` / response body when `str(exc)` is empty (e.g. bare `TimeoutException`).
+- **Partial query results were cached**: `/query` responses missing shard answers are no longer stored in the coordinator read cache, so results recover as soon as shards do.
+### Added
+- **`partial` / `failed_shards` fields on `/query`**: Coordinator responses now say when one or more shards failed to answer, so clients can distinguish "no matches" from degraded fan-out.
+- **`LOG_LEVEL` env var** for the server root logger.
+### Changed
+- **Much quieter logs**: httpx/httpcore request lines silenced (WARNING+), per-5s poll and SSE broadcast logs demoted to DEBUG, per-write cache-invalidation logs demoted to DEBUG, and tqdm/HF progress bars disabled in the Docker image (`TQDM_DISABLE=1`, `HF_HUB_DISABLE_PROGRESS_BARS=1`).
 
 ## [0.10.3] - 2026-07-26
 ### Changed

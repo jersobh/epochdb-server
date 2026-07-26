@@ -4,6 +4,11 @@ FROM python:3.12-slim
 # Prevent hnswlib build from assuming host-native instruction extensions (e.g. AVX-512)
 ENV HNSWLIB_NO_NATIVE=1
 
+# Keep container logs clean: no tqdm "Batches" bars from sentence-transformers,
+# no HuggingFace Hub download progress bars.
+ENV TQDM_DISABLE=1 \
+    HF_HUB_DISABLE_PROGRESS_BARS=1
+
 # Install system dependencies required for compiling C/C++ dependencies if needed
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \

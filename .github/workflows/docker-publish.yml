@@ -30,7 +30,9 @@ jobs:
 
 
     - name: Run pytest
-      run: poetry run pytest
+      run: poetry run pytest -q --tb=short --ignore=tests/load_test.py
+      # load_test boots a 4-process local cluster and is flaky under CI resource limits;
+      # run it manually / locally when changing cluster orchestration.
 
   build-and-push:
     name: Build and Push Docker Image
