@@ -4,6 +4,11 @@ FROM python:3.12-slim
 # Prevent hnswlib build from assuming host-native instruction extensions (e.g. AVX-512)
 ENV HNSWLIB_NO_NATIVE=1
 
+# Keep container logs clean: no tqdm "Batches" bars from sentence-transformers,
+# no HuggingFace Hub download progress bars.
+ENV TQDM_DISABLE=1 \
+    HF_HUB_DISABLE_PROGRESS_BARS=1
+
 # Install system dependencies required for compiling C/C++ dependencies if needed
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -21,7 +26,7 @@ ENV PYTHONPATH=/app
 RUN pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cpu \
     --extra-index-url https://pypi.org/simple \
-    "epochdb>=1.8.2" \
+    "epochdb>=1.8.3" \
     "uvicorn>=0.49.0,<0.50.0" \
     "fastapi>=0.138.1,<0.139.0" \
     "pydantic>=2.13.4,<3.0.0" \

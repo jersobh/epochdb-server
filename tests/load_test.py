@@ -96,7 +96,7 @@ class LocalClusterManager:
             print(f"Starting Shard {i} on port {port} (Data: {temp_dir})...")
             p = subprocess.Popen(
                 [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(port)],
-                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
             )
             self.processes.append(p)
 
@@ -110,31 +110,39 @@ class LocalClusterManager:
         print(f"Starting Coordinator Gateway on port {port_coord}...")
         p_coord = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(port_coord)],
-            env=env_coord, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            env=env_coord, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
         self.processes.append(p_coord)
 
-        # Wait for nodes to pass health checks
+        # Wait for nodes to pass health checks (first boot may download embedder weights).
         time.sleep(2.0)
         start_wait = time.time()
         nodes_healthy = False
-        while time.time() - start_wait < 30:
+        last_err = None
+        while time.time() - start_wait < 90:
             try:
                 healthy_count = 0
                 for port in [port_coord] + ports_shards:
-                    resp = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=1.0)
+                    resp = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=2.0)
                     if resp.status_code == 200:
                         healthy_count += 1
                 if healthy_count == 4:
                     nodes_healthy = True
                     break
-            except Exception:
-                pass
+            except Exception as e:
+                last_err = e
             time.sleep(1.0)
 
         if not nodes_healthy:
+            # Surface process exits to debug CI flakes.
+            for i, p in enumerate(self.processes):
+                code = p.poll()
+                if code is not None:
+                    print(f"Process[{i}] exited early with code={code}")
             self.stop_cluster()
-            raise RuntimeError("Local cluster failed to initialize healthy status in time.")
+            raise RuntimeError(
+                f"Local cluster failed to initialize healthy status in time. last_err={last_err!r}"
+            )
 
         # Let the coordinator build its internal health cache
         print("Cluster is up. Waiting 5s for topology sync...")
