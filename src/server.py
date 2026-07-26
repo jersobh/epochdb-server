@@ -55,11 +55,16 @@ def should_mark_shard_offline(resp: Any) -> bool:
 # 1. Structured Logging Configuration
 # -------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s (Line: %(lineno)d): %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("epochdb_production_server")
+
+# httpx logs one INFO line per outbound request; with 5s health/stats polling
+# across shards this floods coordinator logs and buries real errors.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # -------------------------------------------------------------------------
 # System Resource Profiling Helpers
@@ -257,7 +262,7 @@ def invalidate_cache(tenant: Optional[str], namespace: Optional[str]):
     ctx_key = (tenant or "", namespace or "")
     CLUSTER_STATE_VERSIONS[ctx_key] = CLUSTER_STATE_VERSIONS.get(ctx_key, 0) + 1
     LOCAL_READ_CACHE[ctx_key] = {}
-    logger.info(f"Invalidated read cache for tenant='{tenant}' namespace='{namespace}'. New version: {CLUSTER_STATE_VERSIONS[ctx_key]}")
+    logger.debug(f"Invalidated read cache for tenant='{tenant}' namespace='{namespace}'. New version: {CLUSTER_STATE_VERSIONS[ctx_key]}")
 
 def generate_etag(endpoint: str, payload_dict: dict, state_version: int) -> str:
     # Stable JSON serialization
@@ -289,9 +294,12 @@ async def handle_cached_read(
         
     res_data = await fetch_func()
     
-    if ctx_key not in LOCAL_READ_CACHE:
-        LOCAL_READ_CACHE[ctx_key] = {}
-    LOCAL_READ_CACHE[ctx_key][etag] = res_data
+    # Don't cache partial fan-out results: they would keep serving degraded
+    # answers until the next write invalidation even after shards recover.
+    if not (isinstance(res_data, dict) and res_data.get("partial")):
+        if ctx_key not in LOCAL_READ_CACHE:
+            LOCAL_READ_CACHE[ctx_key] = {}
+        LOCAL_READ_CACHE[ctx_key][etag] = res_data
     response.headers["ETag"] = etag
     return res_data
 
@@ -303,7 +311,7 @@ async def broadcast_sse_event(event_type: str, data: dict):
     """
     if not SSE_LISTENERS:
         return
-    logger.info(f"Broadcasting SSE event '{event_type}' to {len(SSE_LISTENERS)} listeners.")
+    logger.debug(f"Broadcasting SSE event '{event_type}' to {len(SSE_LISTENERS)} listeners.")
     for queue in list(SSE_LISTENERS):
         await queue.put({"event": event_type, "data": data})
 
@@ -411,7 +419,7 @@ async def poll_shards_loop():
                             }
                             
                             # Trigger background synchronization if node was previously offline/unhealthy
-                            logger.info(f"poll_shards_loop: shard={shard} prev_status={prev_status} syncing={shard in SYNCING_NODES}")
+                            logger.debug(f"poll_shards_loop: shard={shard} prev_status={prev_status} syncing={shard in SYNCING_NODES}")
                             if BACKGROUND_SYNC_ENABLED and prev_status not in ("healthy", "synchronizing") and shard not in SYNCING_NODES:
                                 group = get_replica_group_for_node(shard)
                                 source_node = None
@@ -419,7 +427,7 @@ async def poll_shards_loop():
                                     if sibling != shard:
                                         sib_metrics = SHARD_METRICS_CACHE.get(sibling)
                                         sib_status = sib_metrics.get("status") if sib_metrics else None
-                                        logger.info(f"poll_shards_loop: checking sibling={sibling} status={sib_status}")
+                                        logger.debug(f"poll_shards_loop: checking sibling={sibling} status={sib_status}")
                                         if sib_metrics and sib_status == "healthy":
                                             source_node = sibling
                                             break
@@ -1216,7 +1224,7 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                 # Manual embedding generation to support predefined atom_id
                 if engine._model_name:
                     embedder = engine._get_embedder()
-                    emb = await asyncio.to_thread(embedder.encode, text, normalize_embeddings=True)
+                    emb = await asyncio.to_thread(embedder.encode, text, normalize_embeddings=True, show_progress_bar=False)
                     embedding = np.array(emb, dtype=np.float32)
                 else:
                     embedding = np.zeros(engine.dim, dtype=np.float32)
@@ -1509,20 +1517,23 @@ async def query_memories(
             responses = await asyncio.gather(*tasks, return_exceptions=True)
             
             all_results = []
-            for resp in responses:
+            failed_shards = 0
+            for node, resp in zip(target_nodes, responses):
                 if isinstance(resp, httpx.Response) and resp.status_code == 200:
                     data = resp.json()
                     all_results.extend(data.get("results", []))
-                elif isinstance(resp, Exception):
-                    logger.error(f"Error querying shard: {format_shard_error(resp)}")
-                elif isinstance(resp, httpx.Response):
-                    logger.error(
-                        f"Error querying shard: {format_shard_error(resp)}"
-                    )
+                else:
+                    failed_shards += 1
+                    logger.error(f"Error querying shard {node}: {format_shard_error(resp)}")
                     
             # Sort by similarity score in descending order
             all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-            return {"results": all_results[:payload.k]}
+            result = {"results": all_results[:payload.k]}
+            if failed_shards:
+                # Let callers distinguish "no matches" from "some shards did not answer".
+                result["partial"] = True
+                result["failed_shards"] = failed_shards
+            return result
         else:
             active_db = await get_db_instance(ctx.tenant, ctx.namespace)
             try:
@@ -1544,7 +1555,7 @@ async def query_memories(
                 # Retrieve engine to compute exact similarity scores
                 engine = await active_db._get_db()
                 embedder = engine._get_embedder()
-                q_emb = await asyncio.to_thread(embedder.encode, payload.query, normalize_embeddings=True)
+                q_emb = await asyncio.to_thread(embedder.encode, payload.query, normalize_embeddings=True, show_progress_bar=False)
                 q_emb = np.array(q_emb, dtype=np.float32)
                 
                 formatted_results = []
