@@ -343,15 +343,26 @@ async def test_shard_failure_and_graceful_recovery():
         res_recovered = await coord_db.get(target_shard_1_id)
         assert res_recovered.id == target_shard_1_id
 
-        # 10. Write mapped to recovered Shard 1 now succeeds
+        # 10. The coordinator health poll is asynchronous. Retry a write mapped
+        # to the recovered owner until the coordinator observes it as healthy.
         recovered_write = False
         for j in range(100):
             test_txt = f"Recovered write {j}"
             node = test_hash_ring.get_node(test_txt)
             if node == f"http://127.0.0.1:{PORT_S1}":
-                res = await coord_db.remember(test_txt)
-                assert isinstance(res, str)
-                recovered_write = True
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    try:
+                        res = await coord_db.remember(test_txt)
+                        assert isinstance(res, str)
+                        recovered_write = True
+                        break
+                    except RuntimeError as error:
+                        # A transient 503 is expected until the coordinator's
+                        # next health-poll cycle marks the owner available.
+                        if "HTTP Error 503" not in str(error):
+                            raise
+                        await asyncio.sleep(1)
                 break
         assert recovered_write
 

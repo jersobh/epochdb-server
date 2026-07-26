@@ -10,11 +10,6 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
-    # Endpoint and cluster tests exercise routing/persistence contracts. Keep
-    # heavyweight model imports out of the CPU-only CI runner; the Docker image
-    # separately installs CPU PyTorch and validates runtime packaging.
-    env:
-      EMBEDDING_MODEL: ""
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -32,6 +27,14 @@ jobs:
 
     - name: Install dependencies
       run: poetry install --no-root --no-interaction
+
+    # Poetry resolves the PyPI CUDA build of Torch. Replace it with the matching
+    # CPU wheel before importing sentence-transformers on GitHub's CPU runner.
+    - name: Use CPU-only PyTorch
+      run: |
+        poetry run pip install --force-reinstall --no-deps \
+          --index-url https://download.pytorch.org/whl/cpu \
+          "torch==2.13.0+cpu"
 
 
     - name: Run pytest
