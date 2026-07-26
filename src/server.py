@@ -29,7 +29,26 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.10.3"
+SERVER_VERSION = "0.10.4"
+# Coordinator→shard HTTP timeout. Embeddings on small VPS CPUs often exceed 30s
+# under concurrent ingest; default matches gunicorn --timeout 120.
+COORDINATOR_HTTP_TIMEOUT = float(os.getenv("COORDINATOR_HTTP_TIMEOUT", "120"))
+
+
+def format_shard_error(resp: Any) -> str:
+    """Readable shard failure text (TimeoutError/ReadError often have empty str())."""
+    if isinstance(resp, Exception):
+        msg = str(resp).strip()
+        return msg if msg else repr(resp)
+    if isinstance(resp, httpx.Response):
+        body = (resp.text or "").strip().replace("\n", " ")[:200]
+        return f"HTTP {resp.status_code}" + (f": {body}" if body else "")
+    return repr(resp)
+
+
+def should_mark_shard_offline(resp: Any) -> bool:
+    """Only mark offline for hard connectivity loss — not overload timeouts."""
+    return isinstance(resp, httpx.ConnectError)
 
 
 # -------------------------------------------------------------------------
@@ -364,11 +383,14 @@ async def poll_shards_loop():
     all_replica_nodes = []
     for group in shard_groups:
         all_replica_nodes.extend(group)
+    # Stats can stall while shards embed; keep this well below COORDINATOR_HTTP_TIMEOUT
+    # but high enough not to flap healthy→unhealthy under normal ingest load.
+    stats_timeout = float(os.getenv("COORDINATOR_STATS_TIMEOUT", "15"))
         
     while True:
         if client:
             try:
-                tasks = [client.get(f"{shard}/stats", timeout=2.0) for shard in all_replica_nodes]
+                tasks = [client.get(f"{shard}/stats", timeout=stats_timeout) for shard in all_replica_nodes]
                 responses = await asyncio.gather(*tasks, return_exceptions=True)
                 status_changed = False
                 for shard, resp in zip(all_replica_nodes, responses):
@@ -439,8 +461,9 @@ async def poll_shards_loop():
                                 "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
                                 "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
                             }
-                    else:
-                        err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                    elif isinstance(resp, httpx.ConnectError):
+                        err_msg = format_shard_error(resp)
+                        logger.warning(f"poll_shards_loop: shard={shard} unreachable: {err_msg}")
                         SHARD_METRICS_CACHE[shard] = {
                             "status": "unhealthy",
                             "error": err_msg,
@@ -448,6 +471,20 @@ async def poll_shards_loop():
                             "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
                             "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
                         }
+                    else:
+                        # Timeout / transient HTTP blips while embedding: keep prior metrics.
+                        err_msg = format_shard_error(resp)
+                        logger.warning(
+                            f"poll_shards_loop: shard={shard} stats probe failed (keeping prior status={prev_status}): {err_msg}"
+                        )
+                        if not SHARD_METRICS_CACHE.get(shard):
+                            SHARD_METRICS_CACHE[shard] = {
+                                "status": "healthy",
+                                "error": err_msg,
+                                "cpu": 0.0,
+                                "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                                "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                            }
                     
                     new_status = SHARD_METRICS_CACHE.get(shard, {}).get("status")
                     if prev_status != new_status:
@@ -665,7 +702,11 @@ async def lifespan(app: FastAPI):
         headers = {}
         if INTERNAL_AUTH_TOKEN:
             headers["X-Internal-Token"] = INTERNAL_AUTH_TOKEN
-        client = httpx.AsyncClient(headers=headers, timeout=30.0)
+        logger.info(
+            "Coordinator HTTP client timeout=%.1fs (COORDINATOR_HTTP_TIMEOUT)",
+            COORDINATOR_HTTP_TIMEOUT,
+        )
+        client = httpx.AsyncClient(headers=headers, timeout=COORDINATOR_HTTP_TIMEOUT)
         polling_task = asyncio.create_task(poll_shards_loop())
         yield
         polling_task.cancel()
@@ -1126,15 +1167,16 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                     if isinstance(resp, httpx.Response) and resp.status_code == 201:
                         success_nodes.append(node)
                     else:
-                        err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                        err_msg = format_shard_error(resp)
                         logger.warning(f"Replication write failed to node {node}: {err_msg}")
                         failures.append((node, err_msg))
-                        SHARD_METRICS_CACHE[node] = {
-                            "status": "offline",
-                            "cpu": 0.0,
-                            "ram": {"percent": 0.0},
-                            "disk": {"percent": 0.0}
-                        }
+                        if should_mark_shard_offline(resp):
+                            SHARD_METRICS_CACHE[node] = {
+                                "status": "offline",
+                                "cpu": 0.0,
+                                "ram": {"percent": 0.0},
+                                "disk": {"percent": 0.0}
+                            }
                 
                 consistency = get_consistency_level(request)
                 n = len(group)
@@ -1472,7 +1514,11 @@ async def query_memories(
                     data = resp.json()
                     all_results.extend(data.get("results", []))
                 elif isinstance(resp, Exception):
-                    logger.error(f"Error querying shard: {resp}")
+                    logger.error(f"Error querying shard: {format_shard_error(resp)}")
+                elif isinstance(resp, httpx.Response):
+                    logger.error(
+                        f"Error querying shard: {format_shard_error(resp)}"
+                    )
                     
             # Sort by similarity score in descending order
             all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
@@ -1614,15 +1660,16 @@ async def update_memory(payload: UpdatePayload, request: Request, ctx: RequestCo
                 if isinstance(resp, httpx.Response) and resp.status_code == 200:
                     success_nodes.append(node)
                 else:
-                    err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                    err_msg = format_shard_error(resp)
                     logger.warning(f"Replication update failed on replica {node}: {err_msg}")
                     failures.append((node, err_msg))
-                    SHARD_METRICS_CACHE[node] = {
-                        "status": "offline",
-                        "cpu": 0.0,
-                        "ram": {"percent": 0.0},
-                        "disk": {"percent": 0.0}
-                    }
+                    if should_mark_shard_offline(resp):
+                        SHARD_METRICS_CACHE[node] = {
+                            "status": "offline",
+                            "cpu": 0.0,
+                            "ram": {"percent": 0.0},
+                            "disk": {"percent": 0.0}
+                        }
                     
             consistency = get_consistency_level(request)
             n = len(group)
@@ -1702,15 +1749,16 @@ async def delete_memory(payload: DeletePayload, request: Request, ctx: RequestCo
                 if isinstance(resp, httpx.Response) and resp.status_code == 200:
                     success_nodes.append(node)
                 else:
-                    err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                    err_msg = format_shard_error(resp)
                     logger.warning(f"Replication delete failed on replica {node}: {err_msg}")
                     failures.append((node, err_msg))
-                    SHARD_METRICS_CACHE[node] = {
-                        "status": "offline",
-                        "cpu": 0.0,
-                        "ram": {"percent": 0.0},
-                        "disk": {"percent": 0.0}
-                    }
+                    if should_mark_shard_offline(resp):
+                        SHARD_METRICS_CACHE[node] = {
+                            "status": "offline",
+                            "cpu": 0.0,
+                            "ram": {"percent": 0.0},
+                            "disk": {"percent": 0.0}
+                        }
                     
             consistency = get_consistency_level(request)
             n = len(group)
