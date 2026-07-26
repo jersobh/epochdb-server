@@ -2,6 +2,10 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.10.6] - 2026-07-26
+### Changed
+- **Dependency**: Requires `epochdb>=1.8.4`, including robust HNSW queries after hard deletes and improved retrieval of three-character conversational entities.
+
 ## [0.10.5] - 2026-07-26
 ### Fixed
 - **Cross-shard write routing**: Coordinator writes now stay in their consistent-hash owner group. Saturated or unavailable owners return `503` with `Retry-After` instead of stranding records on a fallback shard.
