@@ -2,6 +2,13 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.10.4] - 2026-07-26
+### Fixed
+- **Coordinator write/query timeouts under load**: Default coordinator→shard HTTP timeout raised from 30s to 120s (`COORDINATOR_HTTP_TIMEOUT`), matching gunicorn worker timeout. Concurrent MiniLM embeds on small VPS CPUs regularly exceeded 30s, causing empty `Last error:` / `Error querying shard:` logs and 500s on `/remember`.
+- **False offline marking**: Timeouts no longer mark shards `offline` (only hard `ConnectError`), avoiding cascading routing failures while shards are merely busy.
+- **Stats poll flapping**: `/stats` probe timeout raised (`COORDINATOR_STATS_TIMEOUT`, default 15s). Transient stats failures keep the prior health status instead of flipping every shard to `unhealthy` (which triggered `All nodes unhealthy/offline` despite `healthz` 200).
+- **Opaque exception logs**: Shard fan-out errors now use `repr()` / response body when `str(exc)` is empty (e.g. bare `TimeoutException`).
+
 ## [0.10.3] - 2026-07-26
 ### Changed
 - **Dependency**: Requires `epochdb>=1.8.2` (LocalFactExtractor no longer promotes predicates into co-occurrence graph nodes).
