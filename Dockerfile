@@ -1,6 +1,9 @@
 # Use an official Python runtime as a parent image
 FROM python:3.12-slim
 
+# Prevent hnswlib build from assuming host-native instruction extensions (e.g. AVX-512)
+ENV HNSWLIB_NO_NATIVE=1
+
 # Install system dependencies required for compiling C/C++ dependencies if needed
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -26,15 +29,13 @@ RUN pip install --no-cache-dir \
     "gunicorn>=22.0.0" \
     "sse-starlette>=2.1.0,<4.0.0"
 
-
-
 # Copy the server source code
 COPY src/ ./src/
 
 # Expose the API port
 EXPOSE 8080
 
-# Start the FastAPI server using Gunicorn process manager with Uvicorn workers, first deleting any stale locks
-CMD ["sh", "-c", "rm -f /data/.lock && gunicorn src.server:app --workers 1 --timeout 120 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8080"]
+# Start the FastAPI server using Gunicorn process manager with Uvicorn workers, first recursively deleting any stale locks
+CMD ["sh", "-c", "find /data -name '*.lock' -delete 2>/dev/null || true && gunicorn src.server:app --workers 1 --timeout 120 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8080"]
 
 
