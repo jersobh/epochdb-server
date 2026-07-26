@@ -49,6 +49,8 @@ def run_cluster():
     env0["NODE_MODE"] = "shard"
     env0["STORAGE_DIR"] = SHARD0_DIR
     env0["INTERNAL_AUTH_TOKEN"] = internal_token
+    # This test validates storage concurrency, not saturation responses.
+    env0["SHARD_EMBED_QUEUE_LIMIT"] = "100"
     p0 = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S0)],
         env=env0, stdout=sys.stderr, stderr=sys.stderr
@@ -61,6 +63,7 @@ def run_cluster():
     env1["NODE_MODE"] = "shard"
     env1["STORAGE_DIR"] = SHARD1_DIR
     env1["INTERNAL_AUTH_TOKEN"] = internal_token
+    env1["SHARD_EMBED_QUEUE_LIMIT"] = "100"
     p1 = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S1)],
         env=env1, stdout=sys.stderr, stderr=sys.stderr
@@ -73,6 +76,7 @@ def run_cluster():
     env2["NODE_MODE"] = "shard"
     env2["STORAGE_DIR"] = SHARD2_DIR
     env2["INTERNAL_AUTH_TOKEN"] = internal_token
+    env2["SHARD_EMBED_QUEUE_LIMIT"] = "100"
     p2 = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S2)],
         env=env2, stdout=sys.stderr, stderr=sys.stderr
@@ -290,19 +294,24 @@ async def test_shard_failure_and_graceful_recovery():
                 break
         assert success_write
 
-        # 8. Write mapped to offline Shard 1 is routed to alternative healthy shard (Shard 0 or 2)
-        success_offline_write = False
+        # 8. A write mapped to offline Shard 1 is rejected rather than being
+        # stranded in a different consistent-hash group.
+        rejected_owner_write = False
         for j in range(100):
             test_txt = f"Verify offline write {j}"
             node = test_hash_ring.get_node(test_txt)
             if node == f"http://127.0.0.1:{PORT_S1}":
-                res = await coord_db.remember(test_txt)
-                assert isinstance(res, str)
-                # Should route to shard0 or shard2 since shard1 is down
-                assert res.startswith("shard0-") or res.startswith("shard2-")
-                success_offline_write = True
+                async with httpx.AsyncClient() as raw_client:
+                    res = await raw_client.post(
+                        f"http://127.0.0.1:{PORT_COORD}/remember",
+                        json={"text": test_txt},
+                        headers={"X-API-Key": "test-api-key-12345"},
+                    )
+                assert res.status_code == 503
+                assert res.headers["retry-after"] == "5"
+                rejected_owner_write = True
                 break
-        assert success_offline_write
+        assert rejected_owner_write
 
         # ----------------------------------------------------
         # Recovery phase: Restart Shard 1
@@ -333,15 +342,24 @@ async def test_shard_failure_and_graceful_recovery():
         res_recovered = await coord_db.get(target_shard_1_id)
         assert res_recovered.id == target_shard_1_id
 
-        # 10. Write mapped to recovered Shard 1 now succeeds
+        # 10. The coordinator health poll is asynchronous. Retry a write mapped
+        # to the recovered owner until the coordinator observes it as healthy.
         recovered_write = False
         for j in range(100):
             test_txt = f"Recovered write {j}"
             node = test_hash_ring.get_node(test_txt)
             if node == f"http://127.0.0.1:{PORT_S1}":
-                res = await coord_db.remember(test_txt)
-                assert isinstance(res, str)
-                recovered_write = True
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    try:
+                        res = await coord_db.remember(test_txt)
+                        assert isinstance(res, str)
+                        recovered_write = True
+                        break
+                    except RuntimeError as error:
+                        if "HTTP Error 503" not in str(error):
+                            raise
+                        await asyncio.sleep(1)
                 break
         assert recovered_write
 

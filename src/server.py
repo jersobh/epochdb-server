@@ -1196,11 +1196,25 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                     return {"status": "success", "id": atom_id}
                 else:
                     last_err = failures[-1][1] if failures else "Unknown error"
-                    raise Exception(f"Write consistency check failed. Required: {consistency.value} ({required_success}), got: {len(success_nodes)} success(es). Last error: {last_err}")
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            f"Owning shard group could not accept write. Required: "
+                            f"{consistency.value} ({required_success}), got: "
+                            f"{len(success_nodes)} success(es). Last error: {last_err}"
+                        ),
+                        headers={"Retry-After": "5"},
+                    )
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Failed to forward write to shard set {target_shard} on attempt {attempt}: {e}")
                 if attempt >= max_attempts:
-                    raise HTTPException(status_code=500, detail=f"Failed to forward write to shard set: {str(e)}")
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Owning shard group could not accept write: {str(e)}",
+                        headers={"Retry-After": "5"},
+                    )
             
     else:
         # Shard Mode (Storage Node)
