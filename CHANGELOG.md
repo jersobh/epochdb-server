@@ -2,6 +2,14 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.10.5] - 2026-07-26
+### Fixed
+- **Cross-shard write routing**: Coordinator writes now stay in their consistent-hash owner group. Saturated or unavailable owners return `503` with `Retry-After` instead of stranding records on a fallback shard.
+### Added
+- **Embedding backpressure**: Per-shard bounded embedding capacity (`SHARD_EMBED_CONCURRENCY`, default `1`) and queue limit (`SHARD_EMBED_QUEUE_LIMIT`, default `8`). Saturated shards return a retryable `503`.
+### Changed
+- **Dependency**: Requires `epochdb>=1.8.3` for checkpoint-safe WAL markers, durable hard deletes, and vector-index update maintenance.
+
 ## [0.10.4] - 2026-07-26
 ### Fixed
 - **Coordinator write/query timeouts under load**: Default coordinator→shard HTTP timeout raised from 30s to 120s (`COORDINATOR_HTTP_TIMEOUT`), matching gunicorn worker timeout. Concurrent MiniLM embeds on small VPS CPUs regularly exceeded 30s, causing empty `Last error:` / `Error querying shard:` logs and 500s on `/remember`.

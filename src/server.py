@@ -29,10 +29,16 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.10.4"
+SERVER_VERSION = "0.10.5"
 # Coordinator→shard HTTP timeout. Embeddings on small VPS CPUs often exceed 30s
 # under concurrent ingest; default matches gunicorn --timeout 120.
 COORDINATOR_HTTP_TIMEOUT = float(os.getenv("COORDINATOR_HTTP_TIMEOUT", "120"))
+# Bound CPU-bound sentence-transformer work per shard process. A full queue is
+# rejected rather than letting requests pile up until coordinator timeouts.
+SHARD_EMBED_CONCURRENCY = max(1, int(os.getenv("SHARD_EMBED_CONCURRENCY", "1")))
+SHARD_EMBED_QUEUE_LIMIT = max(0, int(os.getenv("SHARD_EMBED_QUEUE_LIMIT", "8")))
+_embed_semaphore: Optional[asyncio.Semaphore] = None
+_embed_waiters = 0
 
 
 def format_shard_error(resp: Any) -> str:
@@ -65,6 +71,35 @@ logger = logging.getLogger("epochdb_production_server")
 # across shards this floods coordinator logs and buries real errors.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+@asynccontextmanager
+async def embedding_slot():
+    """Reserve bounded shard-local capacity for an embedding operation."""
+    global _embed_semaphore, _embed_waiters
+    if _embed_semaphore is None:
+        _embed_semaphore = asyncio.Semaphore(SHARD_EMBED_CONCURRENCY)
+
+    if _embed_semaphore.locked() and _embed_waiters >= SHARD_EMBED_QUEUE_LIMIT:
+        raise HTTPException(
+            status_code=503,
+            detail="Embedding capacity is saturated; retry shortly.",
+            headers={"Retry-After": "5"},
+        )
+
+    _embed_waiters += 1
+    try:
+        async with _embed_semaphore:
+            yield
+    finally:
+        _embed_waiters -= 1
+
+
+async def run_embedding(fn, *args, **kwargs):
+    """Run a CPU-bound embedding with bounded shard-local queueing."""
+    async with embedding_slot():
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
 
 # -------------------------------------------------------------------------
 # System Resource Profiling Helpers
@@ -547,9 +582,10 @@ async def poll_shards_loop():
 
 def get_healthy_shard(key: str) -> str:
     """
-    Selects the target shard for a key using consistent hashing.
-    If the target shard group is unhealthy or overloaded (CPU/RAM/Disk > 90%),
-    it routes to the next healthy alternative shard group in the ring.
+    Return the owning shard group for a key, only if it can accept a write.
+
+    Writes must never move to another consistent-hash group: doing so breaks
+    deterministic ID routing and leaves data stranded after owner recovery.
     """
     if not shard_nodes:
         raise HTTPException(status_code=500, detail="No shards available to route write request.")
@@ -575,21 +611,15 @@ def get_healthy_shard(key: str) -> str:
     if is_group_good(primary_node):
         return primary_node
 
-    for node in shard_nodes:
-        if node != primary_node and is_group_good(node):
-            logger.warning(f"Routing key '{key[:20]}...' to healthy fallback shard group {node} instead of overloaded/unhealthy {primary_node}")
-            return node
-
-    for node in shard_nodes:
-        group = get_replica_group_for_node(node)
-        for rep in group:
-            metrics = SHARD_METRICS_CACHE.get(rep)
-            if metrics and metrics.get("status") == "healthy":
-                logger.warning(f"Routing to overloaded but alive fallback shard group {node}")
-                return node
-
-    logger.warning(f"All nodes unhealthy/offline. Routing to default consistent-hashing node {primary_node}")
-    return primary_node
+    logger.warning(
+        "Owner shard group %s cannot accept write for key %r; refusing cross-shard reroute.",
+        primary_node, key[:20],
+    )
+    raise HTTPException(
+        status_code=503,
+        detail="Owning shard group is unavailable or saturated; retry shortly.",
+        headers={"Retry-After": "5"},
+    )
 
 
 # -------------------------------------------------------------------------
@@ -1100,57 +1130,22 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
         if not shard_nodes:
             raise HTTPException(status_code=500, detail="No shard nodes available to route write request.")
         
-        target_shard = None
         original_predefined_id = payload.id
-        
-        max_attempts = 3
-        attempt = 0
-        tried_nodes = set()
-        
-        while attempt < max_attempts:
-            attempt += 1
-            
-            if original_predefined_id:
-                # If predefined ID is provided and contains a valid prefix, route to that shard
-                target_shard = get_shard_for_id(original_predefined_id)
-                if target_shard:
-                    atom_id = original_predefined_id
-                else:
-                    # Prepend prefix using health-based routing
-                    target_shard = get_healthy_shard(payload.text)
-                    shard_idx = shard_nodes.index(target_shard)
-                    atom_id = f"shard{shard_idx}-{original_predefined_id}"
+        if original_predefined_id:
+            target_shard = get_shard_for_id(original_predefined_id)
+            if target_shard:
+                atom_id = original_predefined_id
             else:
-                # Generate prefixed UUID, using health-based routing
                 target_shard = get_healthy_shard(payload.text)
                 shard_idx = shard_nodes.index(target_shard)
-                atom_id = f"shard{shard_idx}-{uuid.uuid4().hex}"
-                
-            # If the chosen target shard has already failed in this request cycle, fallback
-            if target_shard in tried_nodes:
-                alternative = None
-                for node in shard_nodes:
-                    if node not in tried_nodes:
-                        metrics = SHARD_METRICS_CACHE.get(node)
-                        if metrics and metrics.get("status") == "healthy":
-                            alternative = node
-                            break
-                if not alternative:
-                    for node in shard_nodes:
-                        if node not in tried_nodes:
-                            alternative = node
-                            break
-                if alternative:
-                    target_shard = alternative
-                    shard_idx = shard_nodes.index(target_shard)
-                    if original_predefined_id:
-                        atom_id = f"shard{shard_idx}-{original_predefined_id}"
-                    else:
-                        atom_id = f"shard{shard_idx}-{uuid.uuid4().hex}"
-                else:
-                    break
-                    
-            tried_nodes.add(target_shard)
+                atom_id = f"shard{shard_idx}-{original_predefined_id}"
+        else:
+            target_shard = get_healthy_shard(payload.text)
+            shard_idx = shard_nodes.index(target_shard)
+            atom_id = f"shard{shard_idx}-{uuid.uuid4().hex}"
+
+        max_attempts = max(1, int(os.getenv("COORDINATOR_WRITE_RETRIES", "3")))
+        for attempt in range(1, max_attempts + 1):
             
             try:
                 target_payload = {
@@ -1224,7 +1219,12 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                 # Manual embedding generation to support predefined atom_id
                 if engine._model_name:
                     embedder = engine._get_embedder()
-                    emb = await asyncio.to_thread(embedder.encode, text, normalize_embeddings=True, show_progress_bar=False)
+                    emb = await run_embedding(
+                        embedder.encode,
+                        text,
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                    )
                     embedding = np.array(emb, dtype=np.float32)
                 else:
                     embedding = np.zeros(engine.dim, dtype=np.float32)
@@ -1343,11 +1343,18 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                 await broadcast_sse_event("update", {"type": "write", "id": atom_id})
                 return {"status": "success", "id": atom_id}
             else:
-                atom_id = await active_db.remember(text=payload.text, metadata=payload.metadata, memory_type=payload.memory_type)
+                async with embedding_slot():
+                    atom_id = await active_db.remember(
+                        text=payload.text,
+                        metadata=payload.metadata,
+                        memory_type=payload.memory_type,
+                    )
                 logger.info(f"Ingested atom: '{payload.text[:40]}...'")
                 invalidate_cache(ctx.tenant, ctx.namespace)
                 await broadcast_sse_event("update", {"type": "write", "id": atom_id})
                 return {"status": "success", "id": atom_id}
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Failed to commit memory write block: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Internal storage layer mutation rejected: {str(e)}")
@@ -1555,7 +1562,12 @@ async def query_memories(
                 # Retrieve engine to compute exact similarity scores
                 engine = await active_db._get_db()
                 embedder = engine._get_embedder()
-                q_emb = await asyncio.to_thread(embedder.encode, payload.query, normalize_embeddings=True, show_progress_bar=False)
+                q_emb = await run_embedding(
+                    embedder.encode,
+                    payload.query,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
                 q_emb = np.array(q_emb, dtype=np.float32)
                 
                 formatted_results = []
