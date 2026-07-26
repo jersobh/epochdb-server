@@ -49,6 +49,9 @@ def run_cluster():
     env0["NODE_MODE"] = "shard"
     env0["STORAGE_DIR"] = SHARD0_DIR
     env0["INTERNAL_AUTH_TOKEN"] = internal_token
+    # This test validates storage concurrency, not production admission
+    # control; keep all 50 writes queued instead of exercising 503 limits.
+    env0["SHARD_EMBED_QUEUE_LIMIT"] = "100"
     p0 = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S0)],
         env=env0, stdout=sys.stderr, stderr=sys.stderr
@@ -61,6 +64,7 @@ def run_cluster():
     env1["NODE_MODE"] = "shard"
     env1["STORAGE_DIR"] = SHARD1_DIR
     env1["INTERNAL_AUTH_TOKEN"] = internal_token
+    env1["SHARD_EMBED_QUEUE_LIMIT"] = "100"
     p1 = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S1)],
         env=env1, stdout=sys.stderr, stderr=sys.stderr
@@ -73,6 +77,7 @@ def run_cluster():
     env2["NODE_MODE"] = "shard"
     env2["STORAGE_DIR"] = SHARD2_DIR
     env2["INTERNAL_AUTH_TOKEN"] = internal_token
+    env2["SHARD_EMBED_QUEUE_LIMIT"] = "100"
     p2 = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.server:app", "--host", "127.0.0.1", "--port", str(PORT_S2)],
         env=env2, stdout=sys.stderr, stderr=sys.stderr

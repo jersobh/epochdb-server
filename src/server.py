@@ -1200,7 +1200,14 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
             except Exception as e:
                 logger.error(f"Failed to forward write to shard set {target_shard} on attempt {attempt}: {e}")
                 if attempt >= max_attempts:
-                    raise HTTPException(status_code=500, detail=f"Failed to forward write to shard set: {str(e)}")
+                    # Owner-group failure is retryable. Returning 500 masks
+                    # overload/offline conditions and makes clients retry
+                    # incorrectly or treat the write as permanently failed.
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Owning shard group could not accept write: {str(e)}",
+                        headers={"Retry-After": "5"},
+                    )
             
     else:
         # Shard Mode (Storage Node)
