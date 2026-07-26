@@ -1461,14 +1461,20 @@ async def query_memories(
         else:
             active_db = await get_db_instance(ctx.tenant, ctx.namespace)
             try:
-                results = await active_db.query(
-                    text=payload.query,
-                    k=payload.k,
-                    filters=payload.filters,
-                    memory_type=payload.memory_type,
-                    context_window=payload.context_window,
-                    expand_hops=payload.expand_hops,
-                )
+                query_kwargs = {
+                    "text": payload.query,
+                    "k": payload.k,
+                    "filters": payload.filters,
+                    "memory_type": payload.memory_type,
+                    "context_window": payload.context_window,
+                }
+                if payload.expand_hops > 0:
+                    query_kwargs["expand_hops"] = payload.expand_hops
+                try:
+                    results = await active_db.query(**query_kwargs)
+                except TypeError:
+                    query_kwargs.pop("expand_hops", None)
+                    results = await active_db.query(**query_kwargs)
                 
                 # Retrieve engine to compute exact similarity scores
                 engine = await active_db._get_db()
