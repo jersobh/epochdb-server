@@ -290,19 +290,24 @@ async def test_shard_failure_and_graceful_recovery():
                 break
         assert success_write
 
-        # 8. Write mapped to offline Shard 1 is routed to alternative healthy shard (Shard 0 or 2)
-        success_offline_write = False
+        # 8. A write mapped to offline Shard 1 is rejected rather than being
+        # stranded in a different consistent-hash group.
+        rejected_owner_write = False
         for j in range(100):
             test_txt = f"Verify offline write {j}"
             node = test_hash_ring.get_node(test_txt)
             if node == f"http://127.0.0.1:{PORT_S1}":
-                res = await coord_db.remember(test_txt)
-                assert isinstance(res, str)
-                # Should route to shard0 or shard2 since shard1 is down
-                assert res.startswith("shard0-") or res.startswith("shard2-")
-                success_offline_write = True
+                async with httpx.AsyncClient() as raw_client:
+                    res = await raw_client.post(
+                        f"http://127.0.0.1:{PORT_COORD}/remember",
+                        json={"text": test_txt},
+                        headers={"X-API-Key": "test-api-key-12345"},
+                    )
+                assert res.status_code == 503
+                assert res.headers["retry-after"] == "5"
+                rejected_owner_write = True
                 break
-        assert success_offline_write
+        assert rejected_owner_write
 
         # ----------------------------------------------------
         # Recovery phase: Restart Shard 1
