@@ -520,11 +520,13 @@ async def poll_shards_loop():
                         else:
                             # Probe failed/timed out/disconnected
                             fail_counts[shard] += 1
-                            backoff_delay = min(base_poll_interval * (2 ** (fail_counts[shard] - 1)), max_backoff)
-                            next_poll_time[shard] = now + backoff_delay
+                            err_msg = format_shard_error(resp)
 
                             if isinstance(resp, httpx.ConnectError):
-                                err_msg = format_shard_error(resp)
+                                # Hard connectivity loss: cap retry delay to base_poll_interval (e.g. 5s)
+                                # so recovered/rebooted nodes are detected promptly.
+                                backoff_delay = base_poll_interval
+                                next_poll_time[shard] = now + backoff_delay
                                 logger.warning(f"poll_shards_loop: shard={shard} unreachable (fails={fail_counts[shard]}, next_poll_in={backoff_delay:.1f}s): {err_msg}")
                                 SHARD_METRICS_CACHE[shard] = {
                                     "status": "unhealthy",
@@ -534,8 +536,10 @@ async def poll_shards_loop():
                                     "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
                                 }
                             else:
-                                # Timeout / transient HTTP blips while embedding: keep prior metrics.
-                                err_msg = format_shard_error(resp)
+                                # Overload timeout / transient HTTP blips while embedding: exponential backoff
+                                # to avoid hammering the busy worker event loop.
+                                backoff_delay = min(base_poll_interval * (2 ** (fail_counts[shard] - 1)), max_backoff)
+                                next_poll_time[shard] = now + backoff_delay
                                 logger.warning(
                                     f"poll_shards_loop: shard={shard} stats probe failed (keeping prior status={prev_status}, fails={fail_counts[shard]}, next_poll_in={backoff_delay:.1f}s): {err_msg}"
                                 )
