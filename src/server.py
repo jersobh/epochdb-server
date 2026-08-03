@@ -421,164 +421,183 @@ async def sync_node_data(recovering_node: str, source_node: str):
 async def poll_shards_loop():
     """
     Background loop that runs on the coordinator to poll shards for health and metrics.
+    Employs per-shard exponential backoff and configurable poll intervals to prevent
+    hammering shards that are busy with heavy embedding or disk I/O tasks.
     """
     logger.info("Starting background health polling loop for shards...")
     all_replica_nodes = []
     for group in shard_groups:
         all_replica_nodes.extend(group)
-    # Stats can stall while shards embed; keep this well below COORDINATOR_HTTP_TIMEOUT
-    # but high enough not to flap healthy→unhealthy under normal ingest load.
+    
     stats_timeout = float(os.getenv("COORDINATOR_STATS_TIMEOUT", "15"))
+    base_poll_interval = float(os.getenv("COORDINATOR_POLL_INTERVAL", "5"))
+    max_backoff = float(os.getenv("COORDINATOR_MAX_BACKOFF", "60"))
+
+    # State tracking per shard: next allowed poll timestamp and failure counts
+    next_poll_time: Dict[str, float] = {shard: 0.0 for shard in all_replica_nodes}
+    fail_counts: Dict[str, int] = {shard: 0 for shard in all_replica_nodes}
         
     while True:
         if client:
             try:
-                tasks = [client.get(f"{shard}/stats", timeout=stats_timeout) for shard in all_replica_nodes]
-                responses = await asyncio.gather(*tasks, return_exceptions=True)
-                status_changed = False
-                for shard, resp in zip(all_replica_nodes, responses):
-                    prev_status = SHARD_METRICS_CACHE.get(shard, {}).get("status")
-                    if isinstance(resp, httpx.Response) and resp.status_code == 200:
-                        try:
-                            data = resp.json()
-                            
-                            metrics = {
-                                "status": "healthy",
-                                "memory_count": data.get("memory_count", 0),
-                                "l1_size": data.get("l1_size", 0),
-                                "l2_size": data.get("l2_size", 0),
-                                "entity_count": data.get("entity_count", 0),
-                                "cpu": data.get("cpu", 0.0),
-                                "ram": data.get("ram", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
-                                "disk": data.get("disk", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
-                            }
-                            
-                            # Trigger background synchronization if node was previously offline/unhealthy
-                            logger.debug(f"poll_shards_loop: shard={shard} prev_status={prev_status} syncing={shard in SYNCING_NODES}")
-                            if BACKGROUND_SYNC_ENABLED and prev_status not in ("healthy", "synchronizing") and shard not in SYNCING_NODES:
-                                group = get_replica_group_for_node(shard)
-                                source_node = None
-                                for sibling in group:
-                                    if sibling != shard:
-                                        sib_metrics = SHARD_METRICS_CACHE.get(sibling)
-                                        sib_status = sib_metrics.get("status") if sib_metrics else None
-                                        logger.debug(f"poll_shards_loop: checking sibling={sibling} status={sib_status}")
-                                        if sib_metrics and sib_status == "healthy":
-                                            source_node = sibling
-                                            break
-                                            
-                                logger.info(f"poll_shards_loop: shard={shard} selected source_node={source_node}")
-                                if source_node:
-                                    metrics["status"] = "synchronizing"
-                                    SHARD_METRICS_CACHE[shard] = metrics
-                                    SYNCING_NODES.add(shard)
-                                    
-                                    async def run_sync_task(node=shard, src=source_node):
-                                        try:
-                                            await sync_node_data(node, src)
-                                            if node in SHARD_METRICS_CACHE:
-                                                SHARD_METRICS_CACHE[node]["status"] = "healthy"
-                                                await broadcast_sse_event("update", {"type": "status_change"})
-                                            logger.info(f"Node {node} successfully recovered and synchronized.")
-                                        except Exception as e:
-                                            if node in SHARD_METRICS_CACHE:
-                                                SHARD_METRICS_CACHE[node]["status"] = "unhealthy"
-                                                await broadcast_sse_event("update", {"type": "status_change"})
-                                            logger.error(f"Failed to synchronize recovering node {node}: {e}")
-                                        finally:
-                                            SYNCING_NODES.discard(node)
-                                            
-                                    asyncio.create_task(run_sync_task())
-                                else:
-                                    logger.info(f"poll_shards_loop: marking shard={shard} healthy immediately because no source_node was found")
-                                    SHARD_METRICS_CACHE[shard] = metrics
-                            else:
-                                if prev_status == "synchronizing":
-                                    metrics["status"] = "synchronizing"
-                                SHARD_METRICS_CACHE[shard] = metrics
-                        except Exception as e:
-                            SHARD_METRICS_CACHE[shard] = {
-                                "status": "unhealthy",
-                                "error": f"Failed to parse stats: {str(e)}",
-                                "cpu": 0.0,
-                                "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
-                                "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
-                            }
-                    elif isinstance(resp, httpx.ConnectError):
-                        err_msg = format_shard_error(resp)
-                        logger.warning(f"poll_shards_loop: shard={shard} unreachable: {err_msg}")
-                        SHARD_METRICS_CACHE[shard] = {
-                            "status": "unhealthy",
-                            "error": err_msg,
-                            "cpu": 0.0,
-                            "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
-                            "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
-                        }
-                    else:
-                        # Timeout / transient HTTP blips while embedding: keep prior metrics.
-                        err_msg = format_shard_error(resp)
-                        logger.warning(
-                            f"poll_shards_loop: shard={shard} stats probe failed (keeping prior status={prev_status}): {err_msg}"
-                        )
-                        if not SHARD_METRICS_CACHE.get(shard):
-                            SHARD_METRICS_CACHE[shard] = {
-                                "status": "healthy",
-                                "error": err_msg,
-                                "cpu": 0.0,
-                                "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
-                                "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
-                            }
-                    
-                    new_status = SHARD_METRICS_CACHE.get(shard, {}).get("status")
-                    if prev_status != new_status:
-                        status_changed = True
-                
-                if status_changed:
-                    await broadcast_sse_event("update", {"type": "status_change"})
-                
-                if SSE_LISTENERS:
-                    total_memory_count = 0
-                    total_l1_size = 0
-                    total_l2_size = 0
-                    total_entity_count = 0
-                    
-                    group_representatives = []
-                    for group in shard_groups:
-                        node = get_healthy_replica_for_group(group)
-                        if node:
-                            group_representatives.append(node)
-                            
-                    shards_metrics = {}
-                    for node in all_replica_nodes:
-                        metrics = SHARD_METRICS_CACHE.get(node)
-                        if metrics:
-                            shards_metrics[node] = metrics
-                            if node in group_representatives:
-                                total_memory_count += metrics.get("memory_count", 0)
-                                total_l1_size += metrics.get("l1_size", 0)
-                                total_l2_size += metrics.get("l2_size", 0)
-                                total_entity_count += metrics.get("entity_count", 0)
+                now = time.monotonic()
+                due_shards = [shard for shard in all_replica_nodes if now >= next_poll_time[shard]]
+
+                if due_shards:
+                    tasks = [client.get(f"{shard}/stats", timeout=stats_timeout) for shard in due_shards]
+                    responses = await asyncio.gather(*tasks, return_exceptions=True)
+                    status_changed = False
+                    for shard, resp in zip(due_shards, responses):
+                        prev_status = SHARD_METRICS_CACHE.get(shard, {}).get("status")
+                        if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                            fail_counts[shard] = 0
+                            next_poll_time[shard] = now + base_poll_interval
+                            try:
+                                data = resp.json()
                                 
-                    coord_system = {
-                        "cpu": get_cpu_usage(),
-                        "ram": get_ram_usage(),
-                        "disk": get_disk_usage(os.getenv("STORAGE_DIR", "."))
-                    }
+                                metrics = {
+                                    "status": "healthy",
+                                    "memory_count": data.get("memory_count", 0),
+                                    "l1_size": data.get("l1_size", 0),
+                                    "l2_size": data.get("l2_size", 0),
+                                    "entity_count": data.get("entity_count", 0),
+                                    "cpu": data.get("cpu", 0.0),
+                                    "ram": data.get("ram", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
+                                    "disk": data.get("disk", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
+                                }
+                                
+                                # Trigger background synchronization if node was previously offline/unhealthy
+                                logger.debug(f"poll_shards_loop: shard={shard} prev_status={prev_status} syncing={shard in SYNCING_NODES}")
+                                if BACKGROUND_SYNC_ENABLED and prev_status not in ("healthy", "synchronizing") and shard not in SYNCING_NODES:
+                                    group = get_replica_group_for_node(shard)
+                                    source_node = None
+                                    for sibling in group:
+                                        if sibling != shard:
+                                            sib_metrics = SHARD_METRICS_CACHE.get(sibling)
+                                            sib_status = sib_metrics.get("status") if sib_metrics else None
+                                            logger.debug(f"poll_shards_loop: checking sibling={sibling} status={sib_status}")
+                                            if sib_metrics and sib_status == "healthy":
+                                                source_node = sibling
+                                                break
+                                                
+                                    logger.info(f"poll_shards_loop: shard={shard} selected source_node={source_node}")
+                                    if source_node:
+                                        metrics["status"] = "synchronizing"
+                                        SHARD_METRICS_CACHE[shard] = metrics
+                                        SYNCING_NODES.add(shard)
+                                        
+                                        async def run_sync_task(node=shard, src=source_node):
+                                            try:
+                                                await sync_node_data(node, src)
+                                                if node in SHARD_METRICS_CACHE:
+                                                    SHARD_METRICS_CACHE[node]["status"] = "healthy"
+                                                    await broadcast_sse_event("update", {"type": "status_change"})
+                                                logger.info(f"Node {node} successfully recovered and synchronized.")
+                                            except Exception as e:
+                                                if node in SHARD_METRICS_CACHE:
+                                                    SHARD_METRICS_CACHE[node]["status"] = "unhealthy"
+                                                    await broadcast_sse_event("update", {"type": "status_change"})
+                                                logger.error(f"Failed to synchronize recovering node {node}: {e}")
+                                            finally:
+                                                SYNCING_NODES.discard(node)
+                                                
+                                        asyncio.create_task(run_sync_task())
+                                    else:
+                                        logger.info(f"poll_shards_loop: marking shard={shard} healthy immediately because no source_node was found")
+                                        SHARD_METRICS_CACHE[shard] = metrics
+                                else:
+                                    if prev_status == "synchronizing":
+                                        metrics["status"] = "synchronizing"
+                                    SHARD_METRICS_CACHE[shard] = metrics
+                            except Exception as e:
+                                SHARD_METRICS_CACHE[shard] = {
+                                    "status": "unhealthy",
+                                    "error": f"Failed to parse stats: {str(e)}",
+                                    "cpu": 0.0,
+                                    "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                                    "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                                }
+                        else:
+                            # Probe failed/timed out/disconnected
+                            fail_counts[shard] += 1
+                            backoff_delay = min(base_poll_interval * (2 ** (fail_counts[shard] - 1)), max_backoff)
+                            next_poll_time[shard] = now + backoff_delay
+
+                            if isinstance(resp, httpx.ConnectError):
+                                err_msg = format_shard_error(resp)
+                                logger.warning(f"poll_shards_loop: shard={shard} unreachable (fails={fail_counts[shard]}, next_poll_in={backoff_delay:.1f}s): {err_msg}")
+                                SHARD_METRICS_CACHE[shard] = {
+                                    "status": "unhealthy",
+                                    "error": err_msg,
+                                    "cpu": 0.0,
+                                    "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                                    "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                                }
+                            else:
+                                # Timeout / transient HTTP blips while embedding: keep prior metrics.
+                                err_msg = format_shard_error(resp)
+                                logger.warning(
+                                    f"poll_shards_loop: shard={shard} stats probe failed (keeping prior status={prev_status}, fails={fail_counts[shard]}, next_poll_in={backoff_delay:.1f}s): {err_msg}"
+                                )
+                                if not SHARD_METRICS_CACHE.get(shard):
+                                    SHARD_METRICS_CACHE[shard] = {
+                                        "status": "healthy",
+                                        "error": err_msg,
+                                        "cpu": 0.0,
+                                        "ram": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                                        "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
+                                    }
+                        
+                        new_status = SHARD_METRICS_CACHE.get(shard, {}).get("status")
+                        if prev_status != new_status:
+                            status_changed = True
                     
-                    stats_payload = {
-                        "mode": "coordinator",
-                        "memory_count": total_memory_count,
-                        "l1_size": total_l1_size,
-                        "l2_size": total_l2_size,
-                        "entity_count": total_entity_count,
-                        "system": coord_system,
-                        "shards": shards_metrics
-                    }
+                    if status_changed:
+                        await broadcast_sse_event("update", {"type": "status_change"})
                     
-                    await broadcast_sse_event("stats", stats_payload)
+                    if SSE_LISTENERS:
+                        total_memory_count = 0
+                        total_l1_size = 0
+                        total_l2_size = 0
+                        total_entity_count = 0
+                        
+                        group_representatives = []
+                        for group in shard_groups:
+                            node = get_healthy_replica_for_group(group)
+                            if node:
+                                group_representatives.append(node)
+                                
+                        shards_metrics = {}
+                        for node in all_replica_nodes:
+                            metrics = SHARD_METRICS_CACHE.get(node)
+                            if metrics:
+                                shards_metrics[node] = metrics
+                                if node in group_representatives:
+                                    total_memory_count += metrics.get("memory_count", 0)
+                                    total_l1_size += metrics.get("l1_size", 0)
+                                    total_l2_size += metrics.get("l2_size", 0)
+                                    total_entity_count += metrics.get("entity_count", 0)
+                                    
+                        coord_system = {
+                            "cpu": get_cpu_usage(),
+                            "ram": get_ram_usage(),
+                            "disk": get_disk_usage(os.getenv("STORAGE_DIR", "."))
+                        }
+                        
+                        stats_payload = {
+                            "mode": "coordinator",
+                            "memory_count": total_memory_count,
+                            "l1_size": total_l1_size,
+                            "l2_size": total_l2_size,
+                            "entity_count": total_entity_count,
+                            "system": coord_system,
+                            "shards": shards_metrics
+                        }
+                        
+                        await broadcast_sse_event("stats", stats_payload)
             except Exception as e:
                 logger.error(f"Error in poll_shards_loop execution: {e}")
-        await asyncio.sleep(5)
+        await asyncio.sleep(1)
 
 def get_healthy_shard(key: str) -> str:
     """
