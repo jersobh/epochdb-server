@@ -2,6 +2,11 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.10.7] - 2026-08-03
+### Added
+- **Per-Shard Exponential Backoff**: Introduced adaptive exponential backoff in `poll_shards_loop` for unreachable or timing-out shards to eliminate phantom CPU overhead from repeated TCP connection handshakes and teardowns.
+- **Configurable Coordinator Polling Parameters**: Added `COORDINATOR_POLL_INTERVAL` (default `5s`) and `COORDINATOR_MAX_BACKOFF` (default `60s`) environment variables for coordinator health probe tuning.
+
 ## [0.10.6] - 2026-07-26
 ### Changed
 - **Dependency**: Requires `epochdb>=1.8.4`, including robust HNSW queries after hard deletes and improved retrieval of three-character conversational entities.
