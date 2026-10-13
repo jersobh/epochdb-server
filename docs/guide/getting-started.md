@@ -30,6 +30,6 @@ EpochDB is fully configured to run inside a multi-container Docker cluster conta
 
 The built-in visualization panel is hosted directly on the coordinator gateway.
 
-1. Open your web browser and navigate to `http://localhost:8080/visualize`.
+1. Open **EpochDB Studio** in your browser at `http://localhost:8080/visualize` (also available at `/`).
 2. Authenticate using the default API key configured in `docker-compose.yml` (`test-api-key-12345`).
 3. You will be greeted by the 3D Knowledge Graph Explorer dashboard.

@@ -63,6 +63,7 @@ A server instance runs in one of two modes depending on environment variables:
 ### Prerequisites
 - Docker & Docker Compose
 - Python 3.10+ (if running bare metal)
+- Node.js 20+ (only if rebuilding EpochDB Studio locally; Docker builds it automatically)
 
 ### Deploying the Cluster (Docker Compose)
 A pre-configured 3-shard cluster and 1 coordinator gateway are defined in `docker-compose.yml`.
@@ -77,6 +78,8 @@ This will run:
 - `shard1` at `http://localhost:8082`
 - `shard2` at `http://localhost:8083`
 - `coordinator` gateway at `http://localhost:8080` (public interface)
+
+Open **EpochDB Studio** at [http://localhost:8080/visualize](http://localhost:8080/visualize) (also served at `/`).
 
 ### Production Cloud Deployment (Kubernetes & Terraform)
 
@@ -360,9 +363,14 @@ Compact all cluster nodes.
 * **Response**: `{ "status": "compaction completed" }`
 
 ### 10. `GET /visualize` (also `GET /`)
-Serves **EpochDB Studio** — the React knowledge-graph explorer (2D/3D, Explorer dock, import/export, SSE live updates).
-* **Response**: Built SPA from `ui/` (assets under `/assets/`), with `window.__EPOCHDB_SERVER_CONFIG__` injected for mode, version, and default auth tokens.
-* **Local UI rebuild** (bare metal): `cd ui && npm install && npm run build` (writes to `src/static/ui/`). Docker images build the UI automatically.
+Serves **EpochDB Studio** — the React knowledge-graph explorer (2D/3D, Explorer dock, Memory Inspector, import/export, auth/scope, theme, SSE live updates).
+* **Response**: Built SPA from [`ui/`](ui/) (hashed assets under `/assets/`), with `window.__EPOCHDB_SERVER_CONFIG__` injected for mode, version, and default auth tokens.
+* **Source**: React + Vite app in `ui/`; production build output in `src/static/ui/`.
+* **Local UI rebuild** (bare metal / after UI changes with a bind-mounted `src/`):
+  ```bash
+  cd ui && npm install && npm run build
+  ```
+  Docker images build the UI automatically in a multi-stage Dockerfile.
 
 ### 11. `POST /v1/analytics/query`
 Execute a DuckDB SQL analytical query over Cold Tier Parquet archives.
