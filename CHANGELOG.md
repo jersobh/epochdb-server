@@ -2,11 +2,7 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
-## [Unreleased]
-### Changed
-- **EpochDB Studio (React)**: Replaced the monolithic `visualize.html` template with a Vite + React app under `ui/`, preserving look, feel, and feature parity (Explorer dock, Memory Inspector, auth/theme, SSE, seed, 2D/3D graphs, import/export). FastAPI serves the built SPA from `src/static/ui/` at `/` and `/visualize`; Docker builds the UI in a multi-stage image.
-
-## [0.11.0] - 2026-10-11
+## [0.11.0] - 2026-10-13
 ### Added
 - **Core Engine Upgrade**: Upgraded to `epochdb >= 1.11.2`, unlocking native batch ingestion, high-speed procedural skill index, user profile memory types, hot summary snapshots, and neuro-symbolic propose/LCAG validation.
 - **Batch Memory Ingestion (`POST /remember_batch`)**: Ingest multiple memories in a single atomic network roundtrip. In coordinator mode, batch items are grouped by consistent-hash target shard and distributed in parallel.
@@ -23,6 +19,11 @@ All notable changes to the EpochDB Distributed Server project will be documented
   - `GET /summary/snapshot` & `POST /summary/snapshot`: Aggregated compact textual summaries of active hot memories and profile facts.
 - **Extended Query Options**: `POST /query` now supports `cold_search_mode`, `min_score` thresholding, and hybrid RRF text queries.
 - **Pending Extractions Metric**: `/stats` now reports `pending_extractions` in shard mode.
+### Changed
+- **EpochDB Studio (React)**: Replaced the monolithic `visualize.html` template with a Vite + React app under `ui/`, preserving look, feel, and feature parity (Explorer dock, Memory Inspector, auth/theme, SSE, seed, 2D/3D graphs, import/export). FastAPI serves the built SPA from `src/static/ui/` at `/` and `/visualize` (with injected `__EPOCHDB_SERVER_CONFIG__` and `/assets` static mount); Docker builds the UI in a multi-stage image.
+### Fixed
+- **Studio graph remount crash**: Toggling entity-type filters (all off → one on) no longer throws `removeChild` `NotFoundError`; 2D/3D canvases stay mounted and update via stable hosts / vis `DataSet`.
+- **Studio 3D navigation**: Orbit/zoom controls work after switching from 2D — the WebGL canvas is no longer initialized under `display: none`.
 
 ## [0.10.7] - 2026-08-03
 ### Added
