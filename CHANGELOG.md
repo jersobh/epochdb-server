@@ -2,6 +2,28 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [Unreleased]
+### Changed
+- **EpochDB Studio (React)**: Replaced the monolithic `visualize.html` template with a Vite + React app under `ui/`, preserving look, feel, and feature parity (Explorer dock, Memory Inspector, auth/theme, SSE, seed, 2D/3D graphs, import/export). FastAPI serves the built SPA from `src/static/ui/` at `/` and `/visualize`; Docker builds the UI in a multi-stage image.
+
+## [0.11.0] - 2026-10-11
+### Added
+- **Core Engine Upgrade**: Upgraded to `epochdb >= 1.11.2`, unlocking native batch ingestion, high-speed procedural skill index, user profile memory types, hot summary snapshots, and neuro-symbolic propose/LCAG validation.
+- **Batch Memory Ingestion (`POST /remember_batch`)**: Ingest multiple memories in a single atomic network roundtrip. In coordinator mode, batch items are grouped by consistent-hash target shard and distributed in parallel.
+- **In-Place Atomic Replacement (`POST /replace`)**: Atomically replace an existing memory's text, triples, and metadata with durable write-ahead log updates and cache invalidation.
+- **Neuro-Symbolic LCAG Validation (`POST /propose`)**: Two-phase state commit endpoint that verifies proposed memory transitions against linear-causal DAG constraints before committing.
+- **Relational Multi-Hop Retrieval (`POST /multi_hop`)**: Relational search traversing the knowledge graph over multiple expansion hops (`hops` parameter) with candidate ranking.
+- **Procedural Skills Index & Endpoints**:
+  - `POST /skills/remember`: Register agent procedural skills and operational recipes.
+  - `GET /skills/{skill_name}` & `POST /skills/get`: Retrieve procedural skills by name via fast `SkillIndex`.
+  - `GET /skills`: List all procedural skills registered across the cluster.
+- **User Profile Dialectic Facts & Snapshots**:
+  - `POST /profiles/remember`: Deterministic routing and storage of user identity preferences under `MemoryType.PROFILE`.
+  - `GET /profiles/{user_id}` & `POST /profiles/get`: Retrieve profile facts with fallback to zero-threshold semantic filtering.
+  - `GET /summary/snapshot` & `POST /summary/snapshot`: Aggregated compact textual summaries of active hot memories and profile facts.
+- **Extended Query Options**: `POST /query` now supports `cold_search_mode`, `min_score` thresholding, and hybrid RRF text queries.
+- **Pending Extractions Metric**: `/stats` now reports `pending_extractions` in shard mode.
+
 ## [0.10.7] - 2026-08-03
 ### Added
 - **Per-Shard Exponential Backoff**: Introduced adaptive exponential backoff in `poll_shards_loop` for unreachable or timing-out shards to eliminate phantom CPU overhead from repeated TCP connection handshakes and teardowns.

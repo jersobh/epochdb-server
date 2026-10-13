@@ -721,14 +721,14 @@ all = ["adbc-driver-manager", "fsspec", "ipython", "numpy", "pandas", "pyarrow"]
 
 [[package]]
 name = "epochdb"
-version = "1.8.4"
+version = "1.11.2"
 description = "An agentic memory engine designed for lossless, tiered verbatim storage and multi-hop retrieval."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "epochdb-1.8.4-py3-none-any.whl", hash = "sha256:559b0806c9b48602dad7054a29a6f5ca59b121a2449d1142fb666d8bd5071b7d"},
-    {file = "epochdb-1.8.4.tar.gz", hash = "sha256:68d29f7c2c099dbb8741c0b5bb4394b419afc6b3732c577cdcd95bb796e95dbb"},
+    {file = "epochdb-1.11.2-py3-none-any.whl", hash = "sha256:dfc59fabae1d52938eb6ef5c715817a2018186b1d66e16a46543eb01a792f4e2"},
+    {file = "epochdb-1.11.2.tar.gz", hash = "sha256:264a5cf68ec146e7ca0f54e48b9f4c39a9cc55cf646d43490de28dfd61c6071d"},
 ]
 
 [package.dependencies]
@@ -745,10 +745,11 @@ z3-solver = "*"
 zstandard = "*"
 
 [package.extras]
-all = ["duckdb (>=1.0.0)", "google-genai (>=2.8.0,<3.0.0)", "langgraph", "mcp[cli] (>=1.0.0)", "sentence-transformers"]
-dev = ["duckdb (>=1.0.0)", "google-genai (>=2.8.0,<3.0.0)", "langgraph", "mcp[cli] (>=1.0.0)", "pytest", "pytest-cov", "sentence-transformers"]
+all = ["duckdb (>=1.0.0)", "google-genai (>=2.8.0,<3.0.0)", "langgraph", "mcp[cli] (>=1.0.0)", "sentence-transformers", "torch", "transformers (>=4.36.0)"]
+dev = ["duckdb (>=1.0.0)", "google-genai (>=2.8.0,<3.0.0)", "langgraph", "mcp[cli] (>=1.0.0)", "pytest", "pytest-cov", "sentence-transformers", "torch", "transformers (>=4.36.0)"]
 duckdb = ["duckdb (>=1.0.0)"]
 embeddings = ["sentence-transformers"]
+extraction = ["torch", "transformers (>=4.36.0)"]
 google = ["google-genai (>=2.8.0,<3.0.0)"]
 langgraph = ["langgraph"]
 mcp = ["mcp[cli] (>=1.0.0)"]
@@ -1219,7 +1220,7 @@ description = "Fast transfer of large files with the Hugging Face Hub."
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
-markers = "sys_platform == \"linux\" and (platform_machine == \"aarch64\" or platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"AMD64\" or platform_machine == \"arm64\") or platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"AMD64\" or platform_machine == \"arm64\" or platform_machine == \"aarch64\""
+markers = "platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"AMD64\" or platform_machine == \"arm64\" or platform_machine == \"aarch64\" or sys_platform == \"linux\" and (platform_machine == \"aarch64\" or platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"AMD64\" or platform_machine == \"arm64\")"
 files = [
     {file = "hf_xet-1.5.2-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:4a5ecb9cda8512ba2aa8ee5d37c87a1422992165892d653098c7b90247481c3b"},
     {file = "hf_xet-1.5.2-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:8764488197c1d7b1378c8438c18d2eea902e150dbca0b0f0d2d32603fb9b5576"},
@@ -1800,7 +1801,7 @@ description = "CUBLAS native runtime libraries"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
-markers = "platform_system == \"Linux\""
+markers = "(sys_platform != \"linux\" or platform_machine != \"aarch64\" and platform_machine != \"x86_64\") and platform_system == \"Linux\" and (sys_platform != \"linux\" and sys_platform != \"win32\" or platform_machine != \"x86_64\")"
 files = [
     {file = "nvidia_cublas-13.6.0.2-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:946f6a252b1cc72d8de912c75975fd6d8ba44f67d4e5044fe764ddb909f4a688"},
     {file = "nvidia_cublas-13.6.0.2-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:b82c80c886cea6da6e149a5c3bdba274f12b7e4ec4b00a050b916b0446fb4153"},
@@ -1845,7 +1846,7 @@ description = "NVRTC native runtime libraries"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
-markers = "platform_system == \"Linux\""
+markers = "(sys_platform != \"linux\" or platform_machine != \"aarch64\" and platform_machine != \"x86_64\") and platform_system == \"Linux\" and (sys_platform != \"linux\" and sys_platform != \"win32\" or platform_machine != \"x86_64\")"
 files = [
     {file = "nvidia_cuda_nvrtc-13.3.33-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:82530788b8c6164a54d3fd9ae8bcca8893d397c4aeb998861982a03bbe41e204"},
     {file = "nvidia_cuda_nvrtc-13.3.33-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:7b05ecda494c6dabc44231a608b060a71008a730d9dfda932cc508e6d29159e0"},
@@ -1970,7 +1971,7 @@ description = "CUSPARSE native runtime libraries"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
-markers = "(sys_platform == \"linux\" or sys_platform == \"win32\") and (sys_platform == \"linux\" or platform_machine == \"x86_64\") and platform_system == \"Linux\" and (platform_machine == \"aarch64\" or platform_machine == \"x86_64\")"
+markers = "<empty>"
 files = [
     {file = "nvidia_cusparse-12.8.2.51-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:00469fcf62c4d464a1225abd9b20864ecff35e3fbc9fb992572e83d358927755"},
     {file = "nvidia_cusparse-12.8.2.51-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:65cbcc4e37a34fca4ee7df2fd57da103593842cda1bbb4a144664ecfe59873a5"},
@@ -2213,7 +2214,7 @@ description = "C parser in Python"
 optional = false
 python-versions = ">=3.10"
 groups = ["dev"]
-markers = "sys_platform == \"win32\" and platform_python_implementation == \"CPython\" and implementation_name != \"PyPy\" or implementation_name == \"pypy\""
+markers = "implementation_name == \"pypy\" or sys_platform == \"win32\" and platform_python_implementation == \"CPython\" and implementation_name != \"PyPy\""
 files = [
     {file = "pycparser-3.0-py3-none-any.whl", hash = "sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992"},
     {file = "pycparser-3.0.tar.gz", hash = "sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29"},
@@ -3520,6 +3521,7 @@ files = [
     {file = "typing_extensions-4.16.0-py3-none-any.whl", hash = "sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"},
     {file = "typing_extensions-4.16.0.tar.gz", hash = "sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5"},
 ]
+markers = {dev = "python_version < \"3.13\""}
 
 [[package]]
 name = "typing-inspection"
@@ -3829,5 +3831,5 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 
 [metadata]
 lock-version = "2.1"
-python-versions = ">=3.10,<3.13"
-content-hash = "6cedb456246ae1a1170ee802a7a2e600aeb58cc5febfefdfa26fd6e41750f1ca"
+python-versions = ">=3.10,<3.15"
+content-hash = "277bacc6bd60770fff16d558fd9bdd70a2ce1299c7d1b6c9dab1a9483f8f66d1"

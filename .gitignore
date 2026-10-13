@@ -35,4 +35,5 @@ Thumbs.db
 docs/node_modules/
 docs/.vitepress/dist/
 docs/.vitepress/cache/
+ui/node_modules/
 wheels/

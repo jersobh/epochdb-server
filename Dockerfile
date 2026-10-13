@@ -1,4 +1,13 @@
-# Use an official Python runtime as a parent image
+# ---- Stage 1: Build EpochDB Studio (React / Vite) ----
+FROM node:24-alpine AS ui-builder
+WORKDIR /build/ui
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci
+COPY ui/ ./
+# vite.config outDir is ../src/static/ui → /build/src/static/ui
+RUN npm run build
+
+# ---- Stage 2: Python server ----
 FROM python:3.12-slim
 
 # Prevent hnswlib build from assuming host-native instruction extensions (e.g. AVX-512)
@@ -41,6 +50,9 @@ RUN pip install --no-cache-dir \
 
 # Copy the server source code
 COPY src/ ./src/
+
+# Overlay freshly built Studio SPA
+COPY --from=ui-builder /build/src/static/ui/ ./src/static/ui/
 
 # Expose the API port
 EXPOSE 8080
