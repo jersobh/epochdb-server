@@ -157,6 +157,53 @@ Ingests a new memory.
   { "status": "success", "id": "shard1-46bb87d8..." }
   ```
 
+### 1a. `POST /remember_batch`
+Ingests multiple memories in a single network roundtrip. In coordinator mode, items are partitioned by target shard via consistent hashing and sent concurrently.
+* **Payload**:
+  ```json
+  {
+    "items": [
+      { "text": "Item 1", "metadata": { "category": "science" } },
+      { "text": "Item 2", "metadata": { "category": "history" } }
+    ]
+  }
+  ```
+* **Response**:
+  ```json
+  { "status": "success", "atom_ids": ["shard0-1234...", "shard1-5678..."] }
+  ```
+
+### 1b. `POST /replace`
+Atomically replaces an existing memory atom in-place.
+* **Payload**:
+  ```json
+  {
+    "atom_id": "shard1-46bb87d8...",
+    "new_text": "Updated content replacement.",
+    "new_triples": [["subject", "predicate", "object"]],
+    "new_metadata": { "version": 2 }
+  }
+  ```
+* **Response**:
+  ```json
+  { "status": "success", "id": "shard1-46bb87d8..." }
+  ```
+
+### 1c. `POST /propose`
+Two-phase state commit endpoint validating a proposed memory transition against Linear-Causal Action Graph (LCAG) constraints.
+* **Payload**:
+  ```json
+  {
+    "text": "Temperature sensor calibrated to 25.0 C.",
+    "metadata": { "sensor_id": "temp_01" }
+  }
+  ```
+* **Response**:
+  ```json
+  { "status": "APPROVED", "memory_id": "shard0-..." }
+  ```
+  *(or `{ "status": "REJECTED", "detail": "Violates causal invariant..." }`)*
+
 ### 2. `POST /get`
 Retrieves a memory by ID.
 * **Payload**: `{ "memory_id": "shard1-46bb87d8..." }`
@@ -176,12 +223,14 @@ Retrieves a memory by ID.
   ```
 
 ### 3. `POST /query`
-Performs semantic search.
+Performs semantic hybrid search with BM25 / RRF fusion.
 * **Payload**:
   ```json
   {
     "query": "search query string",
     "k": 5,
+    "min_score": 0.0,
+    "cold_search_mode": "probe",
     "filters": { "optional": "metadata-filters" },
     "context_window": 1
   }
@@ -202,8 +251,7 @@ Performs semantic search.
               "created_at": 1719541990.123,
               "memory_type": "episodic",
               "metadata": {}
-            },
-            ...
+            }
           ]
         },
         "created_at": 1719542000.123,
@@ -213,7 +261,31 @@ Performs semantic search.
   }
   ```
 
-### 3a. `POST /adaptive_query`
+### 3a. `POST /multi_hop`
+Performs graph-relational multi-hop semantic retrieval.
+* **Payload**:
+  ```json
+  {
+    "query": "Who is connected to Marie Curie?",
+    "k": 5,
+    "hops": 2
+  }
+  ```
+* **Response**: Same format as `POST /query`, with multi-hop context ranked by RRF.
+
+### 3b. Procedural Skills (`/skills`)
+Registers and retrieves reusable operational recipes via `SkillIndex`.
+* `POST /skills/remember`: `{ "skill_name": "data_analysis", "recipe": "...", "metadata": {} }`
+* `GET /skills/{skill_name}` & `POST /skills/get`: Fetch skill definition.
+* `GET /skills`: List all registered skills across the cluster.
+
+### 3c. User Profiles & Snapshots (`/profiles`, `/summary`)
+Stores long-term user preferences and retrieves dynamic context summaries.
+* `POST /profiles/remember`: `{ "user_id": "user_42", "fact_text": "Prefers Python." }`
+* `GET /profiles/{user_id}` & `POST /profiles/get`: Fetch profile memories for a user.
+* `GET /summary/snapshot` & `POST /summary/snapshot`: Aggregated textual summary snapshot of active hot memories.
+
+### 3d. `POST /adaptive_query`
 Intelligently routes the query using LLM-orchestration (supporting Gemini, OpenAI, and Anthropic) or local rules offline.
 * **Payload**:
   ```json
@@ -224,7 +296,6 @@ Intelligently routes the query using LLM-orchestration (supporting Gemini, OpenA
   }
   ```
 * **Response**: Same format as `POST /query`.
-
 
 ### 4. `POST /update`
 Updates an existing memory's text or metadata.
@@ -288,9 +359,10 @@ Retrieves aggregated metrics.
 Compact all cluster nodes.
 * **Response**: `{ "status": "compaction completed" }`
 
-### 10. `GET /visualize`
-Serves an interactive 3D Force-Directed Graph dashboard representing the stored entity/memory graph.
-* **Response**: Clean modularized HTML page (`visualize.html`) loading visualizer assets.
+### 10. `GET /visualize` (also `GET /`)
+Serves **EpochDB Studio** — the React knowledge-graph explorer (2D/3D, Explorer dock, import/export, SSE live updates).
+* **Response**: Built SPA from `ui/` (assets under `/assets/`), with `window.__EPOCHDB_SERVER_CONFIG__` injected for mode, version, and default auth tokens.
+* **Local UI rebuild** (bare metal): `cd ui && npm install && npm run build` (writes to `src/static/ui/`). Docker images build the UI automatically.
 
 ### 11. `POST /v1/analytics/query`
 Execute a DuckDB SQL analytical query over Cold Tier Parquet archives.

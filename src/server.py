@@ -13,9 +13,10 @@ import numpy as np
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status, Security, Depends, Request, Response
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field, model_validator
+from typing import List, Dict, Any, Optional, Union
 
 from epochdb import AsyncEpochDB
 from fastapi import Header, Query
@@ -29,7 +30,7 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.10.5"
+SERVER_VERSION = "0.11.0"
 # Coordinator→shard HTTP timeout. Embeddings on small VPS CPUs often exceed 30s
 # under concurrent ingest; default matches gunicorn --timeout 120.
 COORDINATOR_HTTP_TIMEOUT = float(os.getenv("COORDINATOR_HTTP_TIMEOUT", "120"))
@@ -810,18 +811,82 @@ app = FastAPI(
 # 4. Data Transfer Objects (Pydantic Models)
 # -------------------------------------------------------------------------
 class MemoryPayload(BaseModel):
-    text: str = Field(..., description="The factual memory text to write to the engine.")
+    text: Optional[str] = Field(default=None, description="The factual memory text to write to the engine.")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional structural metadata or graph triples.")
     id: Optional[str] = Field(default=None, description="Optional unique identifier (pre-calculated or forwarded).")
-    memory_type: Optional[str] = Field(default=None, description="Optional memory type: 'general', 'episodic', 'profile', or 'working'.")
+    memory_type: Optional[str] = Field(default=None, description="Optional memory type: 'general', 'episodic', 'profile', 'working', or 'skill'.")
+    triples: Optional[Any] = Field(default=None, description="Optional structural graph triples.")
+    subject: Optional[str] = Field(default=None, description="Optional single triplet subject.")
+    predicate: Optional[str] = Field(default=None, description="Optional single triplet predicate.")
+    object: Optional[str] = Field(default=None, description="Optional single triplet object.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_payload(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            subj = data.get("subject")
+            pred = data.get("predicate")
+            obj = data.get("object")
+            triples = data.get("triples")
+            meta = data.get("metadata") or {}
+            meta_triples = meta.get("triples") if isinstance(meta, dict) else None
+
+            collected = []
+            if subj and pred and obj:
+                collected.append([str(subj).strip(), str(pred).strip(), str(obj).strip()])
+            if triples and isinstance(triples, (list, tuple)):
+                for t in triples:
+                    if isinstance(t, (list, tuple)) and len(t) >= 3:
+                        collected.append([str(t[0]).strip(), str(t[1]).strip(), str(t[2]).strip()])
+            if meta_triples and isinstance(meta_triples, (list, tuple)):
+                for t in meta_triples:
+                    if isinstance(t, (list, tuple)) and len(t) >= 3:
+                        collected.append([str(t[0]).strip(), str(t[1]).strip(), str(t[2]).strip()])
+
+            if collected:
+                data["triples"] = collected
+                if not data.get("text"):
+                    # Auto-generate human-readable memory sentence from the triples
+                    data["text"] = ". ".join([f"{t[0]} {t[1].replace('_', ' ')} {t[2]}" for t in collected]) + "."
+
+            if not data.get("text") and not collected:
+                raise ValueError("Either 'text', 'triples', or subject/predicate/object must be provided.")
+        return data
+
+class BatchMemoryPayload(BaseModel):
+    items: List[Any] = Field(..., description="List of memory items (text strings or dict objects) to ingest in batch.")
+
+class ReplacePayload(BaseModel):
+    atom_id: str = Field(..., description="Existing atom ID to replace in-place.")
+    text: str = Field(..., description="New memory payload text.")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Updated metadata dictionary.")
+    triples: Optional[Any] = Field(default=None, description="Optional updated triples.")
 
 class QueryPayload(BaseModel):
-    query: str = Field(..., description="The semantic search or multi-hop lookup query string.")
+    query: Optional[str] = Field(default=None, description="The semantic search query string.")
+    text: Optional[str] = Field(default=None, description="Alias for query text for client parity.")
     k: int = Field(default=1, ge=1, le=100, description="The number of candidate matches to return.")
     filters: Optional[Dict[str, Any]] = Field(default=None, description="MongoDB-style metadata filter evaluation parameters.")
-    memory_type: Optional[str] = Field(default=None, description="Optional filter by memory type: 'general', 'episodic', 'profile', or 'working'.")
+    memory_type: Optional[str] = Field(default=None, description="Optional filter by memory type: 'general', 'episodic', 'profile', 'working', or 'skill'.")
     context_window: int = Field(default=0, ge=0, description="Number of chronological context turns to retrieve around the matched memory.")
     expand_hops: int = Field(default=0, ge=0, le=10, description="Relational KG expansion hops during retrieval.")
+    min_score: float = Field(default=0.0, description="Minimum similarity score threshold.")
+    cold_search_mode: Optional[str] = Field(default=None, description="Cold tier search mode: 'probe' or 'exhaustive'.")
+
+    def get_query_text(self) -> str:
+        return self.query or self.text or ""
+
+class MultiHopPayload(BaseModel):
+    query: Optional[str] = Field(default=None, description="The query string.")
+    text: Optional[str] = Field(default=None, description="Alias for query text.")
+    hops: int = Field(default=2, ge=1, le=10, description="Number of relational KG expansion hops.")
+    k: int = Field(default=5, ge=1, le=100, description="Number of candidate matches to return.")
+    filters: Optional[Dict[str, Any]] = Field(default=None, description="Metadata filters.")
+    context_window: int = Field(default=0, ge=0, description="Number of chronological context turns.")
+    cold_search_mode: Optional[str] = Field(default=None, description="Cold tier search mode: 'probe' or 'exhaustive'.")
+
+    def get_query_text(self) -> str:
+        return self.query or self.text or ""
 
 class AdaptiveQueryPayload(BaseModel):
     query: str = Field(..., description="The natural language search query.")
@@ -835,6 +900,7 @@ class UpdatePayload(BaseModel):
     memory_id: str = Field(..., description="The unique identifier of the memory to update.")
     text: Optional[str] = Field(default=None, description="Optional new text payload.")
     metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional new metadata dictionary.")
+    triples: Optional[Any] = Field(default=None, description="Optional updated triples.")
 
 class DeletePayload(BaseModel):
     memory_id: str = Field(..., description="The unique identifier of the memory to delete.")
@@ -844,6 +910,47 @@ class TimelinePayload(BaseModel):
     entity_id: Optional[str] = Field(default=None, description="Optional entity ID.")
     start: Optional[float] = Field(default=None, description="Optional start timestamp.")
     end: Optional[float] = Field(default=None, description="Optional end timestamp.")
+
+class ExportPayload(BaseModel):
+    data_type: str = Field(default="all", description="Export category: 'all', 'skills', 'profiles', 'triplets', or 'memories'.")
+    memory_type: Optional[str] = Field(default=None, description="Optional memory type filter when exporting memories.")
+    tenant: Optional[str] = Field(default=None, description="Optional tenant.")
+    namespace: Optional[str] = Field(default=None, description="Optional namespace.")
+
+class ImportPayload(BaseModel):
+    data: Dict[str, Any] = Field(..., description="Export bundle dictionary containing skills, profiles, memories, or triplets.")
+    data_type: Optional[str] = Field(default=None, description="Optional category filter to import from the bundle.")
+    mode: str = Field(default="merge", description="Import mode: 'merge' or 'replace'.")
+
+class SkillCreatePayload(BaseModel):
+    skill_name: str = Field(..., description="Unique human-readable skill name.")
+    description: str = Field(..., description="Detailed description of what the procedural skill accomplishes.")
+    steps: List[Union[Dict[str, Any], str, Any]] = Field(default_factory=list, description="Ordered procedural steps.")
+    tool_schema: Optional[Dict[str, Any]] = Field(default=None, description="Optional JSON Schema tool/function definition.")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata.")
+    skill_id: Optional[str] = Field(default=None, description="Optional stable unique identifier.")
+    decision_rules: Optional[List[str]] = Field(default=None, description="Optional decision rules.")
+    triples: Optional[Any] = Field(default=None, description="Optional structural knowledge graph triples.")
+
+class SkillGetPayload(BaseModel):
+    skill_name: str = Field(..., description="Unique skill name or identifier.")
+
+class ProfileCreatePayload(BaseModel):
+    user_id: str = Field(..., description="Unique user identifier.")
+    fact_text: str = Field(..., description="Factual profile or preference text.")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional metadata.")
+
+class ProfileGetPayload(BaseModel):
+    user_id: str = Field(..., description="Unique user identifier.")
+
+class SnapshotPayload(BaseModel):
+    user_id: Optional[str] = Field(default=None, description="Optional user ID filter for summary snapshot.")
+
+class ProposePayload(BaseModel):
+    text: str = Field(..., description="Factual memory text to propose for symbolic validation.")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Optional structural metadata.")
+    triples: Optional[Any] = Field(default=None, description="Optional graph triples.")
+    id: Optional[str] = Field(default=None, description="Optional predefined identifier.")
 
 # -------------------------------------------------------------------------
 # 5. API Core Router Endpoints
@@ -1175,7 +1282,8 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                     "text": payload.text,
                     "metadata": payload.metadata,
                     "id": atom_id,
-                    "memory_type": payload.memory_type
+                    "memory_type": payload.memory_type,
+                    "triples": payload.triples
                 }
                 group = get_replica_group_for_node(target_shard)
                 tasks = [
@@ -1248,6 +1356,10 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
             if "_updated_at" not in payload.metadata:
                 payload.metadata["_updated_at"] = time.time()
                 
+            provided_triples = list(payload.triples or []) or list(payload.metadata.get("triples") or [])
+            if provided_triples and "triples" not in payload.metadata:
+                payload.metadata["triples"] = provided_triples
+
             if payload.id:
                 engine = await active_db._get_db()
                 text = payload.text
@@ -1266,7 +1378,7 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                 else:
                     embedding = np.zeros(engine.dim, dtype=np.float32)
                     
-                provided_triples = metadata.get("triples") or []
+                provided_triples = metadata.get("triples") or payload.triples or []
 
                 def _extract_triples_for_ingest() -> list:
                     from epochdb.core.fact_extractor import FactExtractor
@@ -1383,6 +1495,7 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                 async with embedding_slot():
                     atom_id = await active_db.remember(
                         text=payload.text,
+                        triples=provided_triples or None,
                         metadata=payload.metadata,
                         memory_type=payload.memory_type,
                     )
@@ -1395,6 +1508,323 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
         except Exception as e:
             logger.error(f"Failed to commit memory write block: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Internal storage layer mutation rejected: {str(e)}")
+
+@app.post("/remember_batch", status_code=status.HTTP_201_CREATED)
+async def remember_batch(
+    payload: BatchMemoryPayload,
+    request: Request,
+    ctx: RequestContext = Depends(get_context({Permission.WRITE}))
+):
+    """
+    Bulk ingestion endpoint for adding multiple memory atoms.
+    Coordinator partitions items by target shard and routes in parallel batches.
+    """
+    if NODE_MODE == "coordinator":
+        if not client:
+            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+        if not shard_nodes:
+            raise HTTPException(status_code=500, detail="No shard nodes available to route batch request.")
+
+        grouped_items: Dict[str, List[Dict[str, Any]]] = {}
+        all_ids: List[str] = []
+
+        for item in payload.items:
+            item_dict = item.model_dump() if hasattr(item, "model_dump") else (item if isinstance(item, dict) else {"text": str(item)})
+            text = item_dict.get("text") or item_dict.get("payload") or ""
+            target_id = item_dict.get("id") or item_dict.get("atom_id")
+
+            if target_id:
+                target_shard = get_shard_for_id(target_id)
+                if not target_shard:
+                    target_shard = get_healthy_shard(text)
+                    shard_idx = shard_nodes.index(target_shard)
+                    target_id = f"shard{shard_idx}-{target_id}"
+            else:
+                target_shard = get_healthy_shard(text)
+                shard_idx = shard_nodes.index(target_shard)
+                target_id = f"shard{shard_idx}-{uuid.uuid4().hex}"
+
+            item_dict["id"] = target_id
+            item_dict["atom_id"] = target_id
+            all_ids.append(target_id)
+
+            if target_shard not in grouped_items:
+                grouped_items[target_shard] = []
+            grouped_items[target_shard].append(item_dict)
+
+        forward_headers = get_forward_headers(ctx)
+        consistency = get_consistency_level(request)
+
+        async def send_group_batch(primary_node: str, items_for_shard: List[Dict[str, Any]]):
+            group = get_replica_group_for_node(primary_node)
+            tasks = [
+                client.post(
+                    f"{node}/remember_batch",
+                    json={"items": items_for_shard},
+                    headers=forward_headers
+                ) for node in group
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            success_count = 0
+            failures = []
+            for node, resp in zip(group, responses):
+                if isinstance(resp, httpx.Response) and resp.status_code == 201:
+                    success_count += 1
+                else:
+                    err_msg = format_shard_error(resp)
+                    failures.append((node, err_msg))
+                    if should_mark_shard_offline(resp):
+                        SHARD_METRICS_CACHE[node] = {
+                            "status": "offline",
+                            "cpu": 0.0,
+                            "ram": {"percent": 0.0},
+                            "disk": {"percent": 0.0}
+                        }
+
+            n = len(group)
+            required = n if consistency == ConsistencyLevel.ALL else (n // 2 + 1 if consistency == ConsistencyLevel.QUORUM else 1)
+            if success_count < required:
+                last_err = failures[-1][1] if failures else "Unknown error"
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Batch replication failed for shard group {primary_node}. Required: {consistency.value} ({required}), got: {success_count}. Last error: {last_err}",
+                    headers={"Retry-After": "5"}
+                )
+
+        await asyncio.gather(*[send_group_batch(shard, items) for shard, items in grouped_items.items()])
+
+        invalidate_cache(ctx.tenant, ctx.namespace)
+        await broadcast_sse_event("update", {"type": "batch_write", "count": len(all_ids)})
+        return {"status": "success", "atom_ids": all_ids, "count": len(all_ids)}
+
+    else:
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+        formatted_items = []
+        now_ts = time.time()
+        for item in payload.items:
+            item_dict = item.model_dump() if hasattr(item, "model_dump") else (item if isinstance(item, dict) else {"text": str(item)})
+            text = item_dict.get("text") or item_dict.get("payload") or ""
+            metadata = dict(item_dict.get("metadata") or {})
+            if "_updated_at" not in metadata:
+                metadata["_updated_at"] = now_ts
+            if "triples" not in metadata and item_dict.get("triples"):
+                metadata["triples"] = item_dict["triples"]
+            atom_id = item_dict.get("id") or item_dict.get("atom_id")
+            memory_type = item_dict.get("memory_type")
+
+            formatted_items.append({
+                "text": text,
+                "metadata": metadata,
+                "id": atom_id,
+                "memory_type": memory_type,
+            })
+
+        async with embedding_slot():
+            atom_ids = []
+            for itm in formatted_items:
+                aid = await active_db.remember(
+                    text=itm["text"],
+                    metadata=itm["metadata"],
+                    memory_type=itm["memory_type"],
+                    atom_id=itm["id"],
+                )
+                atom_ids.append(aid)
+
+        invalidate_cache(ctx.tenant, ctx.namespace)
+        await broadcast_sse_event("update", {"type": "batch_write", "count": len(atom_ids)})
+        return {"status": "success", "atom_ids": atom_ids, "count": len(atom_ids)}
+
+@app.post("/replace")
+async def replace_memory(
+    payload: ReplacePayload,
+    request: Request,
+    ctx: RequestContext = Depends(get_context({Permission.WRITE}))
+):
+    """
+    Performs durable in-place replacement of an existing memory atom.
+    Replaces payload, embedding, and knowledge graph triples without creating duplicate versions.
+    """
+    if NODE_MODE == "coordinator":
+        if not client:
+            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+
+        target_shard = get_shard_for_id(payload.atom_id)
+        if target_shard:
+            group = get_replica_group_for_node(target_shard)
+            tasks = [
+                client.post(
+                    f"{node}/replace",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                ) for node in group
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            success_nodes = []
+            failures = []
+            for node, resp in zip(group, responses):
+                if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                    success_nodes.append(node)
+                else:
+                    err_msg = format_shard_error(resp)
+                    failures.append((node, err_msg))
+                    if should_mark_shard_offline(resp):
+                        SHARD_METRICS_CACHE[node] = {
+                            "status": "offline",
+                            "cpu": 0.0,
+                            "ram": {"percent": 0.0},
+                            "disk": {"percent": 0.0}
+                        }
+
+            consistency = get_consistency_level(request)
+            n = len(group)
+            required = n if consistency == ConsistencyLevel.ALL else (n // 2 + 1 if consistency == ConsistencyLevel.QUORUM else 1)
+            if len(success_nodes) >= required:
+                invalidate_cache(ctx.tenant, ctx.namespace)
+                await broadcast_sse_event("update", {"type": "replace", "id": payload.atom_id})
+                return {"status": "success", "id": payload.atom_id}
+            else:
+                last_err = failures[-1][1] if failures else "Unknown error"
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Replace consistency check failed. Required: {consistency.value} ({required}), got: {len(success_nodes)}. Last error: {last_err}"
+                )
+        else:
+            target_nodes = []
+            for group in shard_groups:
+                target_nodes.extend(get_all_healthy_replicas_for_group(group))
+            tasks = [
+                client.post(
+                    f"{node}/replace",
+                    json=payload.model_dump(),
+                    headers=get_forward_headers(ctx)
+                ) for node in target_nodes
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            invalidate_cache(ctx.tenant, ctx.namespace)
+            await broadcast_sse_event("update", {"type": "replace", "id": payload.atom_id})
+            return {"status": "success", "id": payload.atom_id}
+    else:
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+        try:
+            engine = await active_db._get_db()
+            meta = dict(payload.metadata or {})
+            meta["_updated_at"] = time.time()
+            if payload.triples is not None:
+                meta["triples"] = payload.triples
+
+            if engine._model_name:
+                embedder = engine._get_embedder()
+                emb = await run_embedding(
+                    embedder.encode,
+                    payload.text,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+                embedding = np.array(emb, dtype=np.float32)
+            else:
+                embedding = np.zeros(engine.dim, dtype=np.float32)
+
+            triples = meta.get("triples") or []
+            atom_id = await asyncio.to_thread(
+                engine.replace_memory,
+                payload.atom_id,
+                payload.text,
+                embedding,
+                [tuple(t) for t in triples if isinstance(t, (list, tuple)) and len(t) >= 3],
+                meta
+            )
+            invalidate_cache(ctx.tenant, ctx.namespace)
+            await broadcast_sse_event("update", {"type": "replace", "id": atom_id})
+            return {"status": "success", "id": atom_id}
+        except Exception as e:
+            logger.error(f"Error replacing memory {payload.atom_id}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/propose", status_code=status.HTTP_200_OK)
+async def propose_memory(
+    payload: ProposePayload,
+    request: Request,
+    ctx: RequestContext = Depends(get_context({Permission.WRITE}))
+):
+    """
+    Two-phase state commit (Neuro-Symbolic LCAG verification).
+    Stages the memory, executes configured symbolic invariants, and atomically commits or discards.
+    """
+    if NODE_MODE == "coordinator":
+        if not client:
+            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+        if not shard_nodes:
+            raise HTTPException(status_code=500, detail="No shard nodes available.")
+
+        target_shard = get_healthy_shard(payload.text)
+        group = get_replica_group_for_node(target_shard)
+        tasks = [
+            client.post(
+                f"{node}/propose",
+                json=payload.model_dump(),
+                headers=get_forward_headers(ctx)
+            ) for node in group
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+        success_nodes = []
+        approved_result = None
+        rejections = []
+        failures = []
+
+        for node, resp in zip(group, responses):
+            if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "APPROVED":
+                    success_nodes.append(node)
+                    approved_result = data
+                else:
+                    rejections.append((node, data))
+            else:
+                err_msg = format_shard_error(resp)
+                failures.append((node, err_msg))
+                if should_mark_shard_offline(resp):
+                    SHARD_METRICS_CACHE[node] = {
+                        "status": "offline",
+                        "cpu": 0.0,
+                        "ram": {"percent": 0.0},
+                        "disk": {"percent": 0.0}
+                    }
+
+        if rejections and not success_nodes:
+            return rejections[0][1]
+
+        consistency = get_consistency_level(request)
+        n = len(group)
+        required = n if consistency == ConsistencyLevel.ALL else (n // 2 + 1 if consistency == ConsistencyLevel.QUORUM else 1)
+
+        if len(success_nodes) >= required and approved_result:
+            invalidate_cache(ctx.tenant, ctx.namespace)
+            mid = approved_result.get("memory_id")
+            await broadcast_sse_event("update", {"type": "propose_approved", "id": mid})
+            return approved_result
+        else:
+            last_err = failures[-1][1] if failures else (rejections[-1][1].get("error") if rejections else "Unknown validation failure")
+            raise HTTPException(
+                status_code=503,
+                detail=f"Proposal replication failed. Required: {consistency.value} ({required}), got: {len(success_nodes)}. Last error: {last_err}",
+                headers={"Retry-After": "5"}
+            )
+    else:
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+        try:
+            res = await active_db.propose(
+                text=payload.text,
+                metadata=payload.metadata,
+                triples=payload.triples,
+            )
+            if res.get("status") == "APPROVED":
+                invalidate_cache(ctx.tenant, ctx.namespace)
+                await broadcast_sse_event("update", {"type": "propose_approved", "id": res.get("memory_id")})
+            return res
+        except Exception as e:
+            logger.error(f"Error in propose memory validation: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/get")
 async def get_memory(
@@ -1538,9 +1968,13 @@ async def query_memories(
     ctx: RequestContext = Depends(get_context({Permission.READ}))
 ):
     """
-    Performs semantic search across the memory database.
+    Performs semantic and hybrid search across the memory database.
     Coordinator parallelizes requests to all shards and merges/re-ranks results.
     """
+    query_text = payload.get_query_text()
+    if not query_text:
+        raise HTTPException(status_code=400, detail="Query text must not be empty.")
+
     async def fetch():
         if NODE_MODE == "coordinator":
             if not client:
@@ -1551,10 +1985,15 @@ async def query_memories(
                 node = get_healthy_replica_for_group(group)
                 if node:
                     target_nodes.append(node)
+
+            forward_data = payload.model_dump()
+            forward_data["query"] = query_text
+            forward_data["text"] = query_text
+
             tasks = [
                 client.post(
                     f"{node}/query",
-                    json=payload.model_dump(),
+                    json=forward_data,
                     headers=get_forward_headers(ctx)
                 ) for node in target_nodes
             ]
@@ -1565,16 +2004,20 @@ async def query_memories(
             for node, resp in zip(target_nodes, responses):
                 if isinstance(resp, httpx.Response) and resp.status_code == 200:
                     data = resp.json()
-                    all_results.extend(data.get("results", []))
+                    all_results.extend(data.get("results") or data.get("memories") or [])
                 else:
                     failed_shards += 1
                     logger.error(f"Error querying shard {node}: {format_shard_error(resp)}")
                     
-            # Sort by similarity score in descending order
+            if payload.min_score > 0.0:
+                all_results = [r for r in all_results if r.get("score", 0.0) >= payload.min_score]
+
             all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-            result = {"results": all_results[:payload.k]}
+            result = {
+                "results": all_results[:payload.k],
+                "memories": all_results[:payload.k]
+            }
             if failed_shards:
-                # Let callers distinguish "no matches" from "some shards did not answer".
                 result["partial"] = True
                 result["failed_shards"] = failed_shards
             return result
@@ -1582,26 +2025,30 @@ async def query_memories(
             active_db = await get_db_instance(ctx.tenant, ctx.namespace)
             try:
                 query_kwargs = {
-                    "text": payload.query,
+                    "text": query_text,
                     "k": payload.k,
                     "filters": payload.filters,
                     "memory_type": payload.memory_type,
                     "context_window": payload.context_window,
+                    "min_score": payload.min_score,
                 }
                 if payload.expand_hops > 0:
                     query_kwargs["expand_hops"] = payload.expand_hops
+                if payload.cold_search_mode:
+                    query_kwargs["cold_search_mode"] = payload.cold_search_mode
+
                 try:
                     results = await active_db.query(**query_kwargs)
                 except TypeError:
                     query_kwargs.pop("expand_hops", None)
+                    query_kwargs.pop("cold_search_mode", None)
                     results = await active_db.query(**query_kwargs)
                 
-                # Retrieve engine to compute exact similarity scores
                 engine = await active_db._get_db()
                 embedder = engine._get_embedder()
                 q_emb = await run_embedding(
                     embedder.encode,
-                    payload.query,
+                    query_text,
                     normalize_embeddings=True,
                     show_progress_bar=False,
                 )
@@ -1609,24 +2056,545 @@ async def query_memories(
                 
                 formatted_results = []
                 for r in results:
-                    score = 0.0
-                    if q_emb.any() and r._atom.embedding.any():
+                    score = float(getattr(r, "score", 0.0))
+                    if score == 0.0 and q_emb.any() and r._atom.embedding.any():
                         score = float(np.dot(r._atom.embedding, q_emb) / (
                             np.linalg.norm(r._atom.embedding) * np.linalg.norm(q_emb) + 1e-10
                         ))
-                    formatted_results.append({
+                    item_data = {
                         "id": r.id,
                         "text": r.text,
                         "metadata": r.metadata,
                         "created_at": r.created_at,
                         "score": score
-                    })
-                return {"results": formatted_results}
+                    }
+                    if hasattr(r._atom, "memory_type") and r._atom.memory_type:
+                        item_data["memory_type"] = r._atom.memory_type.value if hasattr(r._atom.memory_type, "value") else str(r._atom.memory_type)
+                    formatted_results.append(item_data)
+
+                if payload.min_score > 0.0:
+                    formatted_results = [r for r in formatted_results if r.get("score", 0.0) >= payload.min_score]
+
+                return {"results": formatted_results, "memories": formatted_results}
             except Exception as e:
                 logger.error(f"Error resolving retrieval operations: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
     return await handle_cached_read("query", payload, request, response, ctx, fetch)
+
+@app.post("/multi_hop")
+async def multi_hop(
+    payload: MultiHopPayload,
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Executes a multi-hop relational retrieval query across knowledge-graph associations and semantic embeddings.
+    Coordinator fans out to shards and aggregates candidate results.
+    """
+    query_text = payload.get_query_text()
+    if not query_text:
+        raise HTTPException(status_code=400, detail="Query text must not be empty.")
+
+    async def fetch():
+        if NODE_MODE == "coordinator":
+            if not client:
+                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+
+            target_nodes = []
+            for group in shard_groups:
+                node = get_healthy_replica_for_group(group)
+                if node:
+                    target_nodes.append(node)
+
+            forward_data = payload.model_dump()
+            forward_data["text"] = query_text
+            forward_data["query"] = query_text
+
+            tasks = [
+                client.post(
+                    f"{node}/multi_hop",
+                    json=forward_data,
+                    headers=get_forward_headers(ctx)
+                ) for node in target_nodes
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+            all_results = []
+            seen_ids = set()
+            failed_shards = 0
+            for node, resp in zip(target_nodes, responses):
+                if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                    data = resp.json()
+                    memories = data.get("memories") or data.get("results") or []
+                    for m in memories:
+                        mid = m.get("id")
+                        if mid and mid not in seen_ids:
+                            seen_ids.add(mid)
+                            all_results.append(m)
+                        elif not mid:
+                            all_results.append(m)
+                else:
+                    failed_shards += 1
+                    logger.error(f"Error querying multi_hop on shard {node}: {format_shard_error(resp)}")
+
+            all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            result = {
+                "results": all_results[:payload.k],
+                "memories": all_results[:payload.k]
+            }
+            if failed_shards:
+                result["partial"] = True
+                result["failed_shards"] = failed_shards
+            return result
+        else:
+            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+            try:
+                kwargs = {
+                    "hops": payload.hops,
+                    "k": payload.k,
+                    "filters": payload.filters,
+                    "context_window": payload.context_window,
+                }
+                if payload.cold_search_mode:
+                    kwargs["cold_search_mode"] = payload.cold_search_mode
+
+                results = await active_db.multi_hop(query_text, **kwargs)
+                formatted = []
+                for r in results:
+                    atom_dict = r._atom.to_dict()
+                    if hasattr(r, "score"):
+                        atom_dict["score"] = float(r.score)
+                    formatted.append(atom_dict)
+                return {"results": formatted, "memories": formatted}
+            except Exception as e:
+                logger.error(f"Error resolving multi_hop retrieval: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    return await handle_cached_read("multi_hop", payload, request, response, ctx, fetch)
+
+@app.post("/skills/remember", status_code=status.HTTP_201_CREATED)
+async def remember_skill(
+    payload: SkillCreatePayload,
+    request: Request,
+    ctx: RequestContext = Depends(get_context({Permission.WRITE}))
+):
+    """
+    Registers a synthesized procedural skill with steps, tool schema, and decision rules.
+    Stored under MemoryType.SKILL and indexed in the Hot Tier SkillIndex.
+    """
+    if NODE_MODE == "coordinator":
+        if not client:
+            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+        if not shard_nodes:
+            raise HTTPException(status_code=500, detail="No shard nodes available.")
+
+        route_key = payload.skill_id or payload.skill_name
+        target_shard = get_healthy_shard(route_key)
+        shard_idx = shard_nodes.index(target_shard)
+        stable_id = payload.skill_id or f"shard{shard_idx}-skill-{uuid.uuid4().hex}"
+        forward_data = payload.model_dump()
+        forward_data["skill_id"] = stable_id
+
+        group = get_replica_group_for_node(target_shard)
+        tasks = [
+            client.post(
+                f"{node}/skills/remember",
+                json=forward_data,
+                headers=get_forward_headers(ctx)
+            ) for node in group
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+        success_nodes = []
+        failures = []
+        for node, resp in zip(group, responses):
+            if isinstance(resp, httpx.Response) and resp.status_code == 201:
+                success_nodes.append(node)
+            else:
+                err_msg = format_shard_error(resp)
+                failures.append((node, err_msg))
+                if should_mark_shard_offline(resp):
+                    SHARD_METRICS_CACHE[node] = {"status": "offline"}
+
+        consistency = get_consistency_level(request)
+        n = len(group)
+        required = n if consistency == ConsistencyLevel.ALL else (n // 2 + 1 if consistency == ConsistencyLevel.QUORUM else 1)
+
+        if len(success_nodes) >= required:
+            invalidate_cache(ctx.tenant, ctx.namespace)
+            await broadcast_sse_event("update", {"type": "skill_registered", "id": stable_id})
+            return {"status": "success", "id": stable_id, "skill_name": payload.skill_name}
+        else:
+            last_err = failures[-1][1] if failures else "Unknown error"
+            raise HTTPException(
+                status_code=503,
+                detail=f"Skill replication failed for group {target_shard}. Required: {consistency.value} ({required}), got: {len(success_nodes)}. Last error: {last_err}",
+                headers={"Retry-After": "5"}
+            )
+    else:
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+        try:
+            norm_steps = []
+            for i, st in enumerate(payload.steps or []):
+                if isinstance(st, str):
+                    norm_steps.append({"step": i + 1, "action": st})
+                elif isinstance(st, dict):
+                    norm_steps.append(st)
+                else:
+                    norm_steps.append({"step": i + 1, "action": str(st)})
+
+            aid = await active_db.remember_skill(
+                skill_name=payload.skill_name,
+                description=payload.description,
+                steps=norm_steps,
+                tool_schema=payload.tool_schema,
+                metadata=payload.metadata,
+                skill_id=payload.skill_id,
+                decision_rules=payload.decision_rules,
+                triples=payload.triples,
+            )
+            invalidate_cache(ctx.tenant, ctx.namespace)
+            await broadcast_sse_event("update", {"type": "skill_registered", "id": aid})
+            return {"status": "success", "id": aid, "skill_name": payload.skill_name}
+        except Exception as e:
+            logger.error(f"Error registering skill {payload.skill_name}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+async def _execute_get_skill(
+    name: str,
+    request: Request,
+    response: Response,
+    ctx: RequestContext
+):
+    if not name:
+        raise HTTPException(status_code=400, detail="Skill name is required.")
+
+    async def fetch():
+        if NODE_MODE == "coordinator":
+            if not client:
+                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+
+            target_node = hash_ring.get_node(name)
+            group = get_replica_group_for_node(target_node)
+            probe_node = get_healthy_replica_for_group(group) or group[0]
+
+            try:
+                res = await client.get(f"{probe_node}/skills/{name}", headers=get_forward_headers(ctx))
+                if res.status_code == 200:
+                    data = res.json()
+                    if data and data.get("id"):
+                        return data
+            except Exception:
+                pass
+
+            target_nodes = []
+            for grp in shard_groups:
+                nd = get_healthy_replica_for_group(grp)
+                if nd and nd != probe_node:
+                    target_nodes.append(nd)
+
+            if target_nodes:
+                tasks = [client.get(f"{node}/skills/{name}", headers=get_forward_headers(ctx)) for node in target_nodes]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                for resp in responses:
+                    if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                        data = resp.json()
+                        if data and data.get("id"):
+                            return data
+            return {}
+        else:
+            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+            try:
+                mem = await active_db.get_skill(name)
+                if mem:
+                    return mem._atom.to_dict()
+                return {}
+            except Exception as e:
+                logger.error(f"Error fetching skill {name}: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    return await handle_cached_read("get_skill", {"skill_name": name}, request, response, ctx, fetch)
+
+@app.get("/skills/{skill_name}")
+async def get_skill_by_path(
+    skill_name: str,
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Retrieves a procedural skill by name via path parameter.
+    """
+    return await _execute_get_skill(skill_name, request, response, ctx)
+
+@app.post("/skills/get")
+async def get_skill_by_payload(
+    payload: SkillGetPayload,
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Retrieves a procedural skill by name via JSON payload.
+    """
+    return await _execute_get_skill(payload.skill_name, request, response, ctx)
+
+@app.get("/skills")
+async def list_skills(
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Lists all procedural skills registered across the cluster.
+    """
+    async def fetch():
+        if NODE_MODE == "coordinator":
+            if not client:
+                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+
+            target_nodes = []
+            for group in shard_groups:
+                node = get_healthy_replica_for_group(group)
+                if node:
+                    target_nodes.append(node)
+
+            tasks = [client.get(f"{node}/skills", headers=get_forward_headers(ctx)) for node in target_nodes]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+            all_skills = []
+            seen = set()
+            for resp in responses:
+                if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                    data = resp.json()
+                    for s in data.get("skills", []):
+                        sid = s.get("id") or s.get("metadata", {}).get("skill_name")
+                        if sid not in seen:
+                            seen.add(sid)
+                            all_skills.append(s)
+            return {"skills": all_skills}
+        else:
+            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+            try:
+                skills = await active_db.list_skills()
+                return {"skills": [s._atom.to_dict() for s in skills]}
+            except Exception as e:
+                logger.error(f"Error listing skills: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    return await handle_cached_read("list_skills", {}, request, response, ctx, fetch)
+
+@app.post("/profiles/remember", status_code=status.HTTP_201_CREATED)
+async def remember_profile(
+    payload: ProfileCreatePayload,
+    request: Request,
+    ctx: RequestContext = Depends(get_context({Permission.WRITE}))
+):
+    """
+    Stores long-term user profile facts and preferences under MemoryType.PROFILE.
+    Coordinator routes deterministically by user_id.
+    """
+    if NODE_MODE == "coordinator":
+        if not client:
+            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+        if not shard_nodes:
+            raise HTTPException(status_code=500, detail="No shard nodes available.")
+
+        target_shard = get_healthy_shard(payload.user_id)
+        group = get_replica_group_for_node(target_shard)
+        tasks = [
+            client.post(
+                f"{node}/profiles/remember",
+                json=payload.model_dump(),
+                headers=get_forward_headers(ctx)
+            ) for node in group
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+        success_nodes = []
+        result_id = None
+        failures = []
+        for node, resp in zip(group, responses):
+            if isinstance(resp, httpx.Response) and resp.status_code == 201:
+                success_nodes.append(node)
+                result_id = resp.json().get("id")
+            else:
+                err_msg = format_shard_error(resp)
+                failures.append((node, err_msg))
+                if should_mark_shard_offline(resp):
+                    SHARD_METRICS_CACHE[node] = {"status": "offline"}
+
+        consistency = get_consistency_level(request)
+        n = len(group)
+        required = n if consistency == ConsistencyLevel.ALL else (n // 2 + 1 if consistency == ConsistencyLevel.QUORUM else 1)
+
+        if len(success_nodes) >= required:
+            invalidate_cache(ctx.tenant, ctx.namespace)
+            await broadcast_sse_event("update", {"type": "profile_updated", "user_id": payload.user_id})
+            return {"status": "success", "id": result_id, "user_id": payload.user_id}
+        else:
+            last_err = failures[-1][1] if failures else "Unknown error"
+            raise HTTPException(
+                status_code=503,
+                detail=f"Profile replication failed. Required: {consistency.value} ({required}), got: {len(success_nodes)}. Last error: {last_err}",
+                headers={"Retry-After": "5"}
+            )
+    else:
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+        try:
+            aid = await active_db.remember_user_profile(
+                user_id=payload.user_id,
+                fact_text=payload.fact_text,
+                metadata=payload.metadata,
+            )
+            invalidate_cache(ctx.tenant, ctx.namespace)
+            await broadcast_sse_event("update", {"type": "profile_updated", "user_id": payload.user_id})
+            return {"status": "success", "id": aid, "user_id": payload.user_id}
+        except Exception as e:
+            logger.error(f"Error remembering user profile for {payload.user_id}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+async def _execute_get_profile(
+    uid: str,
+    request: Request,
+    response: Response,
+    ctx: RequestContext
+):
+    if not uid:
+        raise HTTPException(status_code=400, detail="user_id is required.")
+
+    async def fetch():
+        if NODE_MODE == "coordinator":
+            if not client:
+                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+
+            target_node = hash_ring.get_node(uid)
+            group = get_replica_group_for_node(target_node)
+            probe_node = get_healthy_replica_for_group(group) or group[0]
+
+            res = await client.get(f"{probe_node}/profiles/{uid}", headers=get_forward_headers(ctx))
+            if res.status_code == 200:
+                return res.json()
+            return {"memories": []}
+        else:
+            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+            try:
+                mems = await active_db.get_user_profile(uid)
+                if not mems:
+                    # Query with min_score=-1.0 to ensure profile facts aren't dropped by negative cosine angle
+                    mems = await active_db.query(
+                        text=f"user profile {uid}",
+                        k=50,
+                        filters={"user_id": uid},
+                        memory_type="profile",
+                        min_score=-1.0
+                    )
+                if not mems:
+                    # Fallback to direct hot tier lookup by metadata
+                    raw_db = await active_db._get_db()
+                    matched_atoms = [
+                        a for a in raw_db.hot_tier.atoms.values()
+                        if a.memory_type and a.memory_type.value == "profile" and a.metadata.get("user_id") == uid
+                    ]
+                    return {"memories": [a.to_dict() for a in matched_atoms]}
+
+                return {"memories": [m._atom.to_dict() if hasattr(m, "_atom") else m.to_dict() for m in mems]}
+            except Exception as e:
+                logger.error(f"Error fetching profile for {uid}: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    return await handle_cached_read("get_profile", {"user_id": uid}, request, response, ctx, fetch)
+
+@app.get("/profiles/{user_id}")
+async def get_profile_by_path(
+    user_id: str,
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Retrieves all stored profile facts and preferences for a specific user via path.
+    """
+    return await _execute_get_profile(user_id, request, response, ctx)
+
+@app.post("/profiles/get")
+async def get_profile_by_payload(
+    payload: ProfileGetPayload,
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Retrieves all stored profile facts and preferences for a specific user via JSON payload.
+    """
+    return await _execute_get_profile(payload.user_id, request, response, ctx)
+
+async def _execute_summary_snapshot(
+    uid: Optional[str],
+    request: Request,
+    response: Response,
+    ctx: RequestContext
+):
+    async def fetch():
+        if NODE_MODE == "coordinator":
+            if not client:
+                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+
+            target_nodes = []
+            for group in shard_groups:
+                node = get_healthy_replica_for_group(group)
+                if node:
+                    target_nodes.append(node)
+
+            params = {"user_id": uid} if uid else {}
+            tasks = [client.get(f"{node}/summary/snapshot", params=params, headers=get_forward_headers(ctx)) for node in target_nodes]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+            snapshots = []
+            for resp in responses:
+                if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                    snap_text = resp.json().get("snapshot", "").strip()
+                    if snap_text and snap_text not in snapshots:
+                        snapshots.append(snap_text)
+            aggregated = "\n\n".join(snapshots)
+            return {"snapshot": aggregated}
+        else:
+            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+            try:
+                snap = await active_db.get_hot_summary_snapshot(uid)
+                return {"snapshot": snap}
+            except Exception as e:
+                logger.error(f"Error generating summary snapshot: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+    return await handle_cached_read("summary_snapshot", {"user_id": uid}, request, response, ctx, fetch)
+
+@app.get("/summary/snapshot")
+async def get_summary_snapshot(
+    request: Request,
+    response: Response,
+    user_id: Optional[str] = Query(None),
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Produces a compact textual snapshot of active hot memories and profile facts via GET.
+    """
+    return await _execute_summary_snapshot(user_id, request, response, ctx)
+
+@app.post("/summary/snapshot")
+async def post_summary_snapshot(
+    request: Request,
+    response: Response,
+    payload: Optional[SnapshotPayload] = None,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Produces a compact textual snapshot of active hot memories and profile facts via POST.
+    """
+    uid = payload.user_id if payload else None
+    return await _execute_summary_snapshot(uid, request, response, ctx)
 
 @app.post("/adaptive_query")
 async def adaptive_query_memories(
@@ -1774,6 +2742,8 @@ async def update_memory(payload: UpdatePayload, request: Request, ctx: RequestCo
         try:
             meta = dict(payload.metadata) if payload.metadata is not None else {}
             meta["_updated_at"] = time.time()
+            if payload.triples is not None:
+                meta["triples"] = payload.triples
             await active_db.update(payload.memory_id, payload.text, meta)
             invalidate_cache(ctx.tenant, ctx.namespace)
             await broadcast_sse_event("update", {"type": "update", "id": payload.memory_id})
@@ -1887,43 +2857,83 @@ async def entity_graph(
             if not client:
                 raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
                 
-            params = {"depth": depth}
-            if entity_id:
-                params["entity_id"] = entity_id
-                
             target_nodes = []
             for group in shard_groups:
                 node = get_healthy_replica_for_group(group)
                 if node:
                     target_nodes.append(node)
-            tasks = [
-                client.get(
-                    f"{node}/entity_graph",
-                    params=params,
-                    headers=get_forward_headers(ctx)
-                ) for node in target_nodes
-            ]
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            merged_nodes = set()
-            merged_edges = []
-            seen_edges = set()
-            
-            for resp in responses:
-                if isinstance(resp, httpx.Response) and resp.status_code == 200:
-                    data = resp.json()
-                    for node in data.get("nodes", []):
-                        merged_nodes.add(node)
-                    for edge in data.get("edges", []):
-                        # Dedup edges by source, target, predicate, memory_id
-                        key = (edge.get("source"), edge.get("target"), edge.get("predicate"), edge.get("memory_id"))
-                        if key not in seen_edges:
-                            seen_edges.add(key)
-                            merged_edges.append(edge)
-                elif isinstance(resp, Exception):
-                    logger.error(f"Error querying entity graph from shard: {resp}")
-                    
-            return {"nodes": list(merged_nodes), "edges": merged_edges}
+
+            if not entity_id:
+                tasks = [
+                    client.get(
+                        f"{node}/entity_graph",
+                        params={"depth": depth},
+                        headers=get_forward_headers(ctx)
+                    ) for node in target_nodes
+                ]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                merged_nodes = set()
+                merged_edges = []
+                seen_edges = set()
+                
+                for resp in responses:
+                    if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                        data = resp.json()
+                        for node in data.get("nodes", []):
+                            merged_nodes.add(node)
+                        for edge in data.get("edges", []):
+                            key = (edge.get("source"), edge.get("target"), edge.get("predicate"), edge.get("memory_id"))
+                            if key not in seen_edges:
+                                seen_edges.add(key)
+                                merged_edges.append(edge)
+                    elif isinstance(resp, Exception):
+                        logger.error(f"Error querying entity graph from shard: {resp}")
+                        
+                return {"nodes": list(merged_nodes), "edges": merged_edges}
+            else:
+                # Multi-hop distributed BFS expansion across shards
+                visited = {entity_id}
+                frontier = {entity_id}
+                all_nodes = {entity_id}
+                all_edges = []
+                seen_edges = set()
+                max_hops = max(1, min(depth, 15))
+
+                for _ in range(max_hops):
+                    if not frontier:
+                        break
+                    tasks = []
+                    current_batch = list(frontier)[:64]
+                    for ent in current_batch:
+                        for node in target_nodes:
+                            tasks.append(
+                                client.get(
+                                    f"{node}/entity_graph",
+                                    params={"entity_id": ent, "depth": 1},
+                                    headers=get_forward_headers(ctx)
+                                )
+                            )
+                    responses = await asyncio.gather(*tasks, return_exceptions=True)
+                    new_frontier = set()
+                    for resp in responses:
+                        if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                            data = resp.json()
+                            for n in data.get("nodes", []):
+                                all_nodes.add(n)
+                                if n not in visited:
+                                    visited.add(n)
+                                    new_frontier.add(n)
+                            for edge in data.get("edges", []):
+                                key = (edge.get("source"), edge.get("target"), edge.get("predicate"), edge.get("memory_id"))
+                                if key not in seen_edges:
+                                    seen_edges.add(key)
+                                    all_edges.append(edge)
+                        elif isinstance(resp, Exception):
+                            logger.error(f"Error querying entity graph from shard: {resp}")
+                    frontier = new_frontier
+
+                return {"nodes": list(all_nodes), "edges": all_edges}
         else:
             active_db = await get_db_instance(ctx.tenant, ctx.namespace)
             try:
@@ -1933,13 +2943,17 @@ async def entity_graph(
                         engine.get_hub_entities, GRAPH_HUB_LIMIT
                     )
                     if not hub_entities:
-                        return {"nodes": [], "edges": []}
+                        all_entities = await asyncio.to_thread(engine.get_entities)
+                        if not all_entities:
+                            return {"nodes": [], "edges": []}
+                        hub_entities = all_entities[:GRAPH_HUB_LIMIT]
                     
                     merged_nodes = set()
                     merged_edges = []
                     seen_edges = set()
                     
                     for ent in hub_entities:
+                        merged_nodes.add(ent)
                         graph = await active_db.entity_graph(ent, depth=1)
                         for node in graph.nodes:
                             merged_nodes.add(node)
@@ -2104,6 +3118,11 @@ async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
         try:
             db_stats = await active_db.stats()
             db_stats["mode"] = "shard"
+            db_stats["version"] = SERVER_VERSION
+            try:
+                db_stats["pending_extractions"] = await active_db.pending_extractions()
+            except Exception:
+                db_stats["pending_extractions"] = 0
             db_stats["cpu"] = get_cpu_usage()
             db_stats["ram"] = get_ram_usage()
             db_stats["disk"] = get_disk_usage(os.getenv("STORAGE_DIR", "./shared_memory"))
@@ -2111,6 +3130,355 @@ async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
         except Exception as e:
             logger.error(f"Unable to safely pull analytical parameters: {str(e)}")
             raise HTTPException(status_code=500, detail="Stats access blocked.")
+
+
+# -------------------------------------------------------------------------
+# Granular Import / Export Endpoints
+# -------------------------------------------------------------------------
+@app.get("/export")
+async def export_data_get(
+    request: Request,
+    response: Response,
+    data_type: str = Query("all", description="Category to export: 'all', 'skills', 'profiles', 'triplets', or 'memories'."),
+    memory_type: Optional[str] = Query(None, description="Optional memory type filter."),
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Granularly exports stored database content (skills, user profiles, knowledge graph triplets, or memories).
+    """
+    return await _execute_export(data_type, memory_type, ctx)
+
+@app.post("/export")
+async def export_data_post(
+    payload: ExportPayload,
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Granularly exports stored database content via POST payload.
+    """
+    return await _execute_export(payload.data_type, payload.memory_type, ctx)
+
+async def _execute_export(
+    data_type: str,
+    memory_type: Optional[str],
+    ctx: RequestContext
+) -> Dict[str, Any]:
+    if NODE_MODE == "coordinator":
+        if not client:
+            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+        
+        target_nodes = []
+        for group in shard_groups:
+            node = get_healthy_replica_for_group(group)
+            if node:
+                target_nodes.append(node)
+                
+        payload = {"data_type": data_type}
+        if memory_type:
+            payload["memory_type"] = memory_type
+            
+        tasks = [
+            client.post(
+                f"{node}/export",
+                json=payload,
+                headers=get_forward_headers(ctx)
+            ) for node in target_nodes
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        merged_skills = []
+        seen_skills = set()
+        merged_profiles = []
+        seen_profiles = set()
+        merged_memories = []
+        seen_memories = set()
+        merged_triplets = []
+        seen_triplets = set()
+        
+        for resp in responses:
+            if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                body = resp.json().get("data", {})
+                for s in body.get("skills", []):
+                    sid = s.get("id") or (s.get("metadata", {}).get("skill_name") if s.get("metadata") else None)
+                    if sid and sid not in seen_skills:
+                        seen_skills.add(sid)
+                        merged_skills.append(s)
+                for p in body.get("profiles", []):
+                    pid = p.get("id") or ((p.get("metadata", {}).get("user_id", "") if p.get("metadata") else "") + ":" + (p.get("payload") or ""))
+                    if pid and pid not in seen_profiles:
+                        seen_profiles.add(pid)
+                        merged_profiles.append(p)
+                for m in body.get("memories", []):
+                    mid = m.get("id")
+                    if mid and mid not in seen_memories:
+                        seen_memories.add(mid)
+                        merged_memories.append(m)
+                for t in body.get("triplets", []):
+                    if isinstance(t, (list, tuple)) and len(t) >= 3:
+                        tkey = (str(t[0]), str(t[1]), str(t[2]))
+                        if tkey not in seen_triplets:
+                            seen_triplets.add(tkey)
+                            merged_triplets.append(list(tkey))
+                            
+        return {
+            "version": "1.0",
+            "server_version": SERVER_VERSION,
+            "exported_at": time.time(),
+            "data_type": data_type,
+            "tenant": ctx.tenant or "global",
+            "namespace": ctx.namespace or "default",
+            "counts": {
+                "skills": len(merged_skills),
+                "profiles": len(merged_profiles),
+                "memories": len(merged_memories),
+                "triplets": len(merged_triplets)
+            },
+            "data": {
+                "skills": merged_skills,
+                "profiles": merged_profiles,
+                "memories": merged_memories,
+                "triplets": merged_triplets
+            }
+        }
+    else:
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+        try:
+            raw_db = await active_db._get_db()
+            result = {
+                "skills": [],
+                "profiles": [],
+                "memories": [],
+                "triplets": []
+            }
+            
+            # Skills
+            if data_type in ("all", "skills"):
+                skills = await active_db.list_skills()
+                result["skills"] = [s._atom.to_dict() if hasattr(s, "_atom") else s.to_dict() for s in skills]
+
+            # Atoms from hot tier and cold tier
+            all_atoms = {}
+            with raw_db._internal_lock:
+                for aid, atom in raw_db.hot_tier.atoms.items():
+                    if aid not in raw_db.deleted_atom_ids:
+                        all_atoms[aid] = atom
+                for epoch_id in raw_db.cold_tier.get_all_epochs():
+                    for atom in raw_db.cold_tier.load_epoch(epoch_id):
+                        if atom.id not in raw_db.deleted_atom_ids and atom.id not in all_atoms:
+                            all_atoms[atom.id] = atom
+
+            seen_triples = set()
+            for atom in all_atoms.values():
+                mt = atom.memory_type.value if atom.memory_type else "general"
+                atom_dict = atom.to_dict()
+
+                if data_type in ("all", "profiles") and (mt == "profile" or (atom.metadata and atom.metadata.get("user_id"))):
+                    result["profiles"].append(atom_dict)
+
+                if data_type in ("all", "memories"):
+                    if not memory_type or mt == memory_type:
+                        result["memories"].append(atom_dict)
+
+                if data_type in ("all", "triplets", "graph"):
+                    if atom.triples:
+                        for t in atom.triples:
+                            if isinstance(t, (list, tuple)) and len(t) >= 3:
+                                tkey = (str(t[0]), str(t[1]), str(t[2]))
+                                if tkey not in seen_triples:
+                                    seen_triples.add(tkey)
+                                    result["triplets"].append(list(tkey))
+
+            return {
+                "version": "1.0",
+                "server_version": SERVER_VERSION,
+                "exported_at": time.time(),
+                "data_type": data_type,
+                "tenant": ctx.tenant or "global",
+                "namespace": ctx.namespace or "default",
+                "counts": {
+                    "skills": len(result["skills"]),
+                    "profiles": len(result["profiles"]),
+                    "memories": len(result["memories"]),
+                    "triplets": len(result["triplets"])
+                },
+                "data": result
+            }
+        except Exception as e:
+            logger.error(f"Export execution failure: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/import", status_code=status.HTTP_201_CREATED)
+async def import_data(
+    payload: ImportPayload,
+    request: Request,
+    ctx: RequestContext = Depends(get_context({Permission.WRITE}))
+):
+    """
+    Granularly imports database records (skills, user profiles, memories, and triplets).
+    """
+    data = payload.data.get("data", payload.data)
+    filter_type = payload.data_type
+
+    if NODE_MODE == "coordinator":
+        if not client:
+            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+
+        counts = {"skills": 0, "profiles": 0, "memories": 0, "triplets": 0}
+
+        # 1. Skills
+        if filter_type in (None, "all", "skills") and "skills" in data:
+            for s in data["skills"]:
+                meta = s.get("metadata") or {}
+                skill_name = meta.get("skill_name") or s.get("skill_name") or s.get("id")
+                desc = meta.get("description") or s.get("description") or s.get("payload") or ""
+                steps = meta.get("steps") or s.get("steps") or []
+                if skill_name:
+                    sk_payload = {
+                        "skill_name": skill_name,
+                        "description": desc,
+                        "steps": steps,
+                        "tool_schema": meta.get("tool_schema"),
+                        "metadata": meta,
+                        "skill_id": s.get("id") or meta.get("process_id"),
+                        "decision_rules": meta.get("decision_rules"),
+                        "triples": s.get("triples") or meta.get("triples")
+                    }
+                    target_node = hash_ring.get_node(skill_name)
+                    group = get_replica_group_for_node(target_node)
+                    tasks = [client.post(f"{node}/skills/remember", json=sk_payload, headers=get_forward_headers(ctx)) for node in group]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    counts["skills"] += 1
+
+        # 2. Profiles
+        if filter_type in (None, "all", "profiles") and "profiles" in data:
+            for p in data["profiles"]:
+                meta = p.get("metadata") or {}
+                uid = meta.get("user_id") or p.get("user_id")
+                fact = p.get("payload") or p.get("text") or meta.get("fact_text") or ""
+                if uid and fact:
+                    pr_payload = {"user_id": uid, "fact_text": fact, "metadata": meta}
+                    target_node = hash_ring.get_node(uid)
+                    group = get_replica_group_for_node(target_node)
+                    tasks = [client.post(f"{node}/profiles/remember", json=pr_payload, headers=get_forward_headers(ctx)) for node in group]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    counts["profiles"] += 1
+
+        # 3. Memories
+        if filter_type in (None, "all", "memories") and "memories" in data:
+            for m in data["memories"]:
+                text = m.get("payload") or m.get("text")
+                if text:
+                    mem_payload = {
+                        "text": text,
+                        "metadata": m.get("metadata"),
+                        "triples": m.get("triples"),
+                        "memory_type": m.get("memory_type") or (m.get("metadata") or {}).get("memory_type"),
+                        "id": m.get("id")
+                    }
+                    target_node = get_healthy_shard(text)
+                    group = get_replica_group_for_node(target_node)
+                    tasks = [client.post(f"{node}/remember", json=mem_payload, headers=get_forward_headers(ctx)) for node in group]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    counts["memories"] += 1
+
+        # 4. Triplets
+        if filter_type in (None, "all", "triplets", "graph") and "triplets" in data:
+            for t in data["triplets"]:
+                if isinstance(t, (list, tuple)) and len(t) >= 3:
+                    text = f"{t[0]} {str(t[1]).replace('_', ' ')} {t[2]}."
+                    tr_payload = {"text": text, "triples": [[t[0], t[1], t[2]]]}
+                    target_node = get_healthy_shard(text)
+                    group = get_replica_group_for_node(target_node)
+                    tasks = [client.post(f"{node}/remember", json=tr_payload, headers=get_forward_headers(ctx)) for node in group]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    counts["triplets"] += 1
+
+        invalidate_cache(ctx.tenant, ctx.namespace)
+        await broadcast_sse_event("update", {"type": "import", "counts": counts})
+        return {
+            "status": "success",
+            "imported": counts,
+            "total_imported": sum(counts.values())
+        }
+    else:
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+        try:
+            counts = {"skills": 0, "profiles": 0, "memories": 0, "triplets": 0}
+
+            # 1. Skills
+            if filter_type in (None, "all", "skills") and "skills" in data:
+                for s in data["skills"]:
+                    meta = s.get("metadata") or {}
+                    skill_name = meta.get("skill_name") or s.get("skill_name") or s.get("id")
+                    desc = meta.get("description") or s.get("description") or s.get("payload") or ""
+                    steps = meta.get("steps") or s.get("steps") or []
+                    norm_steps = []
+                    for idx, st in enumerate(steps):
+                        if isinstance(st, str):
+                            norm_steps.append({"step": idx + 1, "action": st})
+                        elif isinstance(st, dict):
+                            norm_steps.append(st)
+                        else:
+                            norm_steps.append({"step": idx + 1, "action": str(st)})
+                    if skill_name:
+                        await active_db.remember_skill(
+                            skill_name=skill_name,
+                            description=desc,
+                            steps=norm_steps,
+                            tool_schema=meta.get("tool_schema"),
+                            metadata=meta,
+                            skill_id=s.get("id") or meta.get("process_id"),
+                            decision_rules=meta.get("decision_rules"),
+                            triples=s.get("triples") or meta.get("triples")
+                        )
+                        counts["skills"] += 1
+
+            # 2. Profiles
+            if filter_type in (None, "all", "profiles") and "profiles" in data:
+                for p in data["profiles"]:
+                    meta = p.get("metadata") or {}
+                    uid = meta.get("user_id") or p.get("user_id")
+                    fact = p.get("payload") or p.get("text") or meta.get("fact_text") or ""
+                    if uid and fact:
+                        await active_db.remember_user_profile(user_id=uid, fact_text=fact, metadata=meta)
+                        counts["profiles"] += 1
+
+            # 3. Memories
+            if filter_type in (None, "all", "memories") and "memories" in data:
+                for m in data["memories"]:
+                    text = m.get("payload") or m.get("text")
+                    if text:
+                        await active_db.remember(
+                            text=text,
+                            triples=m.get("triples"),
+                            metadata=m.get("metadata"),
+                            memory_type=m.get("memory_type") or (m.get("metadata") or {}).get("memory_type"),
+                            atom_id=m.get("id")
+                        )
+                        counts["memories"] += 1
+
+            # 4. Triplets
+            if filter_type in (None, "all", "triplets", "graph") and "triplets" in data:
+                for t in data["triplets"]:
+                    if isinstance(t, (list, tuple)) and len(t) >= 3:
+                        await active_db.remember(
+                            text=f"{t[0]} {str(t[1]).replace('_', ' ')} {t[2]}.",
+                            triples=[[t[0], t[1], t[2]]]
+                        )
+                        counts["triplets"] += 1
+
+            invalidate_cache(ctx.tenant, ctx.namespace)
+            await broadcast_sse_event("update", {"type": "import", "counts": counts})
+            return {
+                "status": "success",
+                "imported": counts,
+                "total_imported": sum(counts.values())
+            }
+        except Exception as e:
+            logger.error(f"Import execution error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/compact", status_code=status.HTTP_200_OK)
 async def compact(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
@@ -2171,6 +3539,9 @@ async def analytics_query(
         raise HTTPException(status_code=500, detail=f"SQL Query failed: {str(e)}")
 
 
+UI_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static", "ui")
+UI_ASSETS_DIR = os.path.join(UI_STATIC_DIR, "assets")
+
 @app.get("/logo.png")
 async def get_logo():
     logo_path = os.path.join(os.path.dirname(__file__), "logo-epoch.png")
@@ -2181,14 +3552,40 @@ async def get_logo():
         return FileResponse(absolute_logo)
     raise HTTPException(status_code=404, detail="Logo not found")
 
+@app.get("/favicon.svg")
+@app.get("/favicon.ico")
+async def get_favicon():
+    favicon_path = os.path.join(UI_STATIC_DIR, "favicon.svg")
+    if os.path.exists(favicon_path):
+        return FileResponse(favicon_path, media_type="image/svg+xml")
+    raise HTTPException(status_code=404, detail="Favicon not found")
+
+def _inject_studio_config(html_content: str) -> str:
+    """Inject server mode/version/default tokens into the Studio SPA HTML."""
+    inject_script = f"""<script>
+        window.__EPOCHDB_SERVER_CONFIG__ = {{
+            mode: "{NODE_MODE}",
+            version: "{SERVER_VERSION}",
+            defaultApiKey: "{API_KEY or ''}",
+            defaultInternalToken: "{INTERNAL_AUTH_TOKEN or ''}"
+        }};
+        </script>"""
+    if "<head>" in html_content:
+        return html_content.replace("<head>", f"<head>\n    {inject_script}", 1)
+    return inject_script + html_content
+
+@app.get("/", response_class=HTMLResponse)
 @app.get("/visualize", response_class=HTMLResponse)
 async def visualize():
-    template_path = os.path.join(os.path.dirname(__file__), "visualize.html")
-    if os.path.exists(template_path):
-        with open(template_path, "r", encoding="utf-8") as f:
+    index_path = os.path.join(UI_STATIC_DIR, "index.html")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
             html_content = f.read()
-        return HTMLResponse(content=html_content)
-    raise HTTPException(status_code=404, detail="Visualization template not found")
+        return HTMLResponse(content=_inject_studio_config(html_content))
+    raise HTTPException(
+        status_code=404,
+        detail="Studio UI not found. Build the React app with: cd ui && npm run build",
+    )
 
 @app.get("/stream")
 async def sse_stream(request: Request):
@@ -2215,6 +3612,10 @@ async def sse_stream(request: Request):
                 SSE_LISTENERS.remove(queue)
                 
     return EventSourceResponse(event_generator())
+
+# Mount Studio static assets after API routes so /assets does not shadow them.
+if os.path.isdir(UI_ASSETS_DIR):
+    app.mount("/assets", StaticFiles(directory=UI_ASSETS_DIR), name="ui_assets")
 
 # -------------------------------------------------------------------------
 # 6. Production Execution Entrypoint
