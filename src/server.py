@@ -30,7 +30,7 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.11.0"
+SERVER_VERSION = "0.12.0"
 # Coordinator→shard HTTP timeout. Embeddings on small VPS CPUs often exceed 30s
 # under concurrent ingest; default matches gunicorn --timeout 120.
 COORDINATOR_HTTP_TIMEOUT = float(os.getenv("COORDINATOR_HTTP_TIMEOUT", "120"))
@@ -728,6 +728,13 @@ async def get_db_instance(tenant: Optional[str] = None, namespace: Optional[str]
         storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
         logger.info(f"Initializing AsyncEpochDB for tenant={tenant}, namespace={namespace} under {storage_dir}")
         auto_extract = os.getenv("AUTO_EXTRACT", "true").lower() in ("1", "true", "yes")
+        # Prefer explicit EPOCHDB_EXTRACTION_MODEL. Default "local" so a host
+        # GEMINI_API_KEY / GEMINI_MODEL does not auto-select GoogleFactExtractor
+        # (shards typically lack google-genai).
+        extraction_model = (
+            os.getenv("EPOCHDB_EXTRACTION_MODEL")
+            or "local"
+        )
         engine = AsyncEpochDB(
             storage_dir=storage_dir,
             embedding_model=EMBEDDING_MODEL,
@@ -738,6 +745,7 @@ async def get_db_instance(tenant: Optional[str] = None, namespace: Optional[str]
             tenant=tenant,
             namespace=namespace,
             auto_extract=auto_extract,
+            extraction_model=extraction_model,
         )
         await engine._get_db()
         
@@ -2965,12 +2973,73 @@ async def entity_graph(
                     return {"nodes": list(merged_nodes), "edges": merged_edges}
                 else:
                     graph = await active_db.entity_graph(entity_id, depth)
-                    return {"nodes": graph.nodes, "edges": graph.edges}
+                    result = {"nodes": graph.nodes, "edges": graph.edges}
+                    node_types = getattr(graph, "node_types", None) or {}
+                    if node_types:
+                        result["node_types"] = node_types
+                        result["typed_nodes"] = [
+                            {
+                                "id": n,
+                                "types": node_types.get(n, []),
+                                "type": (node_types.get(n) or [None])[0],
+                            }
+                            for n in graph.nodes
+                        ]
+                    return result
             except Exception as e:
                 logger.error(f"Error retrieving entity graph for {entity_id}: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
     return await handle_cached_read("entity_graph", payload, request, response, ctx, fetch)
+
+
+@app.get("/discovered_types")
+async def discovered_types(
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ}))
+):
+    """
+    Open-vocab type discovery — union of type objects + predicates from stored triples.
+    No fixed ontology / enum registry.
+    """
+    async def fetch():
+        if NODE_MODE == "coordinator":
+            if not client:
+                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+            target_nodes = []
+            for group in shard_groups:
+                node = get_healthy_replica_for_group(group)
+                if node:
+                    target_nodes.append(node)
+            tasks = [
+                client.get(
+                    f"{node}/discovered_types",
+                    headers=get_forward_headers(ctx),
+                )
+                for node in target_nodes
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            types: set = set()
+            predicates: set = set()
+            entity_types: dict = {}
+            for resp in responses:
+                if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                    data = resp.json()
+                    types.update(data.get("types") or [])
+                    predicates.update(data.get("predicates") or [])
+                    for ent, tlist in (data.get("entity_types") or {}).items():
+                        entity_types.setdefault(ent, set()).update(tlist)
+            return {
+                "types": sorted(types),
+                "predicates": sorted(predicates),
+                "entity_types": {k: sorted(v) for k, v in entity_types.items()},
+            }
+        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+        engine = await active_db._get_db()
+        return await asyncio.to_thread(engine.get_discovered_types)
+
+    return await handle_cached_read("discovered_types", {}, request, response, ctx, fetch)
 
 @app.post("/get_timeline")
 async def get_timeline(
