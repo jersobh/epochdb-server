@@ -91,7 +91,7 @@ export function ExplorerDock({
   onToggleType,
   onSetAllTypes,
   onRefresh,
-  onOpenSeed,
+  onOpenSeed: _onOpenSeed,
   suggestEntities,
   suggestRecall,
   skills,
@@ -111,14 +111,12 @@ export function ExplorerDock({
   const chartInstance = useRef<Chart | null>(null);
 
   const typeCounts: Record<string, number> = {};
-  Object.keys(TYPE_STYLES).forEach((t) => {
-    typeCounts[t] = 0;
-  });
   allNodeNames.forEach((n) => {
-    const t = nodeTypes[n] || 'concept';
+    const t = nodeTypes[n] || 'entity';
     typeCounts[t] = (typeCounts[t] || 0) + 1;
   });
-  const orderedTypes = Object.keys(TYPE_STYLES).sort(
+  // Discovered entity types derived dynamically from active graph nodes:
+  const orderedTypes = Object.keys(typeCounts).sort(
     (a, b) => (typeCounts[b] || 0) - (typeCounts[a] || 0)
   );
 
@@ -477,55 +475,61 @@ export function ExplorerDock({
                   background: 'var(--bg-app)',
                 }}
               >
-                {orderedTypes.map((t) => {
-                  const st = TYPE_STYLES[t as NodeType];
-                  const cnt = typeCounts[t] || 0;
-                  const radius =
-                    st.shape === 'dot' || st.shape === 'ellipse'
-                      ? '50%'
-                      : st.shape === 'square' || st.shape === 'box'
-                        ? '2px'
-                        : '1px';
-                  const rot = st.shape === 'diamond' ? 'transform: rotate(45deg)' : '';
-                  return (
-                    <label
-                      key={t}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 8,
-                        padding: '4px 6px',
-                        borderRadius: 'var(--radius-sm)',
-                        cursor: 'pointer',
-                        userSelect: 'none',
-                        fontSize: 12,
-                        opacity: cnt === 0 ? 0.45 : 1,
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        style={{ accentColor: 'var(--accent-teal)', cursor: 'pointer' }}
-                        checked={!disabledTypes.has(t)}
-                        onChange={(e) => onToggleType(t, e.target.checked)}
-                      />
-                      <span
+                {orderedTypes.length === 0 ? (
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', padding: '12px 8px', textAlign: 'center', fontStyle: 'italic' }}>
+                    No entity types discovered yet. Ingest knowledge or run extraction to discover entities dynamically.
+                  </div>
+                ) : (
+                  orderedTypes.map((t) => {
+                    const st = TYPE_STYLES[t as NodeType];
+                    const cnt = typeCounts[t] || 0;
+                    const radius =
+                      st.shape === 'dot' || st.shape === 'ellipse'
+                        ? '50%'
+                        : st.shape === 'square' || st.shape === 'box'
+                          ? '2px'
+                          : '1px';
+                    const rot = st.shape === 'diamond' ? 'transform: rotate(45deg)' : '';
+                    return (
+                      <label
+                        key={t}
                         style={{
-                          width: 8,
-                          height: 8,
-                          background: typeColor(t),
-                          borderRadius: radius,
-                          flexShrink: 0,
-                          display: 'inline-block',
-                          ...(rot ? { transform: 'rotate(45deg)' } : {}),
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 8,
+                          padding: '4px 6px',
+                          borderRadius: 'var(--radius-sm)',
+                          cursor: 'pointer',
+                          userSelect: 'none',
+                          fontSize: 12,
+                          opacity: cnt === 0 ? 0.45 : 1,
                         }}
-                      />
-                      <span style={{ flex: 1, fontWeight: 500, color: 'var(--text-primary)' }}>{st.label}</span>
-                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)' }}>
-                        {cnt}
-                      </span>
-                    </label>
-                  );
-                })}
+                      >
+                        <input
+                          type="checkbox"
+                          style={{ accentColor: 'var(--accent-teal)', cursor: 'pointer' }}
+                          checked={!disabledTypes.has(t)}
+                          onChange={(e) => onToggleType(t, e.target.checked)}
+                        />
+                        <span
+                          style={{
+                            width: 8,
+                            height: 8,
+                            background: typeColor(t),
+                            borderRadius: radius,
+                            flexShrink: 0,
+                            display: 'inline-block',
+                            ...(rot ? { transform: 'rotate(45deg)' } : {}),
+                          }}
+                        />
+                        <span style={{ flex: 1, fontWeight: 500, color: 'var(--text-primary)' }}>{st.label}</span>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)' }}>
+                          {cnt}
+                        </span>
+                      </label>
+                    );
+                  })
+                )}
               </div>
             </div>
             <div style={{ paddingTop: 8, borderTop: '1px solid var(--border-subtle)', display: 'flex', gap: 8 }}>
@@ -537,14 +541,7 @@ export function ExplorerDock({
               >
                 Refresh Graph
               </button>
-              <button
-                type="button"
-                className="btn-ds btn-ds-secondary"
-                style={{ flex: 1, justifyContent: 'center' }}
-                onClick={onOpenSeed}
-              >
-                Seed Sample
-              </button>
+              {/* Seed Sample disabled — Percepta must not auto-load demo graphs */}
             </div>
           </div>
         )}

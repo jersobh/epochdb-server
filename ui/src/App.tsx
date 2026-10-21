@@ -455,7 +455,7 @@ export default function App() {
           }}
           onSetAllTypes={(enable) => {
             if (enable) setDisabledTypes(new Set());
-            else setDisabledTypes(new Set(Object.keys(TYPE_STYLES)));
+            else setDisabledTypes(new Set(Object.keys(legendCounts)));
           }}
           onRefresh={() => void loadGraph()}
           onOpenSeed={() => setSeedOpen(true)}
@@ -471,8 +471,8 @@ export default function App() {
 
         <div className="bottom-legend-bar">
           <div className="legend-chips">
-            {Object.keys(TYPE_STYLES)
-              .filter((t) => legendCounts[t])
+            {Object.keys(legendCounts)
+              .sort()
               .map((t) => {
                 const st = TYPE_STYLES[t as NodeType];
                 const isOff = disabledTypes.has(t);

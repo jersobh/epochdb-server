@@ -2,6 +2,19 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.12.0] - 2026-10-21
+### Added
+- **Core Engine Upgrade**: Requires `epochdb >= 1.12.0` for open-vocab type discovery and typed entity graphs.
+- **Discovered Types API (`GET /discovered_types`)**: Returns the union of type objects and predicates from stored triples (shard-local or coordinator-merged). No fixed ontology / enum registry.
+- **Typed entity graph payloads**: `/entity_graph` may include `node_types` and `typed_nodes` when the engine discovers type-defining triples.
+- **`EPOCHDB_EXTRACTION_MODEL`**: Explicit extraction model env (default `local`) so host `GEMINI_API_KEY` / cloud extractors are not auto-selected on shards.
+### Changed
+- **Studio open-vocab types**: Legend and filters derive from discovered graph types; dynamic styles for unknown types; default node type is `entity`.
+- **Studio tenant headers**: Client sends `X-Tenant` (and legacy `X-Tenant-ID`) to match server auth.
+- **Compose / `.env.example`**: Document `EPOCHDB_EXTRACTION_MODEL=local`; remove `GEMINI_API_KEY` from shard compose env.
+### Fixed
+- **Seed Sample disabled** in Explorer dock so Percepta / Studio does not auto-load demo graphs.
+
 ## [0.11.0] - 2026-10-13
 ### Added
 - **Core Engine Upgrade**: Upgraded to `epochdb >= 1.11.2`, unlocking native batch ingestion, high-speed procedural skill index, user profile memory types, hot summary snapshots, and neuro-symbolic propose/LCAG validation.

@@ -61,7 +61,11 @@ function authHeaders(): HeadersInit {
   }
   const tenant = getTenant();
   const namespace = getNamespace();
-  if (tenant) headers['X-Tenant-ID'] = tenant;
+  // Server reads X-Tenant / X-Namespace (not X-Tenant-ID)
+  if (tenant) {
+    headers['X-Tenant'] = tenant;
+    headers['X-Tenant-ID'] = tenant;
+  }
   if (namespace) headers['X-Namespace'] = namespace;
   return headers;
 }
