@@ -18,6 +18,8 @@ declare global {
 export interface GraphPayload {
   nodes: string[];
   edges: RawEdge[];
+  typed_nodes?: Array<{ id: string; type?: string; types?: string[] }>;
+  node_types?: Record<string, string[]>;
 }
 
 export interface SkillItem {

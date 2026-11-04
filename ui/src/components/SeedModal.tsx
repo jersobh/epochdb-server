@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
-import { SEED_DOMAINS } from '../lib/seed';
-import { rememberSkill, rememberTriple } from '../lib/api';
+import { SEED_DOMAINS, SEED_PROFILES } from '../lib/seed';
+import { rememberProfile, rememberSkill, rememberTriple } from '../lib/api';
 
 interface SeedModalProps {
   open: boolean;
@@ -45,15 +45,36 @@ export function SeedModal({ open, onClose, tenant, namespace, onDone }: SeedModa
     await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
     try {
       await rememberSkill({
-        skill_name: 'Restart Payment Service',
+        skill_name: 'git_feature_branch_workflow',
         description:
-          'Safely restart the Payment Service on the Kubernetes Cluster without dropping in-flight transactions.',
+          'Standard Git branching and integration workflow for distributed engineering teams.',
         steps: [
-          { step: 1, action: 'Drain traffic from Payment Service pods' },
-          { step: 2, action: 'Perform a rolling restart of the deployment' },
-          { step: 3, action: 'Verify health checks and error rate before restoring traffic' },
+          { step: 1, action: 'Create new topic branch from main' },
+          { step: 2, action: 'Commit atomic changes with semantic message' },
+          { step: 3, action: 'Rebase against origin main to resolve conflicts' },
+          { step: 4, action: 'Push branch and open pull request with test coverage' },
         ],
       });
+      await rememberSkill({
+        skill_name: 'build_linux_custom_kernel',
+        description:
+          'Build and install an optimized Linux kernel tailored for production workloads.',
+        steps: [
+          { step: 1, action: 'Clone Linux Kernel source tree from git repository' },
+          { step: 2, action: 'Configure kernel modules and security settings via make menuconfig' },
+          { step: 3, action: 'Compile kernel bzImage and loadable modules with parallel jobs' },
+          { step: 4, action: 'Install modules to lib directory and update GRUB bootloader configuration' },
+        ],
+      });
+    } catch {
+      /* optional */
+    }
+    try {
+      for (const p of SEED_PROFILES) {
+        for (const fact of p.facts) {
+          await rememberProfile(p.user_id, fact);
+        }
+      }
     } catch {
       /* optional */
     }
@@ -94,7 +115,7 @@ export function SeedModal({ open, onClose, tenant, namespace, onDone }: SeedModa
             </div>
           ))}
           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
-            {total} facts + 1 procedural skill will be added (existing data is kept).
+            {total} facts, 2 procedural skills, and {SEED_PROFILES.length} user profiles will be added.
           </div>
         </div>
         <div style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)', minHeight: 14 }}>

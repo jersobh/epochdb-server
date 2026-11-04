@@ -587,6 +587,120 @@ def test_granular_export_and_import():
         )
 
 
+def test_coordinator_import_resilience():
+    """Verify coordinator mode import correctly verifies replica status, handles partial/total failures, and reports counts."""
+    import src.server as server
+    orig_mode = server.NODE_MODE
+    orig_shards = server.shard_nodes
+    orig_shard_groups = server.shard_groups
+    orig_client = server.client
+    orig_hash_ring = server.hash_ring
+    orig_api_key = server.API_KEY
+
+    server.NODE_MODE = "coordinator"
+    server.API_KEY = "coord-api-key"
+    server.shard_nodes = ["http://shard0:8000", "http://shard1:8000"]
+    server.shard_groups = [["http://shard0:8000", "http://shard1:8000"]]
+    server.hash_ring = server.ConsistentHashRing(server.shard_nodes)
+
+    headers = {"X-API-Key": "coord-api-key"}
+
+    class ConfigurableMockClient:
+        def __init__(self, fail_patterns=None, exception_patterns=None):
+            self.fail_patterns = fail_patterns or []
+            self.exception_patterns = exception_patterns or []
+
+        async def aclose(self):
+            pass
+
+        async def post(self, url, **kwargs):
+            for pat in self.exception_patterns:
+                if pat in url:
+                    raise httpx.ConnectError(f"Connection refused to {url}")
+            for pat in self.fail_patterns:
+                if pat in url:
+                    return MockResponse(500, {"detail": f"Shard internal error at {url}"})
+            if "/skills/remember" in url:
+                return MockResponse(201, {"status": "success", "id": "skill-1"})
+            elif "/profiles/remember" in url:
+                return MockResponse(201, {"status": "success", "id": "prof-1"})
+            elif "/remember" in url:
+                return MockResponse(201, {"status": "success", "id": "mem-1"})
+            return MockResponse(200, {"status": "success"})
+
+    bundle = {
+        "skills": [{"skill_name": "skill_a", "steps": ["step1"]}],
+        "profiles": [{"user_id": "user_a", "fact_text": "likes rust"}],
+        "memories": [{"payload": "memory item 1"}],
+        "triplets": [["Rust", "is", "fast"]]
+    }
+
+    try:
+        with TestClient(app) as client:
+            # 1. Total Success
+            server.client = ConfigurableMockClient()
+            resp = client.post("/import", json={"data_type": "all", "data": bundle}, headers=headers)
+            assert resp.status_code == 201
+            data = resp.json()
+            assert data["status"] == "success"
+            assert data["total_imported"] == 4
+            assert data["total_failed"] == 0
+            assert data["imported"] == {"skills": 1, "profiles": 1, "memories": 1, "triplets": 1}
+            assert data["failed"] == {"skills": 0, "profiles": 0, "memories": 0, "triplets": 0}
+
+            # 2. Total failure (all replica nodes fail with ConnectError or 500)
+            server.client = ConfigurableMockClient(fail_patterns=["shard0", "shard1"])
+            resp = client.post("/import", json={"data_type": "all", "data": bundle}, headers=headers)
+            assert resp.status_code == 201
+            data = resp.json()
+            assert data["status"] == "failed"
+            assert data["total_imported"] == 0
+            assert data["total_failed"] == 4
+            assert data["imported"] == {"skills": 0, "profiles": 0, "memories": 0, "triplets": 0}
+            assert data["failed"] == {"skills": 1, "profiles": 1, "memories": 1, "triplets": 1}
+            assert len(data.get("errors", [])) == 4
+            assert "error" in data
+
+            # 3. Partial failure across items (e.g. skills fail, profiles succeed)
+            server.client = ConfigurableMockClient(fail_patterns=["/skills/remember"])
+            resp = client.post("/import", json={"data_type": "all", "data": bundle}, headers=headers)
+            assert resp.status_code == 201
+            data = resp.json()
+            assert data["status"] == "partial_success"
+            assert data["total_imported"] == 3
+            assert data["total_failed"] == 1
+            assert data["imported"]["skills"] == 0
+            assert data["failed"]["skills"] == 1
+            assert data["imported"]["profiles"] == 1
+
+            # 4. Partial replica group failure with ConsistencyLevel.ONE vs ALL
+            # shard0 succeeds, shard1 fails with ConnectError
+            server.client = ConfigurableMockClient(exception_patterns=["shard1"])
+            # Default ONE consistency -> 1 replica succeeding is sufficient
+            resp = client.post("/import", json={"data_type": "all", "data": bundle}, headers=headers)
+            assert resp.status_code == 201
+            data = resp.json()
+            assert data["status"] == "success"
+            assert data["total_imported"] == 4
+
+            # With ALL consistency -> both replicas must succeed
+            headers_all = {"X-API-Key": "coord-api-key", "X-Consistency-Level": "all"}
+            resp_all = client.post("/import", json={"data_type": "all", "data": bundle}, headers=headers_all)
+            assert resp_all.status_code == 201
+            data_all = resp_all.json()
+            assert data_all["status"] == "failed"
+            assert data_all["total_imported"] == 0
+            assert data_all["total_failed"] == 4
+    finally:
+        server.NODE_MODE = orig_mode
+        server.shard_nodes = orig_shards
+        server.shard_groups = orig_shard_groups
+        server.client = orig_client
+        server.hash_ring = orig_hash_ring
+        server.API_KEY = orig_api_key
+
+
+
 
 
 

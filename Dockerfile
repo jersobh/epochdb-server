@@ -35,7 +35,7 @@ ENV PYTHONPATH=/app
 RUN pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cpu \
     --extra-index-url https://pypi.org/simple \
-    "epochdb>=1.8.4" \
+    "epochdb>=1.12.0" \
     "uvicorn>=0.49.0,<0.50.0" \
     "fastapi>=0.138.1,<0.139.0" \
     "pydantic>=2.13.4,<3.0.0" \
@@ -57,5 +57,6 @@ COPY --from=ui-builder /build/src/static/ui/ ./src/static/ui/
 # Expose the API port
 EXPOSE 8080
 
-# Start the FastAPI server using Gunicorn process manager with Uvicorn workers, first recursively deleting any stale locks
-CMD ["sh", "-c", "find /data -name '*.lock' -delete 2>/dev/null || true && gunicorn src.server:app --workers 1 --timeout 120 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8080"]
+# EpochDB FileLock is exclusive per storage dir — keep workers=1.
+# Timeout can be raised via GUNICORN_TIMEOUT when cold MiniLM boot is slow.
+CMD ["sh", "-c", "find /data -name '*.lock' -delete 2>/dev/null || true && gunicorn src.server:app --workers ${GUNICORN_WORKERS:-1} --timeout ${GUNICORN_TIMEOUT:-180} --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8080"]

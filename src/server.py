@@ -27,19 +27,72 @@ try:
 except ImportError:
     from src.auth import verify_scoped_auth, Permission, get_keystore, ScopedAPIKey
 
+try:
+    from ontology import (
+        ENTITY_TYPES,
+        ENTITY_TYPE_SET,
+        PRED_ROLES,
+        TYPE_DEFINING_PREDICATES,
+        _slug,
+        infer_type_from_name,
+        normalize_type,
+        seed_entries,
+    )
+    from type_registry import (
+        delete_type as registry_delete_type,
+        get_registered_ids,
+        list_registered,
+        seed_types as registry_seed_types,
+        upsert_type as registry_upsert_type,
+    )
+    from type_discovery import discover_types
+except ImportError:
+    from src.ontology import (
+        ENTITY_TYPES,
+        ENTITY_TYPE_SET,
+        PRED_ROLES,
+        TYPE_DEFINING_PREDICATES,
+        _slug,
+        infer_type_from_name,
+        normalize_type,
+        seed_entries,
+    )
+    from src.type_registry import (
+        delete_type as registry_delete_type,
+        get_registered_ids,
+        list_registered,
+        seed_types as registry_seed_types,
+        upsert_type as registry_upsert_type,
+    )
+    from src.type_discovery import discover_types
+
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.12.0"
+SERVER_VERSION = "0.13.0"
 # Coordinator→shard HTTP timeout. Embeddings on small VPS CPUs often exceed 30s
 # under concurrent ingest; default matches gunicorn --timeout 120.
 COORDINATOR_HTTP_TIMEOUT = float(os.getenv("COORDINATOR_HTTP_TIMEOUT", "120"))
+# Short timeout for graph fan-out so one slow shard returns a partial graph
+# instead of holding the coordinator for the full write timeout.
+COORDINATOR_GRAPH_TIMEOUT = float(os.getenv("COORDINATOR_GRAPH_TIMEOUT", "25"))
 # Bound CPU-bound sentence-transformer work per shard process. A full queue is
 # rejected rather than letting requests pile up until coordinator timeouts.
 SHARD_EMBED_CONCURRENCY = max(1, int(os.getenv("SHARD_EMBED_CONCURRENCY", "1")))
 SHARD_EMBED_QUEUE_LIMIT = max(0, int(os.getenv("SHARD_EMBED_QUEUE_LIMIT", "8")))
+# Pre-warm this tenant/namespace at shard boot (Percepta uses global/default).
+# Empty → skip; avoids a second MiniLM cold-load on the first app request.
+DEFAULT_TENANT = (os.getenv("DEFAULT_TENANT") or "").strip() or None
+DEFAULT_NAMESPACE = (os.getenv("DEFAULT_NAMESPACE") or "").strip() or None
 _embed_semaphore: Optional[asyncio.Semaphore] = None
 _embed_waiters = 0
+# Last successful full /stats snapshot — served by ?probe=1 without touching the DB.
+_LAST_SHARD_DB_STATS: Dict[str, Any] = {
+    "memory_count": 0,
+    "l1_size": 0,
+    "l2_size": 0,
+    "entity_count": 0,
+}
 
 
 def format_shard_error(resp: Any) -> str:
@@ -246,7 +299,9 @@ hash_ring = ConsistentHashRing(shard_nodes) if shard_nodes else None
 # Dynamic embedding configuration (defaults to local offline all-MiniLM-L6-v2)
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
-GRAPH_HUB_LIMIT = int(os.getenv("GRAPH_HUB_LIMIT", "50"))
+# Overview graph (no entity_id): hub + 1-hop KG neighbors only — no atom recall / BFS.
+GRAPH_HUB_LIMIT = int(os.getenv("GRAPH_HUB_LIMIT", "24"))
+GRAPH_OVERVIEW_NODE_LIMIT = int(os.getenv("GRAPH_OVERVIEW_NODE_LIMIT", "200"))
 
 
 class RequestContext(BaseModel):
@@ -445,7 +500,12 @@ async def poll_shards_loop():
                 due_shards = [shard for shard in all_replica_nodes if now >= next_poll_time[shard]]
 
                 if due_shards:
-                    tasks = [client.get(f"{shard}/stats", timeout=stats_timeout) for shard in due_shards]
+                    # ?probe=1 is CPU/RAM/disk + last-known counts — never opens the
+                    # DB or runs embeddings, so polls stay healthy under MiniLM load.
+                    tasks = [
+                        client.get(f"{shard}/stats", params={"probe": "1"}, timeout=stats_timeout)
+                        for shard in due_shards
+                    ]
                     responses = await asyncio.gather(*tasks, return_exceptions=True)
                     status_changed = False
                     for shard, resp in zip(due_shards, responses):
@@ -789,8 +849,17 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Initializing default AsyncEpochDB engine in Shard Mode...")
         try:
-            # Pre-initialize and warm up default database
+            # Pre-initialize and warm up default (root) database
             db = await get_db_instance(None, None)
+            # Also warm the app tenant partition when configured (e.g. Percepta
+            # global/default) so the first request does not cold-load MiniLM again.
+            if DEFAULT_TENANT is not None or DEFAULT_NAMESPACE is not None:
+                logger.info(
+                    "Pre-warming app partition tenant=%s namespace=%s",
+                    DEFAULT_TENANT,
+                    DEFAULT_NAMESPACE,
+                )
+                await get_db_instance(DEFAULT_TENANT, DEFAULT_NAMESPACE)
             logger.info("Default db warmed up. AsyncEpochDB database pool ready.")
             yield
         except Exception as e:
@@ -972,12 +1041,40 @@ async def healthz():
         if not client:
             raise HTTPException(status_code=503, detail="Coordinator gateway not initialized.")
         if shard_nodes:
-            tasks = [client.get(f"{shard}/healthz", timeout=2.0) for shard in shard_nodes]
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            for shard_url, resp in zip(shard_nodes, responses):
-                if isinstance(resp, Exception) or resp.status_code != 200:
-                    logger.warning(f"Shard health probe failed: {shard_url} -> {resp}")
-                    raise HTTPException(status_code=503, detail="One or more backend shards are unhealthy or warming up.")
+            # Prefer the background poll cache. Live fan-out with a short timeout
+            # fails whenever a single-worker shard is mid-embed (CPU-bound MiniLM),
+            # which flaps Docker healthchecks despite shards being up.
+            # Match poll_shards_loop: only ConnectError means offline; ReadTimeout
+            # means busy/overload and must not 503 the coordinator.
+            uncached = [s for s in shard_nodes if s not in SHARD_METRICS_CACHE]
+            if uncached:
+                probe_timeout = float(os.getenv("COORDINATOR_HEALTHZ_TIMEOUT", "10"))
+                tasks = [client.get(f"{shard}/healthz", timeout=probe_timeout) for shard in uncached]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+                for shard_url, resp in zip(uncached, responses):
+                    if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                        continue
+                    err = format_shard_error(resp)
+                    # Hard down (DNS/connect) or explicit non-200 → not ready.
+                    # ReadTimeout / overload → busy shard; do not 503 the gateway.
+                    if should_mark_shard_offline(resp) or isinstance(resp, httpx.Response):
+                        logger.warning(f"Shard health probe failed: {shard_url} -> {err}")
+                        raise HTTPException(
+                            status_code=503,
+                            detail="One or more backend shards are unhealthy or warming up.",
+                        )
+                    logger.warning(f"Shard health probe deferred (busy/warming): {shard_url} -> {err}")
+            else:
+                offline = [
+                    s for s in shard_nodes
+                    if SHARD_METRICS_CACHE.get(s, {}).get("status") == "unhealthy"
+                ]
+                if offline:
+                    logger.warning(f"Coordinator healthz: cached unhealthy shards={offline}")
+                    raise HTTPException(
+                        status_code=503,
+                        detail="One or more backend shards are unhealthy or warming up.",
+                    )
         return {"status": "healthy", "mode": "coordinator", "version": SERVER_VERSION}
     else:
         global db
@@ -1419,9 +1516,31 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
 
                     extracted = engine.extract_entities(text)
                     if extracted:
-                        res = _pair_triples(extracted)
-                        if res:
-                            return res
+                        t_lower = text.lower()
+                        stopwords = {
+                            "for", "the", "and", "with", "from", "into", "that", "this",
+                            "some", "all", "are", "was", "were", "been", "has", "had",
+                            "have", "not", "but", "about", "above", "after", "again", "out"
+                        }
+                        valid_extracted = []
+                        for ent in extracted:
+                            ent_s = str(ent).strip()
+                            ent_l = ent_s.lower()
+                            if ent_l in t_lower:
+                                valid_extracted.append(ent_s)
+                            elif " " in ent_s:
+                                parts = [p for p in ent_l.replace("-", " ").split() if len(p) > 2 and p not in stopwords]
+                                if parts:
+                                    matched_count = sum(1 for p in parts if p in t_lower)
+                                    if (len(parts) <= 2 and matched_count == len(parts)) or (matched_count >= 2 and (matched_count / len(parts)) >= 0.5):
+                                        valid_extracted.append(ent_s)
+                            else:
+                                if ent_l not in stopwords and ent_l in t_lower:
+                                    valid_extracted.append(ent_s)
+                        if valid_extracted:
+                            res = _pair_triples(valid_extracted)
+                            if res:
+                                return res
 
                     # Match LocalFactExtractor fallback for brand-new knowledge graphs.
                     words = [w.strip(".,!?;:()\"'") for w in text.split() if w.strip()]
@@ -2871,12 +2990,16 @@ async def entity_graph(
                 if node:
                     target_nodes.append(node)
 
+            graph_timeout = COORDINATOR_GRAPH_TIMEOUT
+            failed_shards: List[str] = []
+
             if not entity_id:
                 tasks = [
                     client.get(
                         f"{node}/entity_graph",
                         params={"depth": depth},
-                        headers=get_forward_headers(ctx)
+                        headers=get_forward_headers(ctx),
+                        timeout=graph_timeout,
                     ) for node in target_nodes
                 ]
                 responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2884,113 +3007,601 @@ async def entity_graph(
                 merged_nodes = set()
                 merged_edges = []
                 seen_edges = set()
-                
-                for resp in responses:
+                seen_relational_pairs = set()
+                relational_merged = []
+                fallback_merged = []
+                merged_typed: Dict[str, Any] = {}
+
+                for node, resp in zip(target_nodes, responses):
                     if isinstance(resp, httpx.Response) and resp.status_code == 200:
                         data = resp.json()
-                        for node in data.get("nodes", []):
-                            merged_nodes.add(node)
+                        for n in data.get("nodes", []):
+                            merged_nodes.add(n)
                         for edge in data.get("edges", []):
-                            key = (edge.get("source"), edge.get("target"), edge.get("predicate"), edge.get("memory_id"))
-                            if key not in seen_edges:
-                                seen_edges.add(key)
-                                merged_edges.append(edge)
-                    elif isinstance(resp, Exception):
-                        logger.error(f"Error querying entity graph from shard: {resp}")
-                        
-                return {"nodes": list(merged_nodes), "edges": merged_edges}
+                            s = edge.get("source")
+                            t = edge.get("target")
+                            p = edge.get("predicate")
+                            if not s or not t:
+                                continue
+                            pair = (s, t) if s <= t else (t, s)
+                            key = (s, t, p, edge.get("memory_id"))
+                            if key in seen_edges:
+                                continue
+                            seen_edges.add(key)
+                            if p not in ("co_occurs_with", "mentions", "related"):
+                                seen_relational_pairs.add(pair)
+                                relational_merged.append(edge)
+                            else:
+                                fallback_merged.append((pair, edge))
+                        for tn in data.get("typed_nodes") or []:
+                            if isinstance(tn, dict) and tn.get("id"):
+                                nid = str(tn["id"])
+                                if nid not in merged_typed or (
+                                    merged_typed[nid].get("type") in (None, "entity")
+                                    and tn.get("type") not in (None, "entity")
+                                ):
+                                    merged_typed[nid] = tn
+                        for nid, types in (data.get("node_types") or {}).items():
+                            nid_str = str(nid)
+                            if nid_str not in merged_typed:
+                                merged_typed[nid_str] = {
+                                    "id": nid_str,
+                                    "types": types,
+                                    "type": (types or [None])[0],
+                                }
+                            elif (
+                                merged_typed[nid_str].get("type") in (None, "entity")
+                                and types
+                                and types[0] not in (None, "entity")
+                            ):
+                                merged_typed[nid_str]["types"] = types
+                                merged_typed[nid_str]["type"] = types[0]
+                    else:
+                        failed_shards.append(node)
+                        logger.error(
+                            "Error querying entity graph from shard %s: %s",
+                            node,
+                            format_shard_error(resp),
+                        )
+
+                # Prioritize relational edges over 'related' or 'co_occurs_with'
+                if relational_merged:
+                    merged_edges = list(relational_merged)
+                    rel_node_set = {e["source"] for e in merged_edges if e.get("source")} | {
+                        e["target"] for e in merged_edges if e.get("target")
+                    }
+                    for nid, tn in merged_typed.items():
+                        if tn.get("type") not in (None, "entity"):
+                            rel_node_set.add(nid)
+                    merged_nodes = rel_node_set
+                else:
+                    merged_edges = [edge for _, edge in fallback_merged]
+
+                result: Dict[str, Any] = {"nodes": list(merged_nodes), "edges": merged_edges}
+                if merged_typed:
+                    result["typed_nodes"] = [tn for tn in merged_typed.values() if str(tn.get("id")) in merged_nodes]
+                    result["node_types"] = {
+                        tid: (tn.get("types") or [])
+                        for tid, tn in merged_typed.items()
+                        if tid in merged_nodes
+                    }
+                if failed_shards:
+                    result["partial"] = True
+                    result["failed_shards"] = failed_shards
+                return result
             else:
-                # Multi-hop distributed BFS expansion across shards
-                visited = {entity_id}
-                frontier = {entity_id}
+                # One request per shard at full depth — shards already BFS locally.
+                # The old hop×frontier×shard fan-out (depth=1 each) took tens of
+                # seconds under embed load and timed out Percepta / Studio.
+                hop_depth = max(1, min(depth, 4))
+                tasks = [
+                    client.get(
+                        f"{node}/entity_graph",
+                        params={"entity_id": entity_id, "depth": hop_depth},
+                        headers=get_forward_headers(ctx),
+                        timeout=graph_timeout,
+                    )
+                    for node in target_nodes
+                ]
+                responses = await asyncio.gather(*tasks, return_exceptions=True)
+
                 all_nodes = {entity_id}
                 all_edges = []
                 seen_edges = set()
-                max_hops = max(1, min(depth, 15))
-
-                for _ in range(max_hops):
-                    if not frontier:
-                        break
-                    tasks = []
-                    current_batch = list(frontier)[:64]
-                    for ent in current_batch:
-                        for node in target_nodes:
-                            tasks.append(
-                                client.get(
-                                    f"{node}/entity_graph",
-                                    params={"entity_id": ent, "depth": 1},
-                                    headers=get_forward_headers(ctx)
-                                )
+                merged_typed: Dict[str, Any] = {}
+                for node, resp in zip(target_nodes, responses):
+                    if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                        data = resp.json()
+                        for n in data.get("nodes", []):
+                            all_nodes.add(n)
+                        for edge in data.get("edges", []):
+                            key = (
+                                edge.get("source"),
+                                edge.get("target"),
+                                edge.get("predicate"),
+                                edge.get("memory_id"),
                             )
-                    responses = await asyncio.gather(*tasks, return_exceptions=True)
-                    new_frontier = set()
-                    for resp in responses:
-                        if isinstance(resp, httpx.Response) and resp.status_code == 200:
-                            data = resp.json()
-                            for n in data.get("nodes", []):
-                                all_nodes.add(n)
-                                if n not in visited:
-                                    visited.add(n)
-                                    new_frontier.add(n)
-                            for edge in data.get("edges", []):
-                                key = (edge.get("source"), edge.get("target"), edge.get("predicate"), edge.get("memory_id"))
-                                if key not in seen_edges:
-                                    seen_edges.add(key)
-                                    all_edges.append(edge)
-                        elif isinstance(resp, Exception):
-                            logger.error(f"Error querying entity graph from shard: {resp}")
-                    frontier = new_frontier
+                            if key not in seen_edges:
+                                seen_edges.add(key)
+                                all_edges.append(edge)
+                        for tn in data.get("typed_nodes") or []:
+                            if isinstance(tn, dict) and tn.get("id"):
+                                nid = str(tn["id"])
+                                if nid not in merged_typed or (
+                                    merged_typed[nid].get("type") in (None, "entity")
+                                    and tn.get("type") not in (None, "entity")
+                                ):
+                                    merged_typed[nid] = tn
+                        for nid, types in (data.get("node_types") or {}).items():
+                            nid_str = str(nid)
+                            if nid_str not in merged_typed:
+                                merged_typed[nid_str] = {
+                                    "id": nid_str,
+                                    "types": types,
+                                    "type": (types or [None])[0],
+                                }
+                            elif (
+                                merged_typed[nid_str].get("type") in (None, "entity")
+                                and types
+                                and types[0] not in (None, "entity")
+                            ):
+                                merged_typed[nid_str]["types"] = types
+                                merged_typed[nid_str]["type"] = types[0]
+                    else:
+                        failed_shards.append(node)
+                        logger.error(
+                            "Error querying entity graph from shard %s: %s",
+                            node,
+                            format_shard_error(resp),
+                        )
 
-                return {"nodes": list(all_nodes), "edges": all_edges}
+                relational_edges = [
+                    e for e in all_edges
+                    if e.get("predicate") not in ("co_occurs_with", "mentions", "related")
+                ]
+                if relational_edges:
+                    final_edges = relational_edges
+                    final_nodes = {entity_id}
+                    for e in final_edges:
+                        if e.get("source"):
+                            final_nodes.add(e["source"])
+                        if e.get("target"):
+                            final_nodes.add(e["target"])
+                else:
+                    final_edges = all_edges
+                    final_nodes = all_nodes
+
+                result = {"nodes": list(final_nodes), "edges": final_edges}
+                if merged_typed:
+                    result["typed_nodes"] = [tn for tn in merged_typed.values() if str(tn.get("id")) in final_nodes]
+                    result["node_types"] = {
+                        tid: (tn.get("types") or [])
+                        for tid, tn in merged_typed.items()
+                        if tid in final_nodes
+                    }
+                if failed_shards:
+                    result["partial"] = True
+                    result["failed_shards"] = failed_shards
+                return result
         else:
             active_db = await get_db_instance(ctx.tenant, ctx.namespace)
             try:
                 if not entity_id:
+                    # Studio overview: cheap KG index walk. The old hub×BFS path
+                    # called recall_by_entity per hub and wedged workers=1 shards
+                    # under MiniLM load, so /entity_graph timed out → empty UI.
                     engine = await active_db._get_db()
-                    hub_entities = await asyncio.to_thread(
-                        engine.get_hub_entities, GRAPH_HUB_LIMIT
-                    )
-                    if not hub_entities:
-                        all_entities = await asyncio.to_thread(engine.get_entities)
-                        if not all_entities:
-                            return {"nodes": [], "edges": []}
-                        hub_entities = all_entities[:GRAPH_HUB_LIMIT]
-                    
-                    merged_nodes = set()
-                    merged_edges = []
-                    seen_edges = set()
-                    
-                    for ent in hub_entities:
-                        merged_nodes.add(ent)
-                        graph = await active_db.entity_graph(ent, depth=1)
-                        for node in graph.nodes:
-                            merged_nodes.add(node)
-                        for edge in graph.edges:
-                            key = (edge.get("source"), edge.get("target"), edge.get("predicate"), edge.get("memory_id"))
-                            if key not in seen_edges:
-                                seen_edges.add(key)
-                                merged_edges.append(edge)
-                    return {"nodes": list(merged_nodes), "edges": merged_edges}
-                else:
-                    graph = await active_db.entity_graph(entity_id, depth)
-                    result = {"nodes": graph.nodes, "edges": graph.edges}
-                    node_types = getattr(graph, "node_types", None) or {}
-                    if node_types:
-                        result["node_types"] = node_types
-                        result["typed_nodes"] = [
-                            {
-                                "id": n,
-                                "types": node_types.get(n, []),
-                                "type": (node_types.get(n) or [None])[0],
+
+                    def _overview_graph():
+                        with engine._internal_lock:
+                            atoms = list(engine.hot_tier.atoms.values())
+                            try:
+                                for epoch_id in engine.cold_tier.get_all_epochs():
+                                    atoms.extend(engine.cold_tier.load_epoch(epoch_id))
+                            except Exception as exc:
+                                logger.debug("Cold tier epoch load error: %s", exc)
+
+                        nodes = set()
+                        edges = []
+                        relational_edges = []
+                        cooccur_edges = []
+                        seen_relational = set()
+                        seen_all_edges = set()
+                        explicit_types: Dict[str, str] = {}
+                        node_type_votes: Dict[str, Dict[str, int]] = {}
+
+                        def _cast_vote(ent: str, vtype: Optional[str]):
+                            if not ent or not vtype:
+                                return
+                            vtype_norm = normalize_type(vtype, allowed=ENTITY_TYPE_SET, default="")
+                            if not vtype_norm or vtype_norm == "entity":
+                                return
+                            votes = node_type_votes.setdefault(ent, {})
+                            votes[vtype_norm] = votes.get(vtype_norm, 0) + 1
+
+                        for atom in atoms:
+                            if atom.id in getattr(engine, "deleted_atom_ids", set()):
+                                continue
+                            if atom.metadata and atom.metadata.get("_deleted"):
+                                continue
+
+                            mtype = str(getattr(atom.memory_type, "value", atom.memory_type) or "").lower()
+                            if mtype == "skill" or (atom.metadata and atom.metadata.get("skill_name")):
+                                sk_name = (atom.metadata.get("skill_name") if atom.metadata else None) or atom.id
+                                explicit_types[sk_name] = "skill"
+                                nodes.add(sk_name)
+                            elif mtype == "profile" or (atom.metadata and atom.metadata.get("user_id")):
+                                uid = atom.metadata.get("user_id") if atom.metadata else None
+                                if uid:
+                                    explicit_types[uid] = "person"
+                                    nodes.add(uid)
+                                    role = atom.metadata.get("role")
+                                    if role:
+                                        explicit_types[role] = "role"
+                                        nodes.add(role)
+                                        relational_edges.append({
+                                            "source": uid,
+                                            "target": role,
+                                            "predicate": "holds_role",
+                                            "memory_id": atom.id,
+                                        })
+                                    team = atom.metadata.get("team")
+                                    if team:
+                                        explicit_types[team] = "organization"
+                                        nodes.add(team)
+                                        relational_edges.append({
+                                            "source": uid,
+                                            "target": team,
+                                            "predicate": "member_of",
+                                            "memory_id": atom.id,
+                                        })
+
+                            raw_triples = list(getattr(atom, "triples", []) or [])
+                            if not raw_triples and atom.metadata:
+                                raw_triples = list(atom.metadata.get("triples") or [])
+
+                            for item in raw_triples:
+                                if not isinstance(item, (list, tuple)) or len(item) < 3:
+                                    continue
+                                s, p, o = str(item[0]).strip(), str(item[1]).strip(), str(item[2]).strip()
+                                if not s or not o:
+                                    continue
+                                pred_slug = _slug(p)
+                                if not pred_slug:
+                                    continue
+
+                                if pred_slug in TYPE_DEFINING_PREDICATES:
+                                    canon = normalize_type(o, allowed=ENTITY_TYPE_SET, default="")
+                                    if canon and canon != "entity":
+                                        explicit_types[s] = canon
+                                    nodes.add(s)
+                                    nodes.add(o)
+                                    relational_edges.append({
+                                        "source": s,
+                                        "target": o,
+                                        "predicate": p,
+                                        "memory_id": atom.id,
+                                    })
+                                    continue
+
+                                if pred_slug == "is_skill":
+                                    explicit_types[s] = "skill"
+                                    explicit_types[o] = "skill"
+                                    nodes.add(s)
+                                    nodes.add(o)
+                                    relational_edges.append({
+                                        "source": s,
+                                        "target": o,
+                                        "predicate": p,
+                                        "memory_id": atom.id,
+                                    })
+                                    continue
+
+                                if pred_slug.startswith("has_step"):
+                                    explicit_types[s] = "skill"
+                                    _cast_vote(o, "process")
+                                    nodes.add(s)
+                                    nodes.add(o)
+                                    relational_edges.append({
+                                        "source": s,
+                                        "target": o,
+                                        "predicate": p,
+                                        "memory_id": atom.id,
+                                    })
+                                    continue
+
+                                if pred_slug in PRED_ROLES:
+                                    s_role, o_role = PRED_ROLES[pred_slug]
+                                    _cast_vote(s, s_role)
+                                    _cast_vote(o, o_role)
+
+                                if pred_slug not in ("co_occurs_with", "mentions", "related"):
+                                    nodes.add(s)
+                                    nodes.add(o)
+                                    relational_edges.append({
+                                        "source": s,
+                                        "target": o,
+                                        "predicate": p,
+                                        "memory_id": atom.id,
+                                    })
+                                else:
+                                    cooccur_edges.append({
+                                        "source": s,
+                                        "target": o,
+                                        "predicate": p,
+                                        "memory_id": atom.id,
+                                    })
+
+                        if relational_edges:
+                            for e in relational_edges:
+                                s = e["source"]
+                                t = e["target"]
+                                key = (s, t, e.get("predicate"))
+                                if key not in seen_all_edges:
+                                    seen_all_edges.add(key)
+                                    edges.append(e)
+                            rel_nodes = {e["source"] for e in edges if e.get("source")} | {
+                                e["target"] for e in edges if e.get("target")
                             }
-                            for n in graph.nodes
-                        ]
+                            for name, etype in explicit_types.items():
+                                if etype in ("skill", "person", "organization", "process"):
+                                    rel_nodes.add(name)
+                            node_list = list(rel_nodes)
+                        else:
+                            hubs = engine.get_hub_entities(GRAPH_HUB_LIMIT)
+                            if not hubs and not nodes:
+                                all_ents = engine.get_entities()
+                                if all_ents:
+                                    hubs = all_ents[:GRAPH_HUB_LIMIT]
+
+                            for ent in (hubs or []):
+                                if len(nodes) < GRAPH_OVERVIEW_NODE_LIMIT:
+                                    nodes.add(ent)
+                                try:
+                                    neighbors = engine.kg_manager.get_neighbors(ent)
+                                except Exception as exc:
+                                    logger.warning("get_neighbors(%s) failed: %s", ent, exc)
+                                    continue
+                                for n in neighbors:
+                                    if len(nodes) < GRAPH_OVERVIEW_NODE_LIMIT:
+                                        nodes.add(n)
+                                    elif n not in nodes:
+                                        continue
+                                    pair = (ent, n) if ent <= n else (n, ent)
+                                    key = (pair[0], pair[1], "related")
+                                    if key not in seen_all_edges:
+                                        seen_all_edges.add(key)
+                                        edges.append({"source": ent, "target": n, "predicate": "related"})
+
+                            for e in cooccur_edges:
+                                s = e["source"]
+                                t = e["target"]
+                                if s in nodes and t in nodes:
+                                    key = (s, t, e.get("predicate"))
+                                    if key not in seen_all_edges:
+                                        seen_all_edges.add(key)
+                                        edges.append(e)
+                            node_list = list(nodes)
+
+                        typed_nodes = []
+                        node_types: Dict[str, List[str]] = {}
+
+                        for nid in node_list:
+                            assigned_type = None
+                            if nid in explicit_types:
+                                assigned_type = explicit_types[nid]
+                            elif nid in node_type_votes:
+                                sorted_votes = sorted(
+                                    node_type_votes[nid].items(),
+                                    key=lambda kv: kv[1],
+                                    reverse=True,
+                                )
+                                if sorted_votes:
+                                    assigned_type = sorted_votes[0][0]
+
+                            if not assigned_type:
+                                inferred = infer_type_from_name(nid)
+                                if inferred and inferred != "entity":
+                                    assigned_type = inferred
+
+                            if not assigned_type:
+                                norm = normalize_type(nid, allowed=ENTITY_TYPE_SET, default="")
+                                if norm and norm != "entity":
+                                    assigned_type = norm
+
+                            final_type = assigned_type or "entity"
+                            node_types[nid] = [final_type]
+                            typed_nodes.append({"id": nid, "types": [final_type], "type": final_type})
+
+                        return {
+                            "nodes": node_list,
+                            "edges": edges,
+                            "typed_nodes": typed_nodes,
+                            "node_types": node_types,
+                        }
+
+                    return await asyncio.to_thread(_overview_graph)
+                else:
+                    hop_depth = max(1, min(depth, 2))
+                    graph = await active_db.entity_graph(entity_id, hop_depth)
+                    all_edges = graph.edges or []
+                    rel_edges = [
+                        e for e in all_edges
+                        if e.get("predicate") not in ("co_occurs_with", "mentions", "related")
+                    ]
+                    if rel_edges:
+                        final_edges = rel_edges
+                        final_nodes = {entity_id}
+                        for e in final_edges:
+                            if e.get("source"):
+                                final_nodes.add(e["source"])
+                            if e.get("target"):
+                                final_nodes.add(e["target"])
+                    else:
+                        final_edges = all_edges
+                        final_nodes = set(graph.nodes or [entity_id])
+
+                    result = {"nodes": list(final_nodes), "edges": final_edges}
+                    registered = set(get_registered_ids(ctx.tenant, ctx.namespace))
+                    allowed = registered or None
+                    raw_types = getattr(graph, "node_types", None) or {}
+                    node_types: Dict[str, List[str]] = {}
+                    typed_nodes = []
+
+                    edge_votes: Dict[str, Dict[str, int]] = {}
+                    explicit_types: Dict[str, str] = {}
+                    for e in final_edges:
+                        s = e.get("source")
+                        t = e.get("target")
+                        p = _slug(e.get("predicate"))
+                        if p in TYPE_DEFINING_PREDICATES and t:
+                            canon = normalize_type(t, allowed=allowed, default="")
+                            if canon and canon != "entity":
+                                explicit_types[s] = canon
+                        elif p == "is_skill":
+                            explicit_types[s] = "skill"
+                            explicit_types[t] = "skill"
+                        elif p.startswith("has_step"):
+                            explicit_types[s] = "skill"
+                            edge_votes.setdefault(t, {})["process"] = edge_votes.setdefault(t, {}).get("process", 0) + 1
+                        elif p in PRED_ROLES:
+                            s_role, o_role = PRED_ROLES[p]
+                            if s_role and s:
+                                edge_votes.setdefault(s, {})[s_role] = edge_votes.setdefault(s, {}).get(s_role, 0) + 1
+                            if o_role and t:
+                                edge_votes.setdefault(t, {})[o_role] = edge_votes.setdefault(t, {}).get(o_role, 0) + 1
+
+                    for n in final_nodes:
+                        assigned_type = None
+                        if n in explicit_types:
+                            assigned_type = explicit_types[n]
+                        elif n in edge_votes:
+                            sv = sorted(edge_votes[n].items(), key=lambda kv: kv[1], reverse=True)
+                            if sv:
+                                assigned_type = sv[0][0]
+                        if not assigned_type and n in raw_types and raw_types[n]:
+                            for rt in raw_types[n]:
+                                norm = normalize_type(rt, allowed=allowed, default="")
+                                if norm and norm != "entity":
+                                    assigned_type = norm
+                                    break
+                        if not assigned_type:
+                            inferred = infer_type_from_name(n, allowed=allowed)
+                            if inferred and inferred != "entity":
+                                assigned_type = inferred
+                        if not assigned_type:
+                            norm = normalize_type(n, allowed=ENTITY_TYPE_SET, default="")
+                            if norm and norm != "entity":
+                                assigned_type = norm
+
+                        final_type = assigned_type or "entity"
+                        node_types[n] = [final_type]
+                        typed_nodes.append({"id": n, "types": [final_type], "type": final_type})
+
+                    result["node_types"] = node_types
+                    result["typed_nodes"] = typed_nodes
                     return result
             except Exception as e:
                 logger.error(f"Error retrieving entity graph for {entity_id}: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
 
     return await handle_cached_read("entity_graph", payload, request, response, ctx, fetch)
+
+
+def _merge_type_catalog(
+    *,
+    tenant: Optional[str],
+    namespace: Optional[str],
+    discovered: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge registered (app/seed) + auto-discovered types."""
+    registered = list_registered(tenant, namespace)
+    reg_ids = [t["id"] for t in registered]
+    disc_types = []
+    for t in discovered.get("types") or []:
+        mapped = normalize_type(str(t), default="")
+        if mapped and mapped != "entity" and mapped not in disc_types:
+            disc_types.append(mapped)
+        elif mapped == "entity":
+            # Keep compact open ids that normalize_type accepted as-is via open path
+            slug = str(t).strip().lower().replace(" ", "_").replace("-", "_")
+            if slug and slug.replace("_", "").isalnum() and len(slug) <= 64 and slug not in disc_types:
+                disc_types.append(slug)
+
+    entity_types: Dict[str, List[str]] = {}
+    for ent, tlist in (discovered.get("entity_types") or {}).items():
+        cleaned = []
+        for t in tlist or []:
+            mapped = normalize_type(str(t), default="")
+            if mapped and mapped != "entity" and mapped not in cleaned:
+                cleaned.append(mapped)
+        inferred = infer_type_from_name(str(ent))
+        if inferred and inferred not in cleaned:
+            cleaned.insert(0, inferred)
+        if cleaned:
+            entity_types[str(ent)] = cleaned
+
+    # Union for clients that only read `types`
+    union: List[str] = []
+    for tid in reg_ids + disc_types:
+        if tid not in union:
+            union.append(tid)
+
+    return {
+        "types": union,
+        "registered": registered,
+        "registered_ids": reg_ids,
+        "discovered": disc_types,
+        "predicates": list(discovered.get("predicates") or []),
+        "entity_types": entity_types,
+        "discovery_source": discovered.get("source"),
+        "closed": False,
+        "seed_catalog": list(ENTITY_TYPES),
+    }
+
+
+async def _collect_discovered_types(ctx: RequestContext) -> Dict[str, Any]:
+    if NODE_MODE == "coordinator":
+        if not client:
+            raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+        target_nodes = []
+        for group in shard_groups:
+            node = get_healthy_replica_for_group(group)
+            if node:
+                target_nodes.append(node)
+        tasks = [
+            client.get(
+                f"{node}/discovered_types",
+                headers=get_forward_headers(ctx),
+                timeout=COORDINATOR_GRAPH_TIMEOUT,
+            )
+            for node in target_nodes
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        types: set = set()
+        predicates: set = set()
+        entity_types: Dict[str, set] = {}
+        source = "shards"
+        for resp in responses:
+            if isinstance(resp, httpx.Response) and resp.status_code == 200:
+                data = resp.json()
+                # Prefer shard's discovered list when present (avoid re-merging registered)
+                for t in data.get("discovered") or data.get("types") or []:
+                    types.add(str(t))
+                predicates.update(data.get("predicates") or [])
+                for ent, tlist in (data.get("entity_types") or {}).items():
+                    entity_types.setdefault(str(ent), set()).update(tlist or [])
+                source = data.get("discovery_source") or source
+        return {
+            "types": sorted(types),
+            "predicates": sorted(predicates),
+            "entity_types": {k: sorted(v) for k, v in entity_types.items()},
+            "source": source,
+        }
+
+    active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+    engine = await active_db._get_db()
+    return await asyncio.to_thread(discover_types, engine)
 
 
 @app.get("/discovered_types")
@@ -3000,46 +3611,107 @@ async def discovered_types(
     ctx: RequestContext = Depends(get_context({Permission.READ}))
 ):
     """
-    Open-vocab type discovery — union of type objects + predicates from stored triples.
-    No fixed ontology / enum registry.
+    Auto-discovered types from triples, merged with any app-registered types.
+    Discovery stays open; apps predefine/create via /entity_types.
     """
     async def fetch():
-        if NODE_MODE == "coordinator":
-            if not client:
-                raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
-            target_nodes = []
-            for group in shard_groups:
-                node = get_healthy_replica_for_group(group)
-                if node:
-                    target_nodes.append(node)
-            tasks = [
-                client.get(
-                    f"{node}/discovered_types",
-                    headers=get_forward_headers(ctx),
-                )
-                for node in target_nodes
-            ]
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
-            types: set = set()
-            predicates: set = set()
-            entity_types: dict = {}
-            for resp in responses:
-                if isinstance(resp, httpx.Response) and resp.status_code == 200:
-                    data = resp.json()
-                    types.update(data.get("types") or [])
-                    predicates.update(data.get("predicates") or [])
-                    for ent, tlist in (data.get("entity_types") or {}).items():
-                        entity_types.setdefault(ent, set()).update(tlist)
-            return {
-                "types": sorted(types),
-                "predicates": sorted(predicates),
-                "entity_types": {k: sorted(v) for k, v in entity_types.items()},
-            }
-        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
-        engine = await active_db._get_db()
-        return await asyncio.to_thread(engine.get_discovered_types)
+        discovered = await _collect_discovered_types(ctx)
+        return _merge_type_catalog(
+            tenant=ctx.tenant, namespace=ctx.namespace, discovered=discovered
+        )
 
     return await handle_cached_read("discovered_types", {}, request, response, ctx, fetch)
+
+
+@app.get("/entity_types")
+async def get_entity_types(
+    request: Request,
+    response: Response,
+    ctx: RequestContext = Depends(get_context({Permission.READ})),
+):
+    """List registered + discovered entity types for this tenant/namespace."""
+    return await discovered_types(request, response, ctx)
+
+
+class EntityTypePayload(BaseModel):
+    id: str = Field(..., description="Type id (lowercase snake_case).")
+    label: Optional[str] = Field(default=None, description="Human label.")
+    description: Optional[str] = Field(default=None, description="Optional description.")
+
+
+class EntityTypeSeedPayload(BaseModel):
+    types: List[Any] = Field(
+        ...,
+        description="List of type ids or {id,label,description} objects.",
+    )
+    replace: bool = Field(
+        default=False,
+        description="If true, replace the registry with this list.",
+    )
+    use_default_seed: bool = Field(
+        default=False,
+        description="If true, seed the built-in suggested catalog (~22 types).",
+    )
+
+
+@app.post("/entity_types")
+async def create_entity_type(
+    payload: EntityTypePayload,
+    ctx: RequestContext = Depends(get_context({Permission.WRITE})),
+):
+    """Register (create/update) an entity type for this tenant/namespace."""
+    try:
+        entry = registry_upsert_type(
+            payload.id,
+            label=payload.label,
+            description=payload.description,
+            source="app",
+            tenant=ctx.tenant,
+            namespace=ctx.namespace,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    invalidate_cache(ctx.tenant, ctx.namespace)
+    return {"status": "success", "type": entry}
+
+
+@app.put("/entity_types/seed")
+async def seed_entity_types(
+    payload: EntityTypeSeedPayload,
+    ctx: RequestContext = Depends(get_context({Permission.WRITE})),
+):
+    """
+    Bulk-predefine entity types. Pass use_default_seed=true for the suggested
+    catalog, or supply types explicitly from the app.
+    """
+    entries = seed_entries() if payload.use_default_seed else payload.types
+    if not entries:
+        raise HTTPException(status_code=400, detail="No types to seed")
+    try:
+        result = registry_seed_types(
+            entries,
+            replace=payload.replace,
+            source="seed",
+            tenant=ctx.tenant,
+            namespace=ctx.namespace,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    invalidate_cache(ctx.tenant, ctx.namespace)
+    return result
+
+
+@app.delete("/entity_types/{type_id}")
+async def delete_entity_type(
+    type_id: str,
+    ctx: RequestContext = Depends(get_context({Permission.WRITE})),
+):
+    """Remove a registered type (does not erase discovered triples)."""
+    ok = registry_delete_type(type_id, tenant=ctx.tenant, namespace=ctx.namespace)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Type '{type_id}' not registered")
+    invalidate_cache(ctx.tenant, ctx.namespace)
+    return {"status": "success", "deleted": type_id}
 
 @app.post("/get_timeline")
 async def get_timeline(
@@ -3096,22 +3768,68 @@ async def get_timeline(
     return await handle_cached_read("get_timeline", payload, request, response, ctx, fetch)
 
 @app.get("/stats")
-async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
+async def stats(
+    probe: Optional[int] = Query(
+        None,
+        description="If 1, return lightweight system metrics without opening the DB (for coordinator polls).",
+    ),
+    ctx: RequestContext = Depends(get_context({Permission.ADMIN})),
+):
     """
     Provides real-time system metrics, cache status, and internal allocation maps.
     """
     if NODE_MODE == "coordinator":
         if not client:
             raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
-            
+
         all_replica_nodes = []
         for group in shard_groups:
             all_replica_nodes.extend(group)
-            
+
+        # Prefer background poll cache when every shard has an entry — avoids a
+        # live fan-out that competes with embeds on single-worker shards.
+        if SHARD_METRICS_CACHE and all(
+            node in SHARD_METRICS_CACHE for node in all_replica_nodes
+        ):
+            total_memory_count = 0
+            total_l1_size = 0
+            total_l2_size = 0
+            total_entity_count = 0
+            group_representatives = []
+            for group in shard_groups:
+                node = get_healthy_replica_for_group(group)
+                if node:
+                    group_representatives.append(node)
+            shards_metrics = {}
+            for node in all_replica_nodes:
+                metrics = dict(SHARD_METRICS_CACHE.get(node) or {})
+                shards_metrics[node] = metrics
+                if node in group_representatives:
+                    total_memory_count += metrics.get("memory_count", 0)
+                    total_l1_size += metrics.get("l1_size", 0)
+                    total_l2_size += metrics.get("l2_size", 0)
+                    total_entity_count += metrics.get("entity_count", 0)
+            return {
+                "mode": "coordinator",
+                "memory_count": total_memory_count,
+                "l1_size": total_l1_size,
+                "l2_size": total_l2_size,
+                "entity_count": total_entity_count,
+                "system": {
+                    "cpu": get_cpu_usage(),
+                    "ram": get_ram_usage(),
+                    "disk": get_disk_usage(os.getenv("STORAGE_DIR", ".")),
+                },
+                "shards": shards_metrics,
+                "cached": True,
+            }
+
         tasks = [
             client.get(
                 f"{node}/stats",
-                headers=get_forward_headers(ctx)
+                params={"probe": "1"},
+                headers=get_forward_headers(ctx),
+                timeout=float(os.getenv("COORDINATOR_STATS_TIMEOUT", "15")),
             ) for node in all_replica_nodes
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -3158,7 +3876,7 @@ async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
                         "disk": {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0},
                     }
             else:
-                err_msg = str(resp) if isinstance(resp, Exception) else f"Status code {resp.status_code if resp else 'unknown'}"
+                err_msg = format_shard_error(resp)
                 shards_metrics[node] = {
                     "status": "unhealthy",
                     "error": err_msg,
@@ -3183,6 +3901,21 @@ async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
             "shards": shards_metrics
         }
     else:
+        # Lightweight probe for coordinator poll_shards_loop — never opens the DB.
+        if probe:
+            return {
+                "mode": "shard",
+                "probe": True,
+                "version": SERVER_VERSION,
+                "memory_count": _LAST_SHARD_DB_STATS.get("memory_count", 0),
+                "l1_size": _LAST_SHARD_DB_STATS.get("l1_size", 0),
+                "l2_size": _LAST_SHARD_DB_STATS.get("l2_size", 0),
+                "entity_count": _LAST_SHARD_DB_STATS.get("entity_count", 0),
+                "cpu": get_cpu_usage(),
+                "ram": get_ram_usage(),
+                "disk": get_disk_usage(os.getenv("STORAGE_DIR", "./shared_memory")),
+            }
+
         active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
             db_stats = await active_db.stats()
@@ -3195,6 +3928,9 @@ async def stats(ctx: RequestContext = Depends(get_context({Permission.ADMIN}))):
             db_stats["cpu"] = get_cpu_usage()
             db_stats["ram"] = get_ram_usage()
             db_stats["disk"] = get_disk_usage(os.getenv("STORAGE_DIR", "./shared_memory"))
+            for key in ("memory_count", "l1_size", "l2_size", "entity_count"):
+                if key in db_stats:
+                    _LAST_SHARD_DB_STATS[key] = db_stats[key]
             return db_stats
         except Exception as e:
             logger.error(f"Unable to safely pull analytical parameters: {str(e)}")
@@ -3393,8 +4129,59 @@ async def import_data(
     if NODE_MODE == "coordinator":
         if not client:
             raise HTTPException(status_code=503, detail="Coordinator HTTP client not ready.")
+        if not shard_nodes:
+            raise HTTPException(status_code=500, detail="No shard nodes available.")
 
         counts = {"skills": 0, "profiles": 0, "memories": 0, "triplets": 0}
+        failed = {"skills": 0, "profiles": 0, "memories": 0, "triplets": 0}
+        errors: List[str] = []
+
+        forward_headers = get_forward_headers(ctx)
+        consistency = get_consistency_level(request)
+
+        async def forward_to_replicas(target_node: str, endpoint: str, item_payload: dict, item_desc: str) -> bool:
+            group = get_replica_group_for_node(target_node)
+            if not group:
+                errors.append(f"{item_desc}: No replicas found for node {target_node}")
+                return False
+
+            tasks = [
+                client.post(
+                    f"{node}{endpoint}",
+                    json=item_payload,
+                    headers=forward_headers
+                ) for node in group
+            ]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+            success_nodes = []
+            failures = []
+            for node, resp in zip(group, responses):
+                if isinstance(resp, httpx.Response) and 200 <= resp.status_code < 300:
+                    success_nodes.append(node)
+                else:
+                    err_msg = format_shard_error(resp)
+                    failures.append((node, err_msg))
+                    if should_mark_shard_offline(resp):
+                        SHARD_METRICS_CACHE[node] = {
+                            "status": "offline",
+                            "cpu": 0.0,
+                            "ram": {"percent": 0.0},
+                            "disk": {"percent": 0.0}
+                        }
+
+            n = len(group)
+            required = n if consistency == ConsistencyLevel.ALL else (n // 2 + 1 if consistency == ConsistencyLevel.QUORUM else 1)
+            if len(success_nodes) >= required:
+                return True
+            else:
+                last_err = failures[-1][1] if failures else "Unknown error"
+                logger.warning(
+                    f"Import replication failed for {item_desc}. "
+                    f"Required: {consistency.value} ({required}), got: {len(success_nodes)}. Last error: {last_err}"
+                )
+                errors.append(f"{item_desc}: {last_err}")
+                return False
 
         # 1. Skills
         if filter_type in (None, "all", "skills") and "skills" in data:
@@ -3415,24 +4202,28 @@ async def import_data(
                         "triples": s.get("triples") or meta.get("triples")
                     }
                     target_node = hash_ring.get_node(skill_name)
-                    group = get_replica_group_for_node(target_node)
-                    tasks = [client.post(f"{node}/skills/remember", json=sk_payload, headers=get_forward_headers(ctx)) for node in group]
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    counts["skills"] += 1
+                    if target_node and await forward_to_replicas(target_node, "/skills/remember", sk_payload, f"skill '{skill_name}'"):
+                        counts["skills"] += 1
+                    else:
+                        failed["skills"] += 1
+                        if not target_node:
+                            errors.append(f"skill '{skill_name}': No shard node available in hash ring")
 
         # 2. Profiles
         if filter_type in (None, "all", "profiles") and "profiles" in data:
             for p in data["profiles"]:
                 meta = p.get("metadata") or {}
                 uid = meta.get("user_id") or p.get("user_id")
-                fact = p.get("payload") or p.get("text") or meta.get("fact_text") or ""
+                fact = p.get("payload") or p.get("text") or p.get("fact_text") or meta.get("fact_text") or ""
                 if uid and fact:
                     pr_payload = {"user_id": uid, "fact_text": fact, "metadata": meta}
                     target_node = hash_ring.get_node(uid)
-                    group = get_replica_group_for_node(target_node)
-                    tasks = [client.post(f"{node}/profiles/remember", json=pr_payload, headers=get_forward_headers(ctx)) for node in group]
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    counts["profiles"] += 1
+                    if target_node and await forward_to_replicas(target_node, "/profiles/remember", pr_payload, f"profile '{uid}'"):
+                        counts["profiles"] += 1
+                    else:
+                        failed["profiles"] += 1
+                        if not target_node:
+                            errors.append(f"profile '{uid}': No shard node available in hash ring")
 
         # 3. Memories
         if filter_type in (None, "all", "memories") and "memories" in data:
@@ -3446,11 +4237,13 @@ async def import_data(
                         "memory_type": m.get("memory_type") or (m.get("metadata") or {}).get("memory_type"),
                         "id": m.get("id")
                     }
-                    target_node = get_healthy_shard(text)
-                    group = get_replica_group_for_node(target_node)
-                    tasks = [client.post(f"{node}/remember", json=mem_payload, headers=get_forward_headers(ctx)) for node in group]
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    counts["memories"] += 1
+                    target_node = hash_ring.get_node(text)
+                    if target_node and await forward_to_replicas(target_node, "/remember", mem_payload, f"memory '{text[:30]}'"):
+                        counts["memories"] += 1
+                    else:
+                        failed["memories"] += 1
+                        if not target_node:
+                            errors.append(f"memory '{text[:30]}': No shard node available in hash ring")
 
         # 4. Triplets
         if filter_type in (None, "all", "triplets", "graph") and "triplets" in data:
@@ -3458,19 +4251,33 @@ async def import_data(
                 if isinstance(t, (list, tuple)) and len(t) >= 3:
                     text = f"{t[0]} {str(t[1]).replace('_', ' ')} {t[2]}."
                     tr_payload = {"text": text, "triples": [[t[0], t[1], t[2]]]}
-                    target_node = get_healthy_shard(text)
-                    group = get_replica_group_for_node(target_node)
-                    tasks = [client.post(f"{node}/remember", json=tr_payload, headers=get_forward_headers(ctx)) for node in group]
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    counts["triplets"] += 1
+                    target_node = hash_ring.get_node(text)
+                    if target_node and await forward_to_replicas(target_node, "/remember", tr_payload, f"triplet '{t[0]}-{t[1]}-{t[2]}'"):
+                        counts["triplets"] += 1
+                    else:
+                        failed["triplets"] += 1
+                        if not target_node:
+                            errors.append(f"triplet '{t[0]}-{t[1]}-{t[2]}': No shard node available in hash ring")
 
-        invalidate_cache(ctx.tenant, ctx.namespace)
-        await broadcast_sse_event("update", {"type": "import", "counts": counts})
-        return {
-            "status": "success",
+        total_imported = sum(counts.values())
+        total_failed = sum(failed.values())
+
+        if total_imported > 0:
+            invalidate_cache(ctx.tenant, ctx.namespace)
+            await broadcast_sse_event("update", {"type": "import", "counts": counts})
+
+        status_str = "success" if total_failed == 0 else ("partial_success" if total_imported > 0 else "failed")
+        resp_data = {
+            "status": status_str,
             "imported": counts,
-            "total_imported": sum(counts.values())
+            "total_imported": total_imported,
+            "failed": failed,
+            "total_failed": total_failed,
         }
+        if errors:
+            resp_data["errors"] = errors
+            resp_data["error"] = errors[0]
+        return resp_data
     else:
         active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
@@ -3509,7 +4316,7 @@ async def import_data(
                 for p in data["profiles"]:
                     meta = p.get("metadata") or {}
                     uid = meta.get("user_id") or p.get("user_id")
-                    fact = p.get("payload") or p.get("text") or meta.get("fact_text") or ""
+                    fact = p.get("payload") or p.get("text") or p.get("fact_text") or meta.get("fact_text") or ""
                     if uid and fact:
                         await active_db.remember_user_profile(user_id=uid, fact_text=fact, metadata=meta)
                         counts["profiles"] += 1
@@ -3543,7 +4350,9 @@ async def import_data(
             return {
                 "status": "success",
                 "imported": counts,
-                "total_imported": sum(counts.values())
+                "total_imported": sum(counts.values()),
+                "failed": {"skills": 0, "profiles": 0, "memories": 0, "triplets": 0},
+                "total_failed": 0
             }
         except Exception as e:
             logger.error(f"Import execution error: {e}")
@@ -3650,7 +4459,14 @@ async def visualize():
     if os.path.exists(index_path):
         with open(index_path, "r", encoding="utf-8") as f:
             html_content = f.read()
-        return HTMLResponse(content=_inject_studio_config(html_content))
+        return HTMLResponse(
+            content=_inject_studio_config(html_content),
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
     raise HTTPException(
         status_code=404,
         detail="Studio UI not found. Build the React app with: cd ui && npm run build",

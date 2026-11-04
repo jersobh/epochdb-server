@@ -636,6 +636,7 @@ body.dark-mode .theme-moon { display: none; }
   flex-direction: column;
   gap: 16px;
   overflow-y: auto;
+  overflow-x: hidden;
   transform: scale(0.96);
   transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 }

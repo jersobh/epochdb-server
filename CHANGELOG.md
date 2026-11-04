@@ -2,6 +2,26 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.13.0] - 2026-10-22
+### Added
+- **`GET /stats?probe=1`**: Lightweight shard metrics (CPU/RAM/disk + last-known counts) that never open the DB or run embeddings. Coordinator `poll_shards_loop` uses this so health polls stay green under MiniLM load.
+- **`DEFAULT_TENANT` / `DEFAULT_NAMESPACE`**: Optional shard boot pre-warm of an app partition (e.g. Percepta `global`/`default`) so the first request does not cold-load a second MiniLM instance.
+- **`COORDINATOR_GRAPH_TIMEOUT`** (default `25s`): Bound entity-graph fan-out separately from the 120s write path; partial graphs report `partial` + `failed_shards`.
+- **`GRAPH_HUB_CONCURRENCY`**: Bounded parallel hub BFS for cluster-wide graphs (default hub limit lowered to 12).
+- **Entity type registry** (`src/type_registry.py`): Apps can predefine or create types via `GET/POST /entity_types`, `PUT /entity_types/seed`, `DELETE /entity_types/{id}` (per tenant/namespace). Persisted under `TYPE_REGISTRY_DIR` / `STORAGE_DIR`.
+- **Type auto-discovery** (`src/type_discovery.py`): Open-vocab types from stored `is_a` / type triples (engine API or hot-tier scan). Merged with registered types in `/discovered_types` and `/entity_types`.
+- **Suggested seed catalog** (`src/ontology.py`): Optional ~22-type seed (`person`, `organization`, `product`, …) via `use_default_seed` or app-supplied lists — not a hard clamp on discovery.
+### Changed
+- **Coordinator `GET /stats`**: Serves from `SHARD_METRICS_CACHE` when populated (same philosophy as `/healthz`); live fan-out uses probe mode with a short timeout.
+- **Gunicorn timeout** default raised to `180s` via `GUNICORN_TIMEOUT` (workers remain `1` — EpochDB `FileLock` is exclusive per `/data`).
+- **Studio type legend**: Uses registered ∪ discovered types; `holds_role` no longer invents types from job titles; sentence/colon junk → `entity` (hidden by default).
+- **Overview `/entity_graph`**: Cheap KG neighbor walk (no hub×BFS) plus `typed_nodes` from id heuristics (`person_*` → person).
+### Fixed
+- **Coordinator `/import` false success on replica failure (#41)**: Inspect replica group responses during coordinator `/import` instead of discarding gather results and unconditionally reporting success. Items are counted only when replica writes succeed according to consistency requirements (at least one or quorum); failed items are recorded under `failed` and `errors`, returning accurate imported counts and error details to eliminate silent data loss.
+- **Empty entity-graph error logs**: Failures now use `format_shard_error()` so `ReadTimeout('')` is visible.
+- **Worker SIGABRT under load**: Background stats probes no longer compete with embeds for the single worker’s DB/event loop, reducing gunicorn `WORKER TIMEOUT` kills and WAL replay storms.
+- **Studio empty graph under MiniLM load**: Hub BFS overview wedged `workers=1` shards; replaced with index walk.
+
 ## [0.12.0] - 2026-10-21
 ### Added
 - **Core Engine Upgrade**: Requires `epochdb >= 1.12.0` for open-vocab type discovery and typed entity graphs.
@@ -13,6 +33,9 @@ All notable changes to the EpochDB Distributed Server project will be documented
 - **Studio tenant headers**: Client sends `X-Tenant` (and legacy `X-Tenant-ID`) to match server auth.
 - **Compose / `.env.example`**: Document `EPOCHDB_EXTRACTION_MODEL=local`; remove `GEMINI_API_KEY` from shard compose env.
 ### Fixed
+- **Coordinator `/entity_graph?entity_id=` latency**: Replaced hop×frontier×shard depth-1 BFS with a single fan-out per shard at full depth (shards BFS locally). Cuts person-graph load from tens of seconds to one round-trip under embed load.
+- **Coordinator `/healthz` under embed load**: Uses the background shard metrics cache instead of a live 2s fan-out probe (configurable `COORDINATOR_HEALTHZ_TIMEOUT` only for uncached shards). Prevents Docker/compose health flaps when single-worker shards are CPU-bound on MiniLM.
+- **Compose networking**: Explicit shared network + `depends_on: service_healthy` so the coordinator only starts after shards are reachable as `shard0`/`shard1`/`shard2` (avoids `No address associated with hostname` and cold-start probe timeouts while the embedding model loads). Healthcheck `start_period` raised to 90s for first-boot model download.
 - **Seed Sample disabled** in Explorer dock so Percepta / Studio does not auto-load demo graphs.
 
 ## [0.11.0] - 2026-10-13

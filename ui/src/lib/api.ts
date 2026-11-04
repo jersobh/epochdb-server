@@ -108,6 +108,25 @@ export async function fetchStats(): Promise<ClusterStats> {
   return apiRequest('/stats');
 }
 
+export type EntityTypesPayload = {
+  types?: string[];
+  registered?: { id: string; label?: string }[];
+  discovered?: string[];
+  registered_ids?: string[];
+};
+
+export async function fetchEntityTypes(): Promise<EntityTypesPayload> {
+  try {
+    return await apiRequest<EntityTypesPayload>('/entity_types');
+  } catch {
+    try {
+      return await apiRequest<EntityTypesPayload>('/discovered_types');
+    } catch {
+      return { types: [], registered: [], discovered: [] };
+    }
+  }
+}
+
 export async function fetchSkills(): Promise<SkillItem[]> {
   const res = await apiRequest<{ skills?: SkillItem[] }>('/skills');
   return res.skills || [];
@@ -136,6 +155,13 @@ export async function rememberSkill(payload: {
   steps: Array<{ step: number; action: string }>;
 }) {
   return apiRequest('/skills/remember', 'POST', payload);
+}
+
+export async function rememberProfile(userId: string, factText: string) {
+  return apiRequest('/profiles/remember', 'POST', {
+    user_id: userId,
+    fact_text: factText,
+  });
 }
 
 export async function exportData(dataType = 'all'): Promise<ExportBundle> {
