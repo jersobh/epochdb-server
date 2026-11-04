@@ -2,6 +2,13 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.13.1] - 2026-11-04
+### Fixed
+- **Coordinator & Shard Stats Memory Count Reporting**: Fixed an issue where coordinator `GET /stats` returned `memory_count == 0` due to `_LAST_SHARD_DB_STATS` remaining 0 on shards and coordinator serving stale polling cache on live requests.
+  - Implemented `get_shard_db_stats()` to dynamically snapshot live atom counts directly from in-memory tier metadata (`hot_tier.atoms` and `cold_tier.get_total_atoms()`) with zero model latency or lock contention.
+  - Ensured coordinator live `/stats` requests (when `probe=False`) query shards directly and dynamically update `SHARD_METRICS_CACHE` with fresh metrics while preserving cached responses for health probes (`probe=True`).
+  - Improved coordinator replica group aggregation with an `accounted_groups` accumulator so surviving replicas properly report cluster statistics even during single-shard outages.
+
 ## [0.13.0] - 2026-10-22
 ### Added
 - **`GET /stats?probe=1`**: Lightweight shard metrics (CPU/RAM/disk + last-known counts) that never open the DB or run embeddings. Coordinator `poll_shards_loop` uses this so health polls stay green under MiniLM load.
