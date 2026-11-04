@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""
+Seed rich, coherent knowledge graph dataset tracking inventors, Turing Award
+laureates, computer scientists, operating systems, modern technology, and user profiles
+(Nikola Tesla, Linus Torvalds, Elon Musk, Tesla Inc, SpaceX, Alan Turing, Ada Lovelace,
+Geoffrey Hinton, Yann LeCun, Yoshua Bengio, Donald Knuth, Barbara Liskov, Edsger Dijkstra, etc.).
+"""
+import urllib.request
+import json
+import sys
+
+API_KEY = "test-api-key-12345"
+BASE_URL = "http://localhost:8080"
+
+DOMAINS = [
+    {
+        "name": "Inventors & Electrical Pioneers",
+        "triples": [
+            ["Nikola Tesla", "invented", "AC Induction Motor"],
+            ["Nikola Tesla", "invented", "Tesla Coil"],
+            ["Nikola Tesla", "discovered", "Rotating Magnetic Field"],
+            ["Nikola Tesla", "designed", "Niagara Falls Power Plant"],
+            ["Nikola Tesla", "rival_of", "Thomas Edison"],
+            ["Nikola Tesla", "collaborated_with", "George Westinghouse"],
+            ["Thomas Edison", "invented", "Incandescent Light Bulb"],
+            ["Thomas Edison", "invented", "Phonograph"],
+            ["Thomas Edison", "founded", "General Electric"],
+            ["George Westinghouse", "founded", "Westinghouse Electric"],
+            ["Westinghouse Electric", "built", "Niagara Falls Power Plant"],
+            ["Westinghouse Electric", "commercialized", "AC Induction Motor"],
+            ["AC Induction Motor", "powers", "Modern Power Grid"],
+            ["General Electric", "competes_with", "Westinghouse Electric"],
+        ],
+    },
+    {
+        "name": "Computer Science Pioneers & Foundations",
+        "triples": [
+            ["Ada Lovelace", "wrote_first_algorithm_for", "Analytical Engine"],
+            ["Ada Lovelace", "collaborated_with", "Charles Babbage"],
+            ["Charles Babbage", "designed", "Analytical Engine"],
+            ["Charles Babbage", "designed", "Difference Engine"],
+            ["Alan Turing", "created", "Turing Machine"],
+            ["Alan Turing", "cracked", "Enigma Machine"],
+            ["Alan Turing", "authored", "Computing Machinery and Intelligence"],
+            ["Alan Turing", "worked_at", "Bletchley Park"],
+            ["Turing Award", "named_after", "Alan Turing"],
+            ["John von Neumann", "designed", "Von Neumann Architecture"],
+            ["John von Neumann", "collaborated_with", "Alan Turing"],
+            ["John von Neumann", "worked_at", "Princeton University"],
+            ["Albert Einstein", "worked_at", "Princeton University"],
+            ["Albert Einstein", "collaborated_with", "John von Neumann"],
+            ["Albert Einstein", "developed", "Theory of Relativity"],
+            ["Claude Shannon", "formulated", "Information Theory"],
+            ["Claude Shannon", "worked_at", "Bell Labs"],
+        ],
+    },
+    {
+        "name": "Turing Award Laureates & Algorithms",
+        "triples": [
+            ["Geoffrey Hinton", "won", "Turing Award"],
+            ["Yann LeCun", "won", "Turing Award"],
+            ["Yoshua Bengio", "won", "Turing Award"],
+            ["Dennis Ritchie", "won", "Turing Award"],
+            ["Ken Thompson", "won", "Turing Award"],
+            ["Tim Berners-Lee", "won", "Turing Award"],
+            ["Donald Knuth", "won", "Turing Award"],
+            ["Barbara Liskov", "won", "Turing Award"],
+            ["Edsger Dijkstra", "won", "Turing Award"],
+            ["Leslie Lamport", "won", "Turing Award"],
+            ["Vint Cerf", "won", "Turing Award"],
+            ["Bob Kahn", "won", "Turing Award"],
+            ["John McCarthy", "won", "Turing Award"],
+            ["Marvin Minsky", "won", "Turing Award"],
+            ["Alan Kay", "won", "Turing Award"],
+            ["Yann LeCun", "pioneered", "Convolutional Neural Networks"],
+            ["Yann LeCun", "collaborated_with", "Geoffrey Hinton"],
+            ["Yann LeCun", "collaborated_with", "Yoshua Bengio"],
+            ["Yoshua Bengio", "collaborated_with", "Geoffrey Hinton"],
+            ["Yoshua Bengio", "pioneered", "Deep Learning"],
+            ["Donald Knuth", "authored", "The Art of Computer Programming"],
+            ["Donald Knuth", "created", "TeX Typesetting System"],
+            ["Donald Knuth", "worked_at", "Stanford University"],
+            ["Barbara Liskov", "formulated", "Liskov Substitution Principle"],
+            ["Barbara Liskov", "created", "CLU Programming Language"],
+            ["Barbara Liskov", "worked_at", "Massachusetts Institute of Technology"],
+            ["Edsger Dijkstra", "formulated", "Dijkstra Shortest Path Algorithm"],
+            ["Edsger Dijkstra", "pioneered", "Structured Programming"],
+            ["Leslie Lamport", "formulated", "Paxos Consensus Algorithm"],
+            ["Leslie Lamport", "created", "LaTeX Document System"],
+            ["Paxos Consensus Algorithm", "enables", "Distributed Databases"],
+            ["Vint Cerf", "designed", "TCP/IP Protocol Suite"],
+            ["Bob Kahn", "designed", "TCP/IP Protocol Suite"],
+            ["TCP/IP Protocol Suite", "powers", "Internet Backbone"],
+            ["John McCarthy", "created", "Lisp Programming Language"],
+            ["John McCarthy", "pioneered", "Artificial Intelligence"],
+            ["John McCarthy", "worked_at", "Stanford University"],
+            ["Marvin Minsky", "co_founded", "MIT AI Lab"],
+            ["Marvin Minsky", "authored", "Perceptrons"],
+            ["Marvin Minsky", "collaborated_with", "John McCarthy"],
+            ["Alan Kay", "pioneered", "Object-Oriented Programming"],
+            ["Alan Kay", "created", "Smalltalk Programming Language"],
+            ["Alan Kay", "worked_at", "Xerox PARC"],
+        ],
+    },
+    {
+        "name": "Operating Systems, Languages & The Web",
+        "triples": [
+            ["Dennis Ritchie", "created", "C Programming Language"],
+            ["Dennis Ritchie", "created", "Unix Operating System"],
+            ["Dennis Ritchie", "worked_at", "Bell Labs"],
+            ["Dennis Ritchie", "collaborated_with", "Ken Thompson"],
+            ["Ken Thompson", "created", "Unix Operating System"],
+            ["Ken Thompson", "created", "Go Programming Language"],
+            ["Ken Thompson", "worked_at", "Bell Labs"],
+            ["Linus Torvalds", "created", "Linux Kernel"],
+            ["Linus Torvalds", "created", "Git Version Control"],
+            ["Linus Torvalds", "fellow_at", "Linux Foundation"],
+            ["Linux Foundation", "supports", "Linux Kernel"],
+            ["Linux Foundation", "supports", "Kubernetes"],
+            ["Git Version Control", "manages", "Linux Kernel"],
+            ["Tim Berners-Lee", "invented", "World Wide Web"],
+            ["Tim Berners-Lee", "created", "HTTP Protocol"],
+            ["Tim Berners-Lee", "worked_at", "CERN"],
+            ["World Wide Web", "runs_on", "HTTP Protocol"],
+            ["World Wide Web", "runs_on", "Internet Backbone"],
+            ["Dijkstra Shortest Path Algorithm", "powers", "Internet Backbone"],
+        ],
+    },
+    {
+        "name": "Modern Tech & Electric Mobility (Tesla & Space)",
+        "triples": [
+            ["Elon Musk", "ceo_of", "Tesla Inc"],
+            ["Elon Musk", "ceo_of", "SpaceX"],
+            ["Elon Musk", "co_founded", "OpenAI"],
+            ["Elon Musk", "co_founded", "Neuralink"],
+            ["Tesla Inc", "named_after", "Nikola Tesla"],
+            ["Tesla Inc", "led_by", "Elon Musk"],
+            ["Tesla Inc", "produces", "Tesla Model S"],
+            ["Tesla Inc", "produces", "Tesla Cybertruck"],
+            ["Tesla Inc", "produces", "Tesla Semi"],
+            ["Tesla Inc", "uses", "AC Induction Motor"],
+            ["Tesla Semi", "uses", "AC Induction Motor"],
+            ["Tesla Inc", "manufactures", "Megapack Energy Storage"],
+            ["Tesla Inc", "develops", "Tesla Full Self-Driving"],
+            ["SpaceX", "founded_by", "Elon Musk"],
+            ["SpaceX", "produces", "Falcon 9 Rocket"],
+            ["SpaceX", "produces", "Starship Spacecraft"],
+            ["SpaceX", "develops", "Raptor Rocket Engine"],
+            ["Starship Spacecraft", "powered_by", "Raptor Rocket Engine"],
+            ["Falcon 9 Rocket", "launches", "Starlink Satellite Network"],
+            ["SpaceX", "operates", "Starlink Satellite Network"],
+            ["SpaceX", "runs_on", "Linux Kernel"],
+            ["Starlink Satellite Network", "provides", "Satellite Broadband Internet"],
+            ["Satellite Broadband Internet", "connects_to", "World Wide Web"],
+        ],
+    },
+    {
+        "name": "AI & Modern Systems",
+        "triples": [
+            ["Geoffrey Hinton", "pioneered", "Deep Learning"],
+            ["Geoffrey Hinton", "mentored", "Ilya Sutskever"],
+            ["Ilya Sutskever", "co_founded", "OpenAI"],
+            ["OpenAI", "produces", "GPT-4 LLM"],
+            ["OpenAI", "runs_on", "Linux Kernel"],
+            ["OpenAI", "implements", "Deep Learning"],
+            ["Tesla Full Self-Driving", "implements", "Deep Learning"],
+            ["Convolutional Neural Networks", "enables", "Tesla Full Self-Driving"],
+            ["GPT-4 LLM", "implements", "Transformer Architecture"],
+            ["Google", "invented", "Transformer Architecture"],
+            ["Google", "created", "Kubernetes"],
+            ["Kubernetes", "runs_on", "Linux Kernel"],
+            ["Distributed Databases", "supports", "Kubernetes"],
+        ],
+    },
+]
+
+SKILLS = [
+    {
+        "skill_name": "git_feature_branch_workflow",
+        "description": "Standard Git branching and integration workflow for distributed engineering teams.",
+        "steps": [
+            {"step": 1, "action": "Create new topic branch from main"},
+            {"step": 2, "action": "Commit atomic changes with semantic message"},
+            {"step": 3, "action": "Rebase against origin main to resolve conflicts"},
+            {"step": 4, "action": "Push branch and open pull request with test coverage"},
+        ],
+    },
+    {
+        "skill_name": "build_linux_custom_kernel",
+        "description": "Build and install an optimized Linux kernel tailored for production workloads.",
+        "steps": [
+            {"step": 1, "action": "Clone Linux Kernel source tree from git repository"},
+            {"step": 2, "action": "Configure kernel modules and security settings via make menuconfig"},
+            {"step": 3, "action": "Compile kernel bzImage and loadable modules with parallel jobs"},
+            {"step": 4, "action": "Install modules to lib directory and update GRUB bootloader configuration"},
+        ],
+    },
+]
+
+PROFILES = [
+    {
+        "user_id": "nikola_tesla",
+        "facts": [
+            "Prefers alternating current polyphase power distribution systems over direct current.",
+            "Envisions wireless energy transmission through high-frequency terrestrial resonant waves.",
+            "Conducts high-voltage experimentations with resonant transformer circuits and wireless lighting.",
+        ],
+    },
+    {
+        "user_id": "linus_torvalds",
+        "facts": [
+            "Maintains the Linux kernel mainline tree using git-merge workflows and rigorous email reviews.",
+            "Prefers monolithic kernel architectures with zero bloat and strict C coding guidelines.",
+            "Advocates for never breaking user space backwards compatibility in Linux system call ABI.",
+        ],
+    },
+    {
+        "user_id": "elon_musk",
+        "facts": [
+            "Prioritizes first-principles engineering and vertical integration in aerospace and automotive manufacturing.",
+            "Prefers stainless steel 30X alloy construction for rapid iterative Starship development cycles.",
+            "Drives aggressive automation and real-time end-to-end visual neural networks for full self-driving.",
+        ],
+    },
+    {
+        "user_id": "alan_turing",
+        "facts": [
+            "Pioneers universal computation models and formal algorithmic state machine transitions.",
+            "Specializes in electromechanical cryptanalysis of rotor-cipher enigma communication systems.",
+            "Formulates behavioral imitation test criteria for machine intelligence and decision problems.",
+        ],
+    },
+    {
+        "user_id": "ada_lovelace",
+        "facts": [
+            "Formulates mathematical step sequences for calculating Bernoulli numbers on mechanical computing engines.",
+            "Envisions computational engines composing elaborate scientific, mathematical, and musical pieces.",
+        ],
+    },
+    {
+        "user_id": "yann_lecun",
+        "facts": [
+            "Advocates for self-supervised world models and open-source foundation architectures over pure next-token prediction.",
+            "Pioneered convolutional networks for spatial feature hierarchies and gradient-based computer vision.",
+        ],
+    },
+    {
+        "user_id": "donald_knuth",
+        "facts": [
+            "Maintains The Art of Computer Programming multi-volume monograph on analysis of fundamental algorithms.",
+            "Implemented the TeX digital typesetting system and METAFONT font design engine in literate programming.",
+        ],
+    },
+    {
+        "user_id": "barbara_liskov",
+        "facts": [
+            "Formulated behavioral subtyping (the Liskov Substitution Principle) for robust object-oriented software engineering.",
+            "Pioneered abstract data types, distributed state-machine replication, and practical Byzantine fault tolerance.",
+        ],
+    },
+]
+
+def post_json(path: str, data: dict, tenant: str = None, namespace: str = None):
+    url = f"{BASE_URL}{path}"
+    headers = {
+        "X-API-Key": API_KEY,
+        "Content-Type": "application/json",
+    }
+    if tenant:
+        headers["X-Tenant"] = tenant
+        headers["X-Tenant-ID"] = tenant
+    if namespace:
+        headers["X-Namespace"] = namespace
+
+    body = json.dumps(data).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8")
+
+def seed_scope(tenant: str = None, namespace: str = None):
+    scope_label = f"tenant={tenant or 'root'}, ns={namespace or 'root'}"
+    print(f"\n--- Seeding scope: {scope_label} ---")
+    
+    triple_count = 0
+    for domain in DOMAINS:
+        print(f"Domain: {domain['name']} ({len(domain['triples'])} triples)")
+        for s, p, o in domain["triples"]:
+            text = f"{s} {p.replace('_', ' ')} {o}."
+            payload = {
+                "text": text,
+                "triples": [[s, p, o]],
+            }
+            code, resp = post_json("/remember", payload, tenant=tenant, namespace=namespace)
+            if code not in (200, 201):
+                print(f"  FAILED [{code}] {s} -{p}-> {o}: {resp}")
+            else:
+                triple_count += 1
+
+    print(f"Stored {triple_count} relational memories.")
+
+    # Seed Skills
+    for skill in SKILLS:
+        code, resp = post_json("/skills/remember", skill, tenant=tenant, namespace=namespace)
+        if code not in (200, 201):
+            print(f"  FAILED skill [{code}] {skill['skill_name']}: {resp}")
+        else:
+            print(f"  Stored skill: {skill['skill_name']}")
+
+    # Seed Profiles
+    profile_fact_count = 0
+    for prof in PROFILES:
+        user_id = prof["user_id"]
+        for fact in prof["facts"]:
+            code, resp = post_json("/profiles/remember", {"user_id": user_id, "fact_text": fact}, tenant=tenant, namespace=namespace)
+            if code not in (200, 201):
+                print(f"  FAILED profile [{code}] {user_id}: {resp}")
+            else:
+                profile_fact_count += 1
+    print(f"Stored {profile_fact_count} profile facts across {len(PROFILES)} profiles.")
+
+def main():
+    print("Resetting global/default partition...")
+    post_json("/admin/reset", {"tenant": "global", "namespace": "default"})
+    
+    seed_scope("global", "default")
+    seed_scope(None, None)
+    print("\n✓ Seeding complete.")
+
+if __name__ == "__main__":
+    main()

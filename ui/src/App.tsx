@@ -16,6 +16,7 @@ import {
   edgeTarget,
   normPred,
   TYPE_STYLES,
+  sortTypeLegend,
   typeColor,
   type NodeType,
 } from './lib/graph';
@@ -23,6 +24,7 @@ import {
   connectSSE,
   ensureDefaultToken,
   fetchEntityGraph,
+  fetchEntityTypes,
   fetchHealthz,
   fetchSkills,
   fetchStats,
@@ -50,7 +52,8 @@ export default function App() {
   const [rawEdges, setRawEdges] = useState<RawEdge[]>([]);
   const [nodeTypes, setNodeTypes] = useState<Record<string, NodeType>>({});
   const [degrees, setDegrees] = useState<Record<string, number>>({});
-  const [disabledTypes, setDisabledTypes] = useState<Set<string>>(new Set());
+  // All entity types enabled by default.
+  const [disabledTypes, setDisabledTypes] = useState<Set<string>>(() => new Set());
   const [knownEntities, setKnownEntities] = useState<Map<string, EntityMeta>>(new Map());
   const [knownPredicates, setKnownPredicates] = useState<string[]>([]);
 
@@ -63,6 +66,8 @@ export default function App() {
 
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [stats, setStats] = useState<ClusterStats | null>(null);
+  const knownTypeSetRef = useRef<Set<string>>(new Set());
+  const serverNodeTypesRef = useRef<Record<string, string>>({});
 
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [inspectNodeId, setInspectNodeId] = useState<string | null>(null);
@@ -104,9 +109,11 @@ export default function App() {
 
   const loadSkills = useCallback(async () => {
     try {
-      setSkills(await fetchSkills());
+      const sk = await fetchSkills();
+      setSkills(sk);
+      return sk;
     } catch {
-      /* ignore */
+      return [];
     }
   }, []);
 
@@ -114,13 +121,30 @@ export default function App() {
     try {
       const s = await fetchStats();
       setStats(s);
+      return s;
     } catch {
-      /* ignore */
+      return null;
+    }
+  }, []);
+
+  const loadEntityTypes = useCallback(async () => {
+    try {
+      const payload = await fetchEntityTypes();
+      const ids = new Set<string>([
+        ...(payload.types || []),
+        ...(payload.discovered || []),
+        ...(payload.registered_ids || []),
+        ...(payload.registered || []).map((t) => t.id),
+      ]);
+      knownTypeSetRef.current = ids;
+      return ids;
+    } catch {
+      return new Set<string>();
     }
   }, []);
 
   const loadGraph = useCallback(
-    async (entityFilter?: string, depthOverride?: number) => {
+    async (entityFilter?: string, depthOverride?: number, overrideSkillNames?: Set<string>) => {
       setLoading(true);
       try {
         const filter = (entityFilter ?? filterValue).trim();
@@ -128,7 +152,32 @@ export default function App() {
         const data = await fetchEntityGraph(filter || undefined, d);
         const names = data.nodes || [];
         const edges = data.edges || [];
-        const types = classifyNodes(names, edges, skillNameSet);
+        const activeSkills = overrideSkillNames ?? skillNameSet;
+
+        const serverTypes: Record<string, string> = {};
+        if (data.node_types) {
+          Object.entries(data.node_types).forEach(([k, v]) => {
+            if (v && v.length > 0 && v[0]) {
+              serverTypes[k] = v[0];
+            }
+          });
+        }
+        if (data.typed_nodes) {
+          data.typed_nodes.forEach((tn) => {
+            if (tn.id && (tn.type || (tn.types && tn.types[0]))) {
+              serverTypes[tn.id] = (tn.type || tn.types![0])!;
+            }
+          });
+        }
+        serverNodeTypesRef.current = serverTypes;
+
+        const types = classifyNodes(
+          names,
+          edges,
+          activeSkills,
+          knownTypeSetRef.current,
+          serverTypes
+        );
         const degs = computeDegrees(names, edges);
         const preds = new Set<string>(knownPredicatesRef.current);
         edges.forEach((e) => {
@@ -143,6 +192,14 @@ export default function App() {
         setNodeTypes(types);
         setDegrees(degs);
         setKnownPredicates(predList);
+
+        setInspectNodeId((curr) => {
+          if (curr && !names.includes(curr)) {
+            setInspectorOpen(false);
+            return null;
+          }
+          return curr;
+        });
 
         setKnownEntities((prev) => {
           const next = filter ? new Map(prev) : new Map<string, EntityMeta>();
@@ -168,13 +225,21 @@ export default function App() {
       const health = await fetchHealthz();
       setClusterModeLabel(health.mode === 'coordinator' ? 'Coordinator Gateway' : 'Shard Node');
       setShardMode(health.mode === 'shard');
-      await loadStatsData();
-      await loadSkills();
-      await loadGraph();
+      const [, loadedSkills] = await Promise.all([
+        loadStatsData(),
+        loadSkills(),
+        loadEntityTypes(),
+      ]);
+      const initialSkillSet = new Set(
+        (loadedSkills || []).map((s) =>
+          String(s.skill_name || s.metadata?.skill_name || s.id || '').toLowerCase()
+        )
+      );
+      await loadGraph(undefined, undefined, initialSkillSet);
     } catch (e) {
       console.error('Init failure:', e);
     }
-  }, [loadGraph, loadSkills, loadStatsData]);
+  }, [loadGraph, loadSkills, loadStatsData, loadEntityTypes]);
 
   useEffect(() => {
     void initApp();
@@ -189,6 +254,26 @@ export default function App() {
     return () => es.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (rawNodes.length === 0) return;
+    const types = classifyNodes(
+      rawNodes,
+      rawEdges,
+      skillNameSet,
+      knownTypeSetRef.current,
+      serverNodeTypesRef.current
+    );
+    setNodeTypes(types);
+    setKnownEntities((prev) => {
+      const next = new Map(prev);
+      rawNodes.forEach((n) => {
+        const existing = next.get(n);
+        next.set(n, { type: types[n], degree: existing?.degree || 0 });
+      });
+      return next;
+    });
+  }, [skillNameSet]);
 
   const visibleNodes = useMemo(
     () => rawNodes.filter((n) => !disabledTypes.has(nodeTypes[n] || 'concept')),
@@ -471,9 +556,7 @@ export default function App() {
 
         <div className="bottom-legend-bar">
           <div className="legend-chips">
-            {Object.keys(legendCounts)
-              .sort()
-              .map((t) => {
+            {sortTypeLegend(Object.keys(legendCounts)).map((t) => {
                 const st = TYPE_STYLES[t as NodeType];
                 const isOff = disabledTypes.has(t);
                 const radius =

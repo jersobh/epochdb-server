@@ -1,7 +1,13 @@
+networks:
+  epochdb:
+    name: epochdb-server_default
+
 services:
   shard0:
     build: .
-    container_name: epochdb-shard0-test
+    container_name: epochdb-shard0
+    networks:
+      - epochdb
     ports:
       - "8081:8080"
     environment:
@@ -20,12 +26,15 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 5s
       timeout: 3s
-      retries: 10
-      start_period: 15s
+      retries: 24
+      # First boot may download/load the embedding model (~30–90s).
+      start_period: 90s
 
   shard1:
     build: .
-    container_name: epochdb-shard1-test
+    container_name: epochdb-shard1
+    networks:
+      - epochdb
     ports:
       - "8082:8080"
     environment:
@@ -44,12 +53,14 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 5s
       timeout: 3s
-      retries: 10
-      start_period: 15s
+      retries: 24
+      start_period: 90s
 
   shard2:
     build: .
-    container_name: epochdb-shard2-test
+    container_name: epochdb-shard2
+    networks:
+      - epochdb
     ports:
       - "8083:8080"
     environment:
@@ -68,12 +79,14 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 5s
       timeout: 3s
-      retries: 10
-      start_period: 15s
+      retries: 24
+      start_period: 90s
 
   coordinator:
     build: .
-    container_name: epochdb-coordinator-test
+    container_name: epochdb-coordinator
+    networks:
+      - epochdb
     ports:
       - "8080:8080"
     environment:
@@ -84,15 +97,18 @@ services:
     volumes:
       - ./src:/app/src:ro
     depends_on:
-      - shard0
-      - shard1
-      - shard2
+      shard0:
+        condition: service_healthy
+      shard1:
+        condition: service_healthy
+      shard2:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
       interval: 5s
       timeout: 3s
-      retries: 10
-      start_period: 20s
+      retries: 12
+      start_period: 30s
 
 volumes:
   shard0_data:

@@ -1,57 +1,57 @@
-export type NodeType = string;
+import {
+  ENTITY_TYPE_LABELS,
+  ENTITY_TYPES,
+  PRED_ROLES,
+  TYPE_DEFINING_PREDICATES,
+  inferTypeFromName,
+  normalizeType,
+  type NodeType,
+} from './ontology';
 
-// Base styles for standard types, while fully supporting any dynamically discovered type
+export type { NodeType } from './ontology';
+export { ENTITY_TYPES, ENTITY_TYPE_LABELS, PRED_ROLES, normalizeType } from './ontology';
+
+// Base styles for closed ontology types (+ entity fallback)
 export const BASE_TYPE_STYLES: Record<string, { label: string; light: string; dark: string; shape: string }> = {
   person: { label: 'Person', light: '#2563EB', dark: '#60A5FA', shape: 'dot' },
   organization: { label: 'Organization', light: '#7C3AED', dark: '#A78BFA', shape: 'square' },
-  company: { label: 'Company', light: '#4F46E5', dark: '#818CF8', shape: 'square' },
+  role: { label: 'Role', light: '#0284C7', dark: '#38BDF8', shape: 'dot' },
+  agent: { label: 'Agent', light: '#0D9488', dark: '#2DD4BF', shape: 'hexagon' },
+  product: { label: 'Product', light: '#C026D3', dark: '#E879F9', shape: 'box' },
+  service: { label: 'Service', light: '#9333EA', dark: '#C084FC', shape: 'box' },
+  feature: { label: 'Feature', light: '#A21CAF', dark: '#F0ABFC', shape: 'diamond' },
+  artifact: { label: 'Artifact', light: '#D97706', dark: '#FBBF24', shape: 'diamond' },
+  system: { label: 'System', light: '#0891B2', dark: '#22D3EE', shape: 'hexagon' },
+  dataset: { label: 'Dataset', light: '#0E7490', dark: '#67E8F9', shape: 'box' },
   place: { label: 'Place', light: '#059669', dark: '#34D399', shape: 'triangle' },
-  system: { label: 'System / Tech', light: '#0891B2', dark: '#22D3EE', shape: 'hexagon' },
-  artifact: { label: 'Invention / Work', light: '#D97706', dark: '#FBBF24', shape: 'diamond' },
-  event: { label: 'Event / Award', light: '#E11D48', dark: '#FB7185', shape: 'star' },
+  event: { label: 'Event', light: '#E11D48', dark: '#FB7185', shape: 'star' },
+  market: { label: 'Market', light: '#CA8A04', dark: '#FACC15', shape: 'triangle' },
+  channel: { label: 'Channel', light: '#4F46E5', dark: '#818CF8', shape: 'ellipse' },
+  campaign: { label: 'Campaign', light: '#DB2777', dark: '#F472B6', shape: 'star' },
   concept: { label: 'Concept', light: '#64748B', dark: '#94A3B8', shape: 'dot' },
-  entity: { label: 'Entity', light: '#475569', dark: '#94A3B8', shape: 'dot' },
   skill: { label: 'Skill', light: '#DB2777', dark: '#F472B6', shape: 'box' },
-  rule: { label: 'Rule', light: '#CA8A04', dark: '#FACC15', shape: 'triangleDown' },
-  step: { label: 'Step', light: '#78716C', dark: '#A8A29E', shape: 'ellipse' },
-  lead: { label: 'Lead', light: '#0284C7', dark: '#38BDF8', shape: 'dot' },
-  stakeholder: { label: 'Stakeholder', light: '#10B981', dark: '#34D399', shape: 'dot' },
-  champion: { label: 'Champion', light: '#059669', dark: '#10B981', shape: 'star' },
-  economic_buyer: { label: 'Economic Buyer', light: '#6366F1', dark: '#818CF8', shape: 'square' },
-  technical_gatekeeper: { label: 'Technical Gatekeeper', light: '#D97706', dark: '#FBBF24', shape: 'diamond' },
+  process: { label: 'Process', light: '#78716C', dark: '#A8A29E', shape: 'ellipse' },
+  metric: { label: 'Metric', light: '#EA580C', dark: '#FB923C', shape: 'triangleDown' },
+  evidence: { label: 'Evidence', light: '#16A34A', dark: '#4ADE80', shape: 'dot' },
+  hypothesis: { label: 'Hypothesis', light: '#B45309', dark: '#FBBF24', shape: 'diamond' },
+  session: { label: 'Session', light: '#475569', dark: '#94A3B8', shape: 'ellipse' },
+  entity: { label: 'Entity', light: '#475569', dark: '#94A3B8', shape: 'dot' },
 };
 
-// Generates dynamic type style for ANY discovered type on-the-fly
 export function getTypeStyle(type: string | undefined): { label: string; light: string; dark: string; shape: string } {
-  const t = (type || 'entity').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  const t = normalizeType(type, 'entity');
   if (BASE_TYPE_STYLES[t]) {
     return BASE_TYPE_STYLES[t];
   }
-
-  // Format human-readable title
-  const label = (type || 'Entity')
-    .replace(/[_-]/g, ' ')
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-
-  // Deterministic 32-bit hash for consistent palette across sessions
-  let hash = 0;
-  for (let i = 0; i < t.length; i++) {
-    hash = (hash << 5) - hash + t.charCodeAt(i);
-    hash |= 0;
-  }
-  const hue = Math.abs(hash) % 360;
-  const shapes = ['dot', 'square', 'triangle', 'hexagon', 'diamond', 'star', 'box', 'ellipse'];
-  const shape = shapes[Math.abs(hash >> 3) % shapes.length];
-
+  const label = ENTITY_TYPE_LABELS[t] || (type || 'Entity');
   return {
     label,
-    light: `hsl(${hue}, 70%, 42%)`,
-    dark: `hsl(${hue}, 80%, 65%)`,
-    shape,
+    light: '#475569',
+    dark: '#94A3B8',
+    shape: 'dot',
   };
 }
 
-// Transparent Proxy so TYPE_STYLES[anyType] always resolves dynamically
 export const TYPE_STYLES: Record<string, { label: string; light: string; dark: string; shape: string }> = new Proxy(
   BASE_TYPE_STYLES,
   {
@@ -64,66 +64,22 @@ export const TYPE_STYLES: Record<string, { label: string; light: string; dark: s
   }
 );
 
-export const PRED_ROLES: Record<string, [NodeType | null, NodeType | null]> = {
-  born_in: ['person', 'place'],
-  lives_in: ['person', 'place'],
-  died_in: ['person', 'place'],
-  works_at: ['person', 'organization'],
-  employed_by: ['person', 'organization'],
-  studied_at: ['person', 'organization'],
-  member_of: ['person', 'organization'],
-  leads: ['person', 'organization'],
-  founded: ['person', 'organization'],
-  founded_by: ['organization', 'person'],
-  collaborated_with: ['person', 'person'],
-  won: ['person', 'event'],
-  wrote: ['person', 'artifact'],
-  authored: ['person', 'artifact'],
-  discovered: ['person', 'concept'],
-  pioneered: ['person', 'concept'],
-  invented: [null, 'artifact'],
-  created: [null, 'artifact'],
-  designed: [null, 'artifact'],
-  developed: [null, 'concept'],
-  created_by: ['artifact', null],
-  designed_by: ['artifact', null],
-  commercialized: ['organization', 'artifact'],
-  competes_with: ['organization', 'organization'],
-  headquartered_in: ['organization', 'place'],
-  located_in: [null, 'place'],
-  capital_of: ['place', 'place'],
-  depends_on: ['system', 'system'],
-  relies_on: ['system', 'system'],
-  runs_on: ['system', 'system'],
-  deployed_on: ['system', 'system'],
-  orchestrates: ['system', 'system'],
-  calls: ['system', 'system'],
-  monitors: ['system', 'system'],
-  visualizes: ['system', 'system'],
-  hosts: ['system', 'system'],
-  powers: [null, 'system'],
-  implements: [null, 'concept'],
-  enables: [null, 'concept'],
-  treats: ['artifact', 'concept'],
-  prevents: ['artifact', 'concept'],
-  operates_in: ['organization', 'market'],
-  has_stakeholder: ['organization', 'person'],
-  holds_role: ['person', 'role'],
-};
-
 export const DEFAULT_PREDICATES = [
-  'relies_on',
-  'depends_on',
-  'implements',
-  'part_of',
-  'located_in',
-  'won',
-  'created_by',
-  'invented',
-  'works_at',
-  'born_in',
-  'operates_in',
+  'is_a',
   'holds_role',
+  'works_at',
+  'member_of',
+  'located_in',
+  'authored',
+  'mentioned_in',
+  'participated_in',
+  'published_on',
+  'about',
+  'observed',
+  'hypothesized',
+  'works_on',
+  'uses',
+  'part_of',
 ];
 
 export interface RawEdge {
@@ -162,60 +118,88 @@ export function typeColor(type: string, dark?: boolean): string {
   return useDark ? st.dark : st.light;
 }
 
-// Predicates that explicitly designate entity type/classification in the graph
-const TYPE_DEFINING_PREDICATES = new Set([
-  'is_a',
-  'type',
-  'entity_type',
-  'has_type',
-  'category',
-  'role',
-  'holds_role',
-  'classified_as',
-  'subclass_of',
-  'instance_of',
-  'kind_of',
-]);
-
+/**
+ * Classify nodes using registered ∪ discovered types when provided.
+ * Auto-discovery from is_a triples stays open; job titles / colon junk are not types.
+ */
 export function classifyNodes(
   names: string[],
   edges: RawEdge[],
-  skillNames: Set<string>
+  skillNames: Set<string>,
+  knownTypes?: Set<string>,
+  serverTypes?: Record<string, string>
 ): Record<string, NodeType> {
   const explicitTypes: Record<string, string> = {};
   const relationalVotes: Record<string, Record<string, number>> = {};
+  const allowed = knownTypes && knownTypes.size > 0 ? knownTypes : undefined;
+
+  const accept = (raw: string | null | undefined): string | null => {
+    if (!raw) return null;
+    // Prefer alias/seed normalization, then compact open ids (auto-discover).
+    const mapped = normalizeType(raw, '');
+    if (mapped && mapped !== 'entity') return mapped;
+    const slug = String(raw)
+      .trim()
+      .toLowerCase()
+      .replace(/[\s-]+/g, '_');
+    if (slug.length <= 64 && /^[a-z][a-z0-9_]*$/.test(slug)) {
+      if (!allowed || allowed.has(slug)) return slug;
+      // New discovery not yet registered — still accept compact ids
+      return slug;
+    }
+    return null;
+  };
 
   const vote = (n: string, t: string | null) => {
-    if (!t) return;
+    if (!t || !n) return;
+    const canon = accept(t);
+    if (!canon) return;
     if (!relationalVotes[n]) relationalVotes[n] = {};
-    relationalVotes[n][t] = (relationalVotes[n][t] || 0) + 1;
+    relationalVotes[n][canon] = (relationalVotes[n][canon] || 0) + 1;
   };
+
+  if (serverTypes) {
+    Object.entries(serverTypes).forEach(([nid, stype]) => {
+      const canon = accept(stype);
+      if (canon && canon !== 'entity') {
+        explicitTypes[nid] = canon;
+      }
+    });
+  }
 
   (edges || []).forEach((e) => {
     const s = edgeSource(e);
     const t = edgeTarget(e);
     const pred = normPred(e.predicate || e.label);
 
-    // 1. Explicit ontological discovery from triples: (Entity, is_a | type | holds_role, TargetType)
-    if (TYPE_DEFINING_PREDICATES.has(pred)) {
-      if (t) {
-        explicitTypes[s] = t;
-      }
+    if (TYPE_DEFINING_PREDICATES.has(pred) && t) {
+      const mapped = accept(t);
+      if (mapped) explicitTypes[s] = mapped;
     }
 
-    // 2. Relational discovery from known predicate roles
+    if (pred === 'is_skill') {
+      explicitTypes[s] = 'skill';
+      explicitTypes[t] = 'skill';
+    } else if (pred.startsWith('has_step')) {
+      explicitTypes[s] = 'skill';
+      vote(t, 'process');
+    }
+
     const role = PRED_ROLES[pred];
     if (role) {
       if (role[0]) vote(s, role[0]);
       if (role[1]) vote(t, role[1]);
-    } else if (pred) {
-      // Dynamic relational inference
-      if (/in|at|located|headquartered/.test(pred)) {
+    } else if (pred && pred !== 'related' && pred !== 'co_occurs_with' && pred !== 'mentions') {
+      if (/^(located|headquartered)_in$/.test(pred) || pred === 'born_in' || pred === 'lives_in') {
         vote(t, 'place');
       } else if (/works|employed|leads|manages|founded/.test(pred)) {
         vote(s, 'person');
         vote(t, 'organization');
       } else if (/uses|runs|requires|depends|integrates/.test(pred)) {
+        vote(t, 'system');
+      } else if (/invented|created|designed|patented|formulated|discovered/.test(pred)) {
+        vote(s, 'person');
+      } else if (/powers|enables|supports/.test(pred)) {
         vote(t, 'system');
       }
     }
@@ -224,42 +208,32 @@ export function classifyNodes(
   const out: Record<string, NodeType> = {};
   names.forEach((n) => {
     const l = n.toLowerCase();
+    if ((/^skill:/.test(l) || skillNames.has(l)) && (!allowed || allowed.has('skill'))) {
+      out[n] = 'skill';
+      return;
+    }
 
-    // 1. Explicit type discovered in triples
     if (explicitTypes[n]) {
       out[n] = explicitTypes[n];
       return;
     }
 
-    // 2. Prefixes (e.g., skill:..., rule:..., lead:..., company:...)
-    if (/^skill:/.test(l) || skillNames.has(l)) {
-      out[n] = 'skill';
-    } else if (/^rule:/.test(l)) {
-      out[n] = 'rule';
-    } else if (/^step:/.test(l)) {
-      out[n] = 'step';
-    } else if (n.includes(':')) {
-      const prefix = n.split(':')[0].trim().toLowerCase();
-      if (prefix && prefix.length <= 16) {
-        out[n] = prefix;
-        return;
-      }
+    const fromName = inferTypeFromName(n);
+    if (fromName && (!allowed || allowed.has(fromName))) {
+      out[n] = fromName;
+      return;
     }
 
-    // 3. Relational discovery votes
-    if (!out[n] && relationalVotes[n]) {
+    if (relationalVotes[n]) {
       out[n] = Object.entries(relationalVotes[n]).sort((a, b) => b[1] - a[1])[0][0];
+      return;
     }
 
-    // 4. Default discovered general entity type
-    if (!out[n]) {
-      out[n] = 'entity';
-    }
+    out[n] = 'entity';
   });
 
   return out;
 }
-
 export function computeDegrees(names: string[], edges: RawEdge[]): Record<string, number> {
   const degs: Record<string, number> = {};
   names.forEach((n) => {
@@ -272,4 +246,17 @@ export function computeDegrees(names: string[], edges: RawEdge[]): Record<string
     if (degs[t] !== undefined) degs[t]++;
   });
   return degs;
+}
+
+/** Legend order: ontology order, then entity last if present. */
+export function sortTypeLegend(types: string[]): string[] {
+  const order = new Map<string, number>(ENTITY_TYPES.map((t, i) => [t, i]));
+  return [...types].sort((a, b) => {
+    const ia = order.has(a) ? (order.get(a) as number) : 1000;
+    const ib = order.has(b) ? (order.get(b) as number) : 1000;
+    if (a === 'entity') return 1;
+    if (b === 'entity') return -1;
+    if (ia !== ib) return ia - ib;
+    return a.localeCompare(b);
+  });
 }

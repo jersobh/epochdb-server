@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import type { SkillItem } from '../types';
 import type { NodeType, RawEdge } from '../lib/graph';
 import { TYPE_STYLES, edgeSource, edgeTarget } from '../lib/graph';
@@ -34,6 +35,26 @@ export function MemoryInspector({
       if (t === nodeId) incoming.push(`${s} → [${p}] →`);
     });
   }
+
+  const relatedSkills = useMemo(() => {
+    if (!nodeId) return [];
+    const nLow = nodeId.toLowerCase().trim();
+    return skills.filter((s) => {
+      const name = skillName(s).toLowerCase().trim();
+      if (name === nLow) return true;
+      const rawSteps = (s.steps || s.metadata?.steps || []) as Array<{ step?: number; action?: string; description?: string } | string>;
+      const stepMatch = rawSteps.some((st) => {
+        const text = typeof st === 'string' ? st : (st.action || st.description || '');
+        return text.toLowerCase().trim() === nLow;
+      });
+      if (stepMatch) return true;
+      return edges.some((e) => {
+        const src = edgeSource(e).toLowerCase().trim();
+        const tgt = edgeTarget(e).toLowerCase().trim();
+        return (src === nLow && tgt === name) || (tgt === nLow && src === name);
+      });
+    });
+  }, [nodeId, skills, edges]);
 
   const typeLabel = (TYPE_STYLES[nodeType as NodeType] || TYPE_STYLES.concept).label;
 
@@ -101,27 +122,53 @@ export function MemoryInspector({
 
           <div>
             <h3 style={{ fontSize: 12, fontWeight: 700, marginBottom: 8, color: 'var(--text-secondary)' }}>
-              Stored Procedural Skills
+              {nodeType === 'skill' ? 'Procedural Skill Definition' : 'Linked Procedural Skills'}
             </h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {skills.length === 0 ? (
+              {relatedSkills.length === 0 ? (
                 <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                  No procedural skills registered yet.
+                  No procedural skills linked to this entity.
                 </div>
               ) : (
-                skills.map((s, i) => {
+                relatedSkills.map((s, i) => {
                   const name = skillName(s);
                   const desc = String(s.description || s.metadata?.description || '');
-                  const steps = (s.steps || s.metadata?.steps || []) as unknown[];
+                  const rawSteps = (s.steps || s.metadata?.steps || []) as Array<{ step?: number; action?: string; description?: string } | string>;
                   return (
                     <div key={`${name}-${i}`} className="metric-card">
                       <div className="metric-title">
-                        <span>{name}</span>
+                        <span style={{ fontWeight: 600 }}>{name}</span>
                         <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)' }}>
-                          {steps.length} steps
+                          {rawSteps.length} steps
                         </span>
                       </div>
-                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{desc}</div>
+                      {desc && (
+                        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: rawSteps.length > 0 ? 8 : 0 }}>
+                          {desc}
+                        </div>
+                      )}
+                      {rawSteps.length > 0 && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 4 }}>
+                          {rawSteps.map((st, sIdx) => {
+                            const act = typeof st === 'string' ? st : (st.action || st.description || `Step ${sIdx + 1}`);
+                            return (
+                              <div
+                                key={sIdx}
+                                style={{
+                                  fontSize: 11,
+                                  fontFamily: 'var(--font-mono)',
+                                  color: 'var(--text-secondary)',
+                                  background: 'var(--surface-hover)',
+                                  padding: '4px 8px',
+                                  borderRadius: 4,
+                                }}
+                              >
+                                {sIdx + 1}. {act}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   );
                 })

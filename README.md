@@ -137,6 +137,7 @@ Environment variables used by the server:
 - `INTERNAL_AUTH_TOKEN`: Secure token used for inter-node communication between the coordinator and shards (enforces `X-Internal-Token` header authentication).
 - `COORDINATOR_HTTP_TIMEOUT`: Coordinator→shard request timeout in seconds (default: `120`). Keep it at or above the time a busy shard needs to finish an embedding batch.
 - `COORDINATOR_STATS_TIMEOUT`: Timeout in seconds for the 5s `/stats` health probes (default: `15`). Probe timeouts keep the previous health status instead of flapping shards to `unhealthy`.
+- `COORDINATOR_HEALTHZ_TIMEOUT`: Timeout for live shard `/healthz` probes when the metrics cache is still empty (default: `10`). After the first poll, coordinator `/healthz` uses the cache so Docker healthchecks do not flap under embed load.
 - `LOG_LEVEL`: Root logging level (default: `INFO`). httpx per-request logs are always capped at WARNING.
 
 ---
