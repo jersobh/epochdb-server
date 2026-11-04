@@ -69,7 +69,7 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.13.0"
+SERVER_VERSION = "0.13.1"
 # Coordinator→shard HTTP timeout. Embeddings on small VPS CPUs often exceed 30s
 # under concurrent ingest; default matches gunicorn --timeout 120.
 COORDINATOR_HTTP_TIMEOUT = float(os.getenv("COORDINATOR_HTTP_TIMEOUT", "120"))
@@ -817,6 +817,69 @@ async def get_db_instance(tenant: Optional[str] = None, namespace: Optional[str]
             
         db_pool[key] = engine
         return engine
+
+
+def get_shard_db_stats(tenant: Optional[str] = None, namespace: Optional[str] = None) -> Dict[str, int]:
+    """
+    Fast, lock-free snapshot of shard database counts.
+    Reads directly from in-memory hot/cold tier metadata structures without triggering
+    SentenceTransformer embeddings, heavy write locks, or cold start delays.
+    """
+    instances = []
+    if tenant is not None or namespace is not None:
+        if (tenant, namespace) in db_pool:
+            instances.append(db_pool[(tenant, namespace)])
+        elif db is not None:
+            instances.append(db)
+    else:
+        seen = set()
+        if db is not None:
+            instances.append(db)
+            seen.add(id(db))
+        for inst in db_pool.values():
+            if id(inst) not in seen:
+                instances.append(inst)
+                seen.add(id(inst))
+
+    if instances:
+        total_mem = 0
+        total_l1 = 0
+        total_l2 = 0
+        total_ent = 0
+        has_any = False
+        for inst in instances:
+            raw_db = getattr(inst, "_db", None)
+            if raw_db is not None:
+                try:
+                    hot = getattr(raw_db, "hot_tier", None)
+                    l1 = len(getattr(hot, "atoms", {})) if hot else 0
+                    cold = getattr(raw_db, "cold_tier", None)
+                    l2 = cold.get_total_atoms() if cold and hasattr(cold, "get_total_atoms") else 0
+                    kg = getattr(raw_db, "kg_manager", None)
+                    ent = len(kg.get_entities()) if kg and hasattr(kg, "get_entities") else 0
+                    total_mem += (l1 + l2)
+                    total_l1 += l1
+                    total_l2 += l2
+                    total_ent += ent
+                    has_any = True
+                except Exception:
+                    pass
+        if has_any:
+            res = {
+                "memory_count": total_mem,
+                "l1_size": total_l1,
+                "l2_size": total_l2,
+                "entity_count": total_ent,
+            }
+            _LAST_SHARD_DB_STATS.update(res)
+            return res
+
+    return {
+        "memory_count": _LAST_SHARD_DB_STATS.get("memory_count", 0),
+        "l1_size": _LAST_SHARD_DB_STATS.get("l1_size", 0),
+        "l2_size": _LAST_SHARD_DB_STATS.get("l2_size", 0),
+        "entity_count": _LAST_SHARD_DB_STATS.get("entity_count", 0),
+    }
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -3786,29 +3849,27 @@ async def stats(
         for group in shard_groups:
             all_replica_nodes.extend(group)
 
-        # Prefer background poll cache when every shard has an entry — avoids a
-        # live fan-out that competes with embeds on single-worker shards.
-        if SHARD_METRICS_CACHE and all(
+        # Prefer background poll cache when probe=True and every shard has an entry —
+        # avoids live fan-out for health probes. Live client requests (probe=False) fetch fresh stats.
+        if probe and SHARD_METRICS_CACHE and all(
             node in SHARD_METRICS_CACHE for node in all_replica_nodes
         ):
             total_memory_count = 0
             total_l1_size = 0
             total_l2_size = 0
             total_entity_count = 0
-            group_representatives = []
-            for group in shard_groups:
-                node = get_healthy_replica_for_group(group)
-                if node:
-                    group_representatives.append(node)
-            shards_metrics = {}
-            for node in all_replica_nodes:
-                metrics = dict(SHARD_METRICS_CACHE.get(node) or {})
-                shards_metrics[node] = metrics
-                if node in group_representatives:
-                    total_memory_count += metrics.get("memory_count", 0)
-                    total_l1_size += metrics.get("l1_size", 0)
-                    total_l2_size += metrics.get("l2_size", 0)
-                    total_entity_count += metrics.get("entity_count", 0)
+            accounted_groups = set()
+            for idx, grp in enumerate(shard_groups):
+                for node in grp:
+                    metrics = SHARD_METRICS_CACHE.get(node)
+                    if metrics and metrics.get("status") == "healthy" and idx not in accounted_groups:
+                        accounted_groups.add(idx)
+                        total_memory_count += metrics.get("memory_count", 0)
+                        total_l1_size += metrics.get("l1_size", 0)
+                        total_l2_size += metrics.get("l2_size", 0)
+                        total_entity_count += metrics.get("entity_count", 0)
+                        break
+            shards_metrics = {node: dict(SHARD_METRICS_CACHE.get(node) or {}) for node in all_replica_nodes}
             return {
                 "mode": "coordinator",
                 "memory_count": total_memory_count,
@@ -3838,26 +3899,26 @@ async def stats(
         total_l1_size = 0
         total_l2_size = 0
         total_entity_count = 0
-        
-        group_representatives = []
-        for group in shard_groups:
-            node = get_healthy_replica_for_group(group)
-            if node:
-                group_representatives.append(node)
-                
+        accounted_groups = set()
         shards_metrics = {}
         for node, resp in zip(all_replica_nodes, responses):
             if isinstance(resp, httpx.Response) and resp.status_code == 200:
                 try:
                     data = resp.json()
-                    if node in group_representatives:
+                    group_idx = None
+                    for idx, grp in enumerate(shard_groups):
+                        if node in grp:
+                            group_idx = idx
+                            break
+                    if group_idx is not None and group_idx not in accounted_groups:
+                        accounted_groups.add(group_idx)
                         total_memory_count += data.get("memory_count", 0)
                         total_l1_size += data.get("l1_size", 0)
                         total_l2_size += data.get("l2_size", 0)
                         total_entity_count += data.get("entity_count", 0)
                     
                     cached_status = SHARD_METRICS_CACHE.get(node, {}).get("status", "healthy")
-                    shards_metrics[node] = {
+                    metric_entry = {
                         "status": cached_status,
                         "memory_count": data.get("memory_count", 0),
                         "l1_size": data.get("l1_size", 0),
@@ -3867,6 +3928,8 @@ async def stats(
                         "ram": data.get("ram", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
                         "disk": data.get("disk", {"total": 0.0, "available": 0.0, "used": 0.0, "percent": 0.0}),
                     }
+                    shards_metrics[node] = metric_entry
+                    SHARD_METRICS_CACHE[node] = metric_entry
                 except Exception as e:
                     shards_metrics[node] = {
                         "status": "unhealthy",
@@ -3901,16 +3964,17 @@ async def stats(
             "shards": shards_metrics
         }
     else:
-        # Lightweight probe for coordinator poll_shards_loop — never opens the DB.
+        # Fast shard probe for coordinator poll_shards_loop & health checks — never opens new DBs or runs embeddings.
         if probe:
+            db_counts = get_shard_db_stats(ctx.tenant, ctx.namespace)
             return {
                 "mode": "shard",
                 "probe": True,
                 "version": SERVER_VERSION,
-                "memory_count": _LAST_SHARD_DB_STATS.get("memory_count", 0),
-                "l1_size": _LAST_SHARD_DB_STATS.get("l1_size", 0),
-                "l2_size": _LAST_SHARD_DB_STATS.get("l2_size", 0),
-                "entity_count": _LAST_SHARD_DB_STATS.get("entity_count", 0),
+                "memory_count": db_counts.get("memory_count", 0),
+                "l1_size": db_counts.get("l1_size", 0),
+                "l2_size": db_counts.get("l2_size", 0),
+                "entity_count": db_counts.get("entity_count", 0),
                 "cpu": get_cpu_usage(),
                 "ram": get_ram_usage(),
                 "disk": get_disk_usage(os.getenv("STORAGE_DIR", "./shared_memory")),
