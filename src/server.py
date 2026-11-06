@@ -1,6 +1,7 @@
 # src/server.py
 import logging
 import os
+import sys
 import uvicorn
 import uuid
 import hashlib
@@ -10,13 +11,270 @@ import httpx
 import json
 import time
 import numpy as np
+from collections import deque
 from contextlib import asynccontextmanager
+from typing import List, Dict, Any, Optional, Union, Tuple, Set
+
+# Compatibility alias for sentence-transformers 5.x with 6.x models
+try:
+    import sentence_transformers.sentence_transformer.modules.normalize as _st_norm
+    sys.modules.setdefault("sentence_transformers.base.modules.normalize", _st_norm)
+except Exception:
+    pass
+
+class EpochEmbedderAdapter:
+    """
+    Adapter for SentenceTransformer and other embedding models.
+    Enforces:
+    1. Instruction Prefix for inference/query vs document passages (e.g. Qwen3-Embedding).
+    2. EOS / Last-token pooling verification for causal decoder-only models.
+    3. Matryoshka dimension truncation and L2 re-normalization.
+    """
+    def __init__(self, model: Any, dim: int, model_name: str = ""):
+        self.model = model
+        self.dim = dim
+        self.model_name = model_name
+        self._verify_pooling()
+
+    def _verify_pooling(self):
+        """Verify and enforce last-token pooling for causal decoder-only architectures."""
+        try:
+            modules = getattr(self.model, "_modules", {})
+            for mod in modules.values():
+                if mod.__class__.__name__ == "Pooling" or hasattr(mod, "pooling_mode"):
+                    current_mode = getattr(mod, "pooling_mode", None)
+                    is_causal = False
+                    for m in modules.values():
+                        auto_mod = getattr(m, "auto_model", None)
+                        arch = getattr(auto_mod, "config", None)
+                        if arch:
+                            arch_str = str(getattr(arch, "architectures", "")).lower()
+                            model_type = str(getattr(arch, "model_type", "")).lower()
+                            if getattr(arch, "is_decoder", False) or "causal" in arch_str or "qwen" in model_type or "llama" in model_type:
+                                is_causal = True
+                                break
+                    if not is_causal and any(k in self.model_name.lower() for k in ["qwen", "epochdb-embed"]):
+                        is_causal = True
+
+                    if is_causal and current_mode != "lasttoken":
+                        logging.getLogger("epochdb_server").warning(
+                            f"[EpochEmbedderAdapter] Causal decoder model detected with pooling_mode='{current_mode}'. "
+                            f"Enforcing 'lasttoken' pooling for correct semantic similarity."
+                        )
+                        if hasattr(mod, "pooling_mode"):
+                            mod.pooling_mode = "lasttoken"
+                        if hasattr(mod, "pooling_mode_lasttoken"):
+                            mod.pooling_mode_lasttoken = True
+                        if hasattr(mod, "pooling_mode_mean_tokens"):
+                            mod.pooling_mode_mean_tokens = False
+        except Exception as e:
+            logging.getLogger("epochdb_server").debug(f"[EpochEmbedderAdapter] Could not check pooling: {e}")
+
+    def _get_query_prompt_kwargs(self) -> dict:
+        custom_inst = os.getenv("EPOCHDB_QUERY_INSTRUCTION")
+        if custom_inst:
+            if not custom_inst.endswith("Query: ") and not custom_inst.endswith("Query:"):
+                custom_inst = f"{custom_inst.rstrip()}\nQuery: "
+            return {"prompt": custom_inst}
+        prompts = getattr(self.model, "prompts", None)
+        if isinstance(prompts, dict) and "query" in prompts:
+            return {"prompt_name": "query"}
+        model_id = str(getattr(self.model, "model_name_or_path", "") or self.model_name).lower()
+        if any(k in model_id for k in ["qwen", "epochdb-embed", "bge-", "e5-"]):
+            return {"prompt": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "}
+        return {}
+
+    def encode(
+        self,
+        text: Union[str, List[str]],
+        is_query: bool = False,
+        prompt_name: Optional[str] = None,
+        prompt: Optional[str] = None,
+        truncate_dim: Optional[int] = None,
+        normalize_embeddings: bool = True,
+        **kwargs
+    ) -> np.ndarray:
+        target_dim = truncate_dim or self.dim
+        dim_fn = getattr(self.model, "get_embedding_dimension", None) or getattr(self.model, "get_sentence_embedding_dimension", None)
+        native_dim = dim_fn() if callable(dim_fn) else None
+
+        encode_kwargs = dict(kwargs)
+        encode_kwargs["normalize_embeddings"] = normalize_embeddings
+
+        if prompt is not None:
+            encode_kwargs["prompt"] = prompt
+        elif prompt_name is not None:
+            encode_kwargs["prompt_name"] = prompt_name
+        elif is_query:
+            encode_kwargs.update(self._get_query_prompt_kwargs())
+        else:
+            prompts = getattr(self.model, "prompts", None)
+            if isinstance(prompts, dict) and prompts.get("document"):
+                encode_kwargs["prompt_name"] = "document"
+
+        # Apply Matryoshka truncation if target_dim < native_dim
+        if target_dim and native_dim and target_dim < native_dim:
+            encode_kwargs["truncate_dim"] = target_dim
+
+        try:
+            res = self.model.encode(text, **encode_kwargs)
+        except TypeError:
+            encode_kwargs.pop("truncate_dim", None)
+            encode_kwargs.pop("prompt_name", None)
+            encode_kwargs.pop("prompt", None)
+            res = self.model.encode(text, **encode_kwargs)
+
+        def _post_process(vec):
+            v = np.array(vec, dtype=np.float32)
+            if target_dim and len(v) > target_dim:
+                v = v[:target_dim]
+            if normalize_embeddings:
+                norm = np.linalg.norm(v)
+                if norm > 1e-10:
+                    v = v / norm
+            return v
+
+        if isinstance(text, str):
+            return _post_process(res)
+        return np.array([_post_process(v) for v in res], dtype=np.float32)
+
+    def encode_batch(self, texts: List[str], is_query: bool = False, **kwargs) -> np.ndarray:
+        return self.encode(texts, is_query=is_query, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.model, name)
+
+# Apply runtime monkey patches to EpochDB to guarantee embedding alignment
+try:
+    from epochdb.api.db import EpochDB, Memory
+
+    _orig_get_embedder = EpochDB._get_embedder
+    def _patched_get_embedder(self):
+        embedder = _orig_get_embedder(self)
+        if embedder is not None and not isinstance(embedder, EpochEmbedderAdapter):
+            wrapped = EpochEmbedderAdapter(embedder, dim=self.dim, model_name=self._model_name or "")
+            self._embedder = wrapped
+            return wrapped
+        return embedder
+    EpochDB._get_embedder = _patched_get_embedder
+
+    _orig_query = EpochDB.query
+    def _patched_query(self, text: str, k: int = 5, filters: Optional[dict] = None, min_score: float = 0.0, memory_type: Optional[str] = None, context_window: int = 0, expand_hops: int = 0, cold_search_mode: Optional[str] = None) -> List[Memory]:
+        query_entities = [str(e) for e in self.extract_entities(text)]
+        if self._model_name:
+            embedder = self._get_embedder()
+            try:
+                raw_emb = embedder.encode(text, is_query=True, normalize_embeddings=True)
+            except TypeError:
+                raw_emb = embedder.encode(text, normalize_embeddings=True)
+            emb = np.array(raw_emb, dtype=np.float32)
+            if len(emb) > self.dim:
+                emb = emb[:self.dim]
+                norm = np.linalg.norm(emb)
+                if norm > 1e-10:
+                    emb /= norm
+        else:
+            emb = np.zeros(self.dim, dtype=np.float32)
+
+        with self._internal_lock:
+            atoms = self.retriever.search(
+                query_emb=emb,
+                top_k=k,
+                expand_hops=max(0, int(expand_hops or 0)),
+                query_entities=query_entities,
+                filters=filters,
+                context_window=context_window,
+                cold_search_mode=cold_search_mode,
+                query_text=text,
+            )
+            if memory_type:
+                from epochdb.core.atom import MemoryType
+                try:
+                    mt = MemoryType(memory_type)
+                    atoms = [a for a in atoms if a.memory_type == mt]
+                except ValueError:
+                    pass
+            memories = []
+            for atom in atoms:
+                mem = Memory(atom)
+                if hasattr(atom, "score"):
+                    mem.score = atom.score
+                memories.append(mem)
+            return memories
+    EpochDB.query = _patched_query
+
+    # Patch supersession in RetrievalManager and ColdTier so co-occurrence
+    # and biographical relationship triples do not falsely supersede earlier facts
+    try:
+        import textwrap, inspect
+        import epochdb.retrieval.retrieval as ret_mod
+        from epochdb.retrieval.retrieval import RetrievalManager
+
+        src_rm = textwrap.dedent(inspect.getsource(RetrievalManager.search))
+        old_rm_block = """    for atom, _ in recency_sorted:
+        for s, p, o in atom.triples:
+            state_key = (str(s).lower(), str(p).lower())"""
+        new_rm_block = """    NON_SUPERSEDING_PREDICATES = {
+        'co_occurs_with', 'mentions', 'associated_with', 'related_to',
+        'tagged_with', 'has_tag', 'contains', 'part_of', 'member_of',
+        'founded', 'co_founded', 'created', 'invented', 'designed',
+        'mentored', 'worked_at', 'attended', 'developed', 'pioneered',
+        'authored', 'discovered', 'produced', 'competes_with',
+    }
+    for atom, _ in recency_sorted:
+        for s, p, o in atom.triples:
+            p_l = str(p).lower()
+            if p_l in NON_SUPERSEDING_PREDICATES:
+                continue
+            state_key = (str(s).lower(), p_l)"""
+        if old_rm_block in src_rm:
+            patched_rm_src = src_rm.replace(old_rm_block, new_rm_block, 1)
+            scope_rm = ret_mod.__dict__.copy()
+            exec(patched_rm_src, scope_rm)
+            RetrievalManager.search = scope_rm['search']
+            logging.getLogger("epochdb_server").info("Successfully patched RetrievalManager.search supersession logic.")
+    except Exception as _rm_err:
+        logging.getLogger("epochdb_server").warning(f"Could not patch RetrievalManager: {_rm_err}")
+
+    try:
+        import textwrap, inspect
+        import epochdb.storage.cold_tier as cold_mod
+        from epochdb.storage.cold_tier import ColdTier
+
+        src_c = textwrap.dedent(inspect.getsource(ColdTier.compact))
+        old_c_block = """        is_superseded = False
+        for s, p, o in atom.triples:
+            state_key = (str(s).lower(), str(p).lower())"""
+        new_c_block = """        NON_SUPERSEDING_PREDICATES = {
+            'co_occurs_with', 'mentions', 'associated_with', 'related_to',
+            'tagged_with', 'has_tag', 'contains', 'part_of', 'member_of',
+            'founded', 'co_founded', 'created', 'invented', 'designed',
+            'mentored', 'worked_at', 'attended', 'developed', 'pioneered',
+            'authored', 'discovered', 'produced', 'competes_with',
+        }
+        is_superseded = False
+        for s, p, o in atom.triples:
+            p_l = str(p).lower()
+            if p_l in NON_SUPERSEDING_PREDICATES:
+                continue
+            state_key = (str(s).lower(), p_l)"""
+        if old_c_block in src_c:
+            patched_c_src = src_c.replace(old_c_block, new_c_block, 1)
+            scope_c = cold_mod.__dict__.copy()
+            exec(patched_c_src, scope_c)
+            ColdTier.compact = scope_c['compact']
+            logging.getLogger("epochdb_server").info("Successfully patched ColdTier.compact supersession logic.")
+    except Exception as _cold_err:
+        logging.getLogger("epochdb_server").warning(f"Could not patch ColdTier: {_cold_err}")
+except Exception as _patch_err:
+    logging.getLogger("epochdb_server").warning(f"Could not monkey-patch EpochDB: {_patch_err}")
+
 from fastapi import FastAPI, HTTPException, status, Security, Depends, Request, Response
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, model_validator
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Tuple, Set
 
 from epochdb import AsyncEpochDB
 from fastapi import Header, Query
@@ -69,7 +327,7 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.13.1"
+SERVER_VERSION = "0.13.2"
 # Coordinator→shard HTTP timeout. Embeddings on small VPS CPUs often exceed 30s
 # under concurrent ingest; default matches gunicorn --timeout 120.
 COORDINATOR_HTTP_TIMEOUT = float(os.getenv("COORDINATOR_HTTP_TIMEOUT", "120"))
@@ -125,6 +383,121 @@ logger = logging.getLogger("epochdb_production_server")
 # across shards this floods coordinator logs and buries real errors.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+# -------------------------------------------------------------------------
+# Dynamic CausalLM support for HuggingFace triple extraction
+# (e.g. Qwen3.5, Llama, Mistral such as jersobh/epochdb-extractor-0.8b)
+# -------------------------------------------------------------------------
+def _patch_epochdb_fact_extractor():
+    try:
+        import re
+        from epochdb.core import fact_extractor as fe
+        if getattr(fe, "_causal_lm_patched", False):
+            return
+
+        orig_load = fe.HuggingFaceFactExtractor._load
+        orig_extract = fe.HuggingFaceFactExtractor.extract
+
+        def patched_load(self):
+            if self._model is not None:
+                return
+            try:
+                from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+            except ImportError:
+                raise ImportError(
+                    "transformers is required for Hugging Face triple extraction. "
+                    "Install it with: pip install epochdb[extraction]"
+                )
+
+            cache_dir = self._cache_dir()
+            load_id = cache_dir if cache_dir and os.path.isdir(cache_dir) and os.listdir(cache_dir) else self.model_id
+            logger.info(f"Loading HuggingFace extraction model: {load_id}")
+            self._tokenizer = AutoTokenizer.from_pretrained(load_id)
+            try:
+                self._model = AutoModelForSeq2SeqLM.from_pretrained(load_id)
+                self._is_causal = False
+            except (ValueError, KeyError, Exception):
+                import torch
+                from transformers import AutoModelForCausalLM
+                self._model = AutoModelForCausalLM.from_pretrained(
+                    load_id,
+                    dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                )
+                self._is_causal = True
+            self._model.eval()
+
+            if cache_dir and load_id == self.model_id:
+                try:
+                    os.makedirs(cache_dir, exist_ok=True)
+                    self._tokenizer.save_pretrained(cache_dir)
+                    self._model.save_pretrained(cache_dir)
+                except Exception as e:
+                    logger.warning(f"Could not cache HF extraction model to {cache_dir}: {e}")
+
+        def patched_extract(self, text: str):
+            import torch
+            self._load()
+            assert self._tokenizer is not None and self._model is not None
+
+            if getattr(self, "_is_causal", False):
+                prompt = (
+                    "Extract relationship triples from the text as JSON with key "
+                    '"triples" as a list of {subject, predicate, object} objects.\n'
+                    f"Text: {text}\nJSON:"
+                )
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                self._model.to(device)
+                inputs = self._tokenizer(
+                    prompt,
+                    max_length=self.max_input_length,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                ).to(device)
+                with torch.no_grad():
+                    generated = self._model.generate(
+                        **inputs,
+                        max_new_tokens=self.max_length,
+                        do_sample=False,
+                    )
+                decoded = self._tokenizer.batch_decode(
+                    generated[:, inputs["input_ids"].shape[1]:],
+                    skip_special_tokens=True,
+                )[0]
+                triples = fe._parse_jsonish_triples(decoded)
+                return triples if triples else []
+            else:
+                return orig_extract(self, text)
+
+        orig_parse = fe._parse_jsonish_triples
+        def patched_parse_jsonish_triples(text: str):
+            res = orig_parse(text)
+            if res:
+                return res
+            import ast, re
+            for match in re.finditer(r"(\{.*\}|\[.*\])", text, re.DOTALL):
+                try:
+                    data = ast.literal_eval(match.group(1).strip())
+                    if isinstance(data, dict):
+                        got = fe._normalize_triples(data.get("triples") or data.get("relations") or [])
+                    else:
+                        got = fe._normalize_triples(data)
+                    if got:
+                        return got
+                except Exception:
+                    continue
+            return []
+
+        fe.HuggingFaceFactExtractor._load = patched_load
+        fe.HuggingFaceFactExtractor.extract = patched_extract
+        fe._parse_jsonish_triples = patched_parse_jsonish_triples
+        fe._causal_lm_patched = True
+        logger.info("Initialized dynamic CausalLM loader for HuggingFace fact extractors.")
+    except Exception as ex:
+        logger.debug(f"Could not apply CausalLM patch to fact extractor: {ex}")
+
+_patch_epochdb_fact_extractor()
 
 
 @asynccontextmanager
@@ -813,7 +1186,15 @@ async def get_db_instance(tenant: Optional[str] = None, namespace: Optional[str]
         try:
             await engine.query(text="system boot warmup", k=1)
         except Exception as e:
-            logger.error(f"Error warming up db instance {key}: {e}")
+            if "dimension mismatch" in str(e).lower():
+                logger.error(
+                    f"Error warming up db instance {key}: {e}. "
+                    f"Hint: Stored partition metadata/vectors were created with a different embedding dimension "
+                    f"than the current model ({EMBEDDING_MODEL}, dim={EMBEDDING_DIM}). "
+                    f"Either switch to a new namespace/tenant, or clear storage volumes (docker compose down -v) to reinitialize."
+                )
+            else:
+                logger.error(f"Error warming up db instance {key}: {e}")
             
         db_pool[key] = engine
         return engine
@@ -1539,10 +1920,16 @@ async def remember(payload: MemoryPayload, request: Request, ctx: RequestContext
                     emb = await run_embedding(
                         embedder.encode,
                         text,
+                        is_query=False,
                         normalize_embeddings=True,
                         show_progress_bar=False,
                     )
                     embedding = np.array(emb, dtype=np.float32)
+                    if len(embedding) > engine.dim:
+                        embedding = embedding[:engine.dim]
+                        norm = np.linalg.norm(embedding)
+                        if norm > 1e-10:
+                            embedding /= norm
                 else:
                     embedding = np.zeros(engine.dim, dtype=np.float32)
                     
@@ -1907,10 +2294,16 @@ async def replace_memory(
                 emb = await run_embedding(
                     embedder.encode,
                     payload.text,
+                    is_query=False,
                     normalize_embeddings=True,
                     show_progress_bar=False,
                 )
                 embedding = np.array(emb, dtype=np.float32)
+                if len(embedding) > engine.dim:
+                    embedding = embedding[:engine.dim]
+                    norm = np.linalg.norm(embedding)
+                    if norm > 1e-10:
+                        embedding /= norm
             else:
                 embedding = np.zeros(engine.dim, dtype=np.float32)
 
@@ -2239,18 +2632,31 @@ async def query_memories(
                 q_emb = await run_embedding(
                     embedder.encode,
                     query_text,
+                    is_query=True,
                     normalize_embeddings=True,
                     show_progress_bar=False,
                 )
                 q_emb = np.array(q_emb, dtype=np.float32)
+                if len(q_emb) > engine.dim:
+                    q_emb = q_emb[:engine.dim]
+                    norm = np.linalg.norm(q_emb)
+                    if norm > 1e-10:
+                        q_emb /= norm
                 
                 formatted_results = []
                 for r in results:
                     score = float(getattr(r, "score", 0.0))
                     if score == 0.0 and q_emb.any() and r._atom.embedding.any():
-                        score = float(np.dot(r._atom.embedding, q_emb) / (
-                            np.linalg.norm(r._atom.embedding) * np.linalg.norm(q_emb) + 1e-10
-                        ))
+                        atom_emb = r._atom.embedding
+                        if len(atom_emb) != len(q_emb):
+                            min_len = min(len(atom_emb), len(q_emb))
+                            score = float(np.dot(atom_emb[:min_len], q_emb[:min_len]) / (
+                                np.linalg.norm(atom_emb[:min_len]) * np.linalg.norm(q_emb[:min_len]) + 1e-10
+                            ))
+                        else:
+                            score = float(np.dot(atom_emb, q_emb) / (
+                                np.linalg.norm(atom_emb) * np.linalg.norm(q_emb) + 1e-10
+                            ))
                     item_data = {
                         "id": r.id,
                         "text": r.text,
@@ -3029,6 +3435,56 @@ async def delete_memory(payload: DeletePayload, request: Request, ctx: RequestCo
             logger.error(f"Error deleting memory {payload.memory_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+def _prune_subgraph_by_depth(
+    entity_id: str,
+    edges: List[Dict[str, Any]],
+    max_depth: int,
+) -> Tuple[Set[str], List[Dict[str, Any]]]:
+    """
+    Prune edges and nodes to only those reachable from entity_id within max_depth hops.
+    Matches entity_id case-insensitively if needed, but preserves canonical casing in graph.
+    """
+    if not edges:
+        return {entity_id}, []
+
+    start_node = entity_id
+    ent_lower = entity_id.lower().strip()
+
+    adj: Dict[str, Set[str]] = {}
+    for e in edges:
+        s = e.get("source")
+        t = e.get("target")
+        if s and t:
+            adj.setdefault(s, set()).add(t)
+            adj.setdefault(t, set()).add(s)
+            if s.lower().strip() == ent_lower and start_node != s:
+                start_node = s
+            elif t.lower().strip() == ent_lower and start_node != t:
+                start_node = t
+
+    if start_node not in adj:
+        return {start_node}, []
+
+    distances: Dict[str, int] = {start_node: 0}
+    queue: deque = deque([start_node])
+    while queue:
+        curr = queue.popleft()
+        d = distances[curr]
+        if d >= max_depth:
+            continue
+        for nbr in adj.get(curr, ()):
+            if nbr not in distances:
+                distances[nbr] = d + 1
+                queue.append(nbr)
+
+    pruned_nodes = set(distances.keys())
+    pruned_edges = [
+        e for e in edges
+        if e.get("source") in pruned_nodes and e.get("target") in pruned_nodes
+    ]
+    return pruned_nodes, pruned_edges
+
+
 @app.get("/entity_graph")
 async def entity_graph(
     request: Request,
@@ -3156,7 +3612,7 @@ async def entity_graph(
                 # One request per shard at full depth — shards already BFS locally.
                 # The old hop×frontier×shard fan-out (depth=1 each) took tens of
                 # seconds under embed load and timed out Percepta / Studio.
-                hop_depth = max(1, min(depth, 4))
+                hop_depth = max(1, min(depth, 10))
                 tasks = [
                     client.get(
                         f"{node}/entity_graph",
@@ -3218,21 +3674,14 @@ async def entity_graph(
                             format_shard_error(resp),
                         )
 
-                relational_edges = [
+                candidate_edges = [
                     e for e in all_edges
                     if e.get("predicate") not in ("co_occurs_with", "mentions", "related")
                 ]
-                if relational_edges:
-                    final_edges = relational_edges
-                    final_nodes = {entity_id}
-                    for e in final_edges:
-                        if e.get("source"):
-                            final_nodes.add(e["source"])
-                        if e.get("target"):
-                            final_nodes.add(e["target"])
-                else:
-                    final_edges = all_edges
-                    final_nodes = all_nodes
+                if not candidate_edges:
+                    candidate_edges = all_edges
+
+                final_nodes, final_edges = _prune_subgraph_by_depth(entity_id, candidate_edges, hop_depth)
 
                 result = {"nodes": list(final_nodes), "edges": final_edges}
                 if merged_typed:
@@ -3485,24 +3934,17 @@ async def entity_graph(
 
                     return await asyncio.to_thread(_overview_graph)
                 else:
-                    hop_depth = max(1, min(depth, 2))
+                    hop_depth = max(1, min(depth, 10))
                     graph = await active_db.entity_graph(entity_id, hop_depth)
                     all_edges = graph.edges or []
-                    rel_edges = [
+                    candidate_edges = [
                         e for e in all_edges
                         if e.get("predicate") not in ("co_occurs_with", "mentions", "related")
                     ]
-                    if rel_edges:
-                        final_edges = rel_edges
-                        final_nodes = {entity_id}
-                        for e in final_edges:
-                            if e.get("source"):
-                                final_nodes.add(e["source"])
-                            if e.get("target"):
-                                final_nodes.add(e["target"])
-                    else:
-                        final_edges = all_edges
-                        final_nodes = set(graph.nodes or [entity_id])
+                    if not candidate_edges:
+                        candidate_edges = all_edges
+
+                    final_nodes, final_edges = _prune_subgraph_by_depth(entity_id, candidate_edges, hop_depth)
 
                     result = {"nodes": list(final_nodes), "edges": final_edges}
                     registered = set(get_registered_ids(ctx.tenant, ctx.namespace))

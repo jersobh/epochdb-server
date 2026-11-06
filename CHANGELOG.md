@@ -2,6 +2,28 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.13.2] - 2026-11-06
+### Added
+- **Embedding & Extraction Model Support**:
+  - Integrated support and benchmarks for `jersobh/epochdb-embed-0.6b` (1024-dimension, ~600M parameters, Matryoshka and MultipleNegativesRankingLoss trained) and `jersobh/epochdb-extractor-0.8b` (fine-tuned Qwen3.5-0.8B for canonical relational triple extraction).
+  - Added benchmarking script `benchmark_models.py` evaluating model load time, single-sentence and batch encoding latency, retrieval accuracy, distinction margins, and triple extraction quality.
+  - Added runtime compatibility alias for `sentence_transformers.base.modules.normalize` allowing sentence-transformers 6.x-trained models to run on 5.x environments without import failures.
+  - Extended HuggingFace fact extraction to support decoder-only CausalLM models (`AutoModelForCausalLM` fallback) and resilient Python dict literal parsing (`ast.literal_eval`).
+- **High-Availability & Replication Topologies**:
+  - Added `docker-compose.replicas.yml` for active-active multi-replica cluster setups and `docker-compose.sharded-ha.yml` for sharded clusters with per-shard replica sets.
+  - Added detailed architectural documentation on sharding vs replica tradeoffs and fault-tolerant deployment modes in `docs/guide/sharding-architecture.md` and `docs/guide/getting-started.md`.
+
+### Fixed
+- **Entity Graph Traversal Depth & Co-Occurrence Leakage**:
+  - Fixed an issue where querying `/entity_graph` with an `entity_id` (e.g. `Alan Turing`) at `depth=2` leaked distant, unrelated skills (such as `Linux Kernel` and `Git Version Control`) into the subgraph.
+  - Resolved root cause where raw document-level `co_occurs_with` edges bridged memory atoms, and stripped bridge edges left disconnected island subgraphs in `all_edges` whose endpoints were inadvertently added to `final_nodes`.
+  - Implemented strict BFS distance pruning (`_prune_subgraph_by_depth`) on both coordinator and shard endpoints to discard any nodes and edges beyond the requested traversal radius.
+  - Removed artificial depth clamping on shards (`min(depth, 2)`) and coordinator (`min(depth, 4)`), allowing the UI traversal depth slider to function across its full 1–10 hop range.
+  - Added automated test suite coverage (`test_entity_graph_traversal_depth` in `tests/test_server_api.py`).
+- **UI Graph Explorer Filtering**:
+  - Fixed race condition in `ExplorerDock.tsx` and `App.tsx` where picking an entity autocomplete suggestion dropped the selected filter value.
+  - Fixed procedural skill node demotion to generic `entity` in `ui/src/lib/graph.ts` and enabled skill memory type recognition in `src/type_discovery.py`.
+
 ## [0.13.1] - 2026-11-04
 ### Fixed
 - **Coordinator & Shard Stats Memory Count Reporting**: Fixed an issue where coordinator `GET /stats` returned `memory_count == 0` due to `_LAST_SHARD_DB_STATS` remaining 0 on shards and coordinator serving stale polling cache on live requests.

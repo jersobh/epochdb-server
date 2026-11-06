@@ -1,0 +1,141 @@
+networks:
+  epochdb:
+    name: epochdb-sharded-ha_default
+
+services:
+  # --- Shard Group 0 (Replicas A & B) ---
+  shard0a:
+    build: .
+    container_name: epochdb-s0a
+    networks:
+      - epochdb
+    ports:
+      - "8081:8080"
+    environment:
+      - NODE_MODE=shard
+      - STORAGE_DIR=/data
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - EPOCHDB_EXTRACTION_MODEL=${EPOCHDB_EXTRACTION_MODEL:-local}
+    volumes:
+      - shard0a_data:/data
+      - ./src:/app/src:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 90s
+
+  shard0b:
+    build: .
+    container_name: epochdb-s0b
+    networks:
+      - epochdb
+    ports:
+      - "8082:8080"
+    environment:
+      - NODE_MODE=shard
+      - STORAGE_DIR=/data
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - EPOCHDB_EXTRACTION_MODEL=${EPOCHDB_EXTRACTION_MODEL:-local}
+    volumes:
+      - shard0b_data:/data
+      - ./src:/app/src:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 90s
+
+  # --- Shard Group 1 (Replicas A & B) ---
+  shard1a:
+    build: .
+    container_name: epochdb-s1a
+    networks:
+      - epochdb
+    ports:
+      - "8083:8080"
+    environment:
+      - NODE_MODE=shard
+      - STORAGE_DIR=/data
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - EPOCHDB_EXTRACTION_MODEL=${EPOCHDB_EXTRACTION_MODEL:-local}
+    volumes:
+      - shard1a_data:/data
+      - ./src:/app/src:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 90s
+
+  shard1b:
+    build: .
+    container_name: epochdb-s1b
+    networks:
+      - epochdb
+    ports:
+      - "8084:8080"
+    environment:
+      - NODE_MODE=shard
+      - STORAGE_DIR=/data
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - EPOCHDB_EXTRACTION_MODEL=${EPOCHDB_EXTRACTION_MODEL:-local}
+    volumes:
+      - shard1b_data:/data
+      - ./src:/app/src:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 90s
+
+  # --- Coordinator Gateway ---
+  coordinator:
+    build: .
+    container_name: epochdb-coordinator-sharded-ha
+    networks:
+      - epochdb
+    ports:
+      - "8080:8080"
+    environment:
+      - NODE_MODE=coordinator
+      # Shard group 0 has shard0a+shard0b; Shard group 1 has shard1a+shard1b
+      - SHARD_NODES=http://shard0a:8080+http://shard0b:8080,http://shard1a:8080+http://shard1b:8080
+      - API_KEY=test-api-key-12345
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+    volumes:
+      - ./src:/app/src:ro
+    depends_on:
+      shard0a:
+        condition: service_healthy
+      shard0b:
+        condition: service_healthy
+      shard1a:
+        condition: service_healthy
+      shard1b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  shard0a_data:
+  shard0b_data:
+  shard1a_data:
+  shard1b_data:
+

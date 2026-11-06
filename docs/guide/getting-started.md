@@ -11,18 +11,38 @@ Spin up your sharded memory database cluster in minutes.
 
 ## Deploying the Cluster
 
-EpochDB is fully configured to run inside a multi-container Docker cluster containing a coordinator gateway and three storage shards.
+EpochDB supports multiple cluster topologies depending on whether your priority is **zero data loss (high availability)**, **maximum horizontal scale (sharding)**, or both:
 
-1. Locate the `docker-compose.yml` file in the root of the server repository.
-2. Spin up the cluster using Docker Compose:
-   ```bash
-   docker-compose up --build
-   ```
-3. Once the database nodes finish warming up, the cluster endpoints will be active:
-   - **Coordinator Gateway**: `http://localhost:8080` (External port)
-   - **Shard 0**: `http://localhost:8081`
-   - **Shard 1**: `http://localhost:8082`
-   - **Shard 2**: `http://localhost:8083`
+### Option 1: High-Availability Replicas (Recommended for Most Applications)
+
+Every node stores 100% of memories, skills, and entity graphs. If any node goes down, zero data is lost:
+
+```bash
+docker compose -f docker-compose.replicas.yml up --build -d
+```
+- **Coordinator Gateway**: `http://localhost:8080`
+- **Replicas 0, 1, 2**: `http://localhost:8081`, `http://localhost:8082`, `http://localhost:8083`
+
+### Option 2: Standard Sharded Cluster (Max Horizontal Scale)
+
+Data is split evenly across three independent shards using consistent hashing:
+
+```bash
+docker compose up --build -d
+```
+- **Coordinator Gateway**: `http://localhost:8080`
+- **Shard 0, 1, 2**: `http://localhost:8081`, `http://localhost:8082`, `http://localhost:8083`
+
+### Option 3: Sharded + High-Availability Replicas (Enterprise Scale & Redundancy)
+
+Multi-shard architecture where each shard is protected by a replica pair:
+
+```bash
+docker compose -f docker-compose.sharded-ha.yml up --build -d
+```
+- **Coordinator Gateway**: `http://localhost:8080`
+- **Shard 0 (Replicas A/B)**: `http://localhost:8081`, `http://localhost:8082`
+- **Shard 1 (Replicas A/B)**: `http://localhost:8083`, `http://localhost:8084`
 
 ---
 

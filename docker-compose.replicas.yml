@@ -1,0 +1,117 @@
+networks:
+  epochdb:
+    name: epochdb-replicas_default
+
+services:
+  replica0:
+    build: .
+    container_name: epochdb-replica0
+    networks:
+      - epochdb
+    ports:
+      - "8081:8080"
+    environment:
+      - NODE_MODE=shard
+      - STORAGE_DIR=/data
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - EPOCHDB_EXTRACTION_MODEL=${EPOCHDB_EXTRACTION_MODEL:-local}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+    volumes:
+      - replica0_data:/data
+      - ./src:/app/src:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 90s
+
+  replica1:
+    build: .
+    container_name: epochdb-replica1
+    networks:
+      - epochdb
+    ports:
+      - "8082:8080"
+    environment:
+      - NODE_MODE=shard
+      - STORAGE_DIR=/data
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - EPOCHDB_EXTRACTION_MODEL=${EPOCHDB_EXTRACTION_MODEL:-local}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+    volumes:
+      - replica1_data:/data
+      - ./src:/app/src:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 90s
+
+  replica2:
+    build: .
+    container_name: epochdb-replica2
+    networks:
+      - epochdb
+    ports:
+      - "8083:8080"
+    environment:
+      - NODE_MODE=shard
+      - STORAGE_DIR=/data
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - EPOCHDB_EXTRACTION_MODEL=${EPOCHDB_EXTRACTION_MODEL:-local}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+    volumes:
+      - replica2_data:/data
+      - ./src:/app/src:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 90s
+
+  coordinator:
+    build: .
+    container_name: epochdb-coordinator-ha
+    networks:
+      - epochdb
+    ports:
+      - "8080:8080"
+    environment:
+      - NODE_MODE=coordinator
+      # '+' groups nodes into a single replica set: all 3 hold identical copies of 100% of data
+      - SHARD_NODES=http://replica0:8080+http://replica1:8080+http://replica2:8080
+      - API_KEY=test-api-key-12345
+      - INTERNAL_AUTH_TOKEN=test-internal-token-67890
+    volumes:
+      - ./src:/app/src:ro
+    depends_on:
+      replica0:
+        condition: service_healthy
+      replica1:
+        condition: service_healthy
+      replica2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  replica0_data:
+  replica1_data:
+  replica2_data:
+

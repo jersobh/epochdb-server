@@ -40,6 +40,22 @@ def _scan_hot_tier(engine: Any) -> Dict[str, Any]:
         if count >= _MAX_ATOMS:
             break
         count += 1
+
+        raw_mtype = getattr(atom, "memory_type", None) or (atom.get("memory_type") if isinstance(atom, dict) else None)
+        mtype_val = getattr(raw_mtype, "value", raw_mtype)
+        mtype = str(mtype_val or "").lower()
+        meta = getattr(atom, "metadata", None) or (atom.get("metadata") if isinstance(atom, dict) else None) or {}
+        if mtype == "skill" or meta.get("skill_name"):
+            types.add("skill")
+            sk = meta.get("skill_name") or getattr(atom, "id", None) or (atom.get("id") if isinstance(atom, dict) else None)
+            if sk:
+                entity_types.setdefault(str(sk), set()).add("skill")
+        elif mtype == "profile" or meta.get("user_id"):
+            types.add("person")
+            uid = meta.get("user_id")
+            if uid:
+                entity_types.setdefault(str(uid), set()).add("person")
+
         triples = getattr(atom, "triples", None) or []
         if not triples and isinstance(atom, dict):
             triples = atom.get("triples") or (atom.get("metadata") or {}).get("triples") or []
@@ -49,6 +65,11 @@ def _scan_hot_tier(engine: Any) -> Dict[str, Any]:
             s, p, o = str(triple[0]), _pred_key(triple[1]), str(triple[2])
             if p:
                 predicates.add(p)
+            if p == "is_skill":
+                types.add("skill")
+                entity_types.setdefault(s, set()).add("skill")
+                entity_types.setdefault(o, set()).add("skill")
+                continue
             if p not in TYPE_DEFINING_PREDICATES:
                 continue
             # Only compact type ids — skip sentence-length objects
