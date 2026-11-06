@@ -50,7 +50,21 @@ A server instance runs in one of two modes depending on environment variables:
 * **Query Re-ranking**: For semantic queries, the coordinator queries all shards in parallel and aggregates, merges, and re-ranks the results by cosine similarity score before returning the top `k` candidates.
 * **Graph Merging**: For `/entity_graph`, nodes and edges are retrieved from all shards and merged (set union) dynamically.
 
-### 3. Security & Internal Tokens
+### 3. Replication & High Availability (HA)
+In un-replicated sharding, each shard holds a unique slice of the database; if a shard goes down, its memories and graph edges become temporarily unavailable. To prevent single-point-of-failure data loss, EpochDB supports **replica sets**:
+
+* **Replication Syntax (`+`)**: Use `+` in `SHARD_NODES` to group nodes into a replica set that shares the same partition:
+  * Pure Replicated Cluster (1 shard group, 3 replicas):
+    `SHARD_NODES=http://replica0:8080+http://replica1:8080+http://replica2:8080`
+  * Sharded + Replicated (2 shards, 2 replicas each):
+    `SHARD_NODES=http://s0a:8080+http://s0b:8080,http://s1a:8080+http://s1b:8080`
+* **Automatic Failover**: The coordinator periodically health-probes all replicas. If a replica crashes, read and write operations automatically fall back to the surviving healthy replica(s) in the group.
+* **Tunable Write Consistency**: Clients specify write guarantees via the `X-Consistency-Level` header:
+  * `one` (default): Fast return as soon as one replica in the group acknowledges the write.
+  * `quorum`: Succeeds only when a majority ($\lfloor n/2 \rfloor + 1$) of replicas in the group write successfully.
+  * `all`: Strictly requires all replicas in the group to commit the write.
+
+### 4. Security & Internal Tokens
 * **Gateway Authentication**: The coordinator gateway enforces token-based authentication using the `X-API-Key` request header (configured via the `API_KEY` environment variable).
 * **Inter-Node Shard Security**: Shard nodes enforce authentication via the `X-Internal-Token` header (configured via the `INTERNAL_AUTH_TOKEN` environment variable).
 * **Header Propagation**: The coordinator gateway automatically propagates the `X-Internal-Token` to all downstream shard communication.
@@ -65,19 +79,40 @@ A server instance runs in one of two modes depending on environment variables:
 - Python 3.10+ (if running bare metal)
 - Node.js 20+ (only if rebuilding EpochDB Studio locally; Docker builds it automatically)
 
-### Deploying the Cluster (Docker Compose)
-A pre-configured 3-shard cluster and 1 coordinator gateway are defined in `docker-compose.yml`.
+### Choosing a Topology & Deploying via Docker Compose
 
-Run the following command to start the cluster:
+EpochDB provides ready-to-run Docker Compose topologies tailored for different reliability and scaling requirements:
+
+#### Option A: High-Availability Replicas (Recommended for Most Apps)
+* **Best for**: Workloads requiring **zero data loss and high availability**. If any replica dies, the surviving nodes hold 100% of the memories, skills, and graph relationships.
+* **Topology**: 1 coordinator gateway + 3 storage replicas in one replica set.
+```bash
+docker compose -f docker-compose.replicas.yml up --build -d
+```
+* **Endpoints**:
+  * Coordinator Gateway: `http://localhost:8080`
+  * Replicas 0, 1, 2: `http://localhost:8081`, `http://localhost:8082`, `http://localhost:8083`
+
+#### Option B: Standard Sharded Cluster (Scale-Focused)
+* **Best for**: Datasets requiring maximum write throughput and horizontal RAM scaling across multiple independent shards.
+* **Topology**: 1 coordinator gateway + 3 independent storage shards (partitioned via consistent hashing).
 ```bash
 docker compose up --build -d
 ```
+* **Endpoints**:
+  * Coordinator Gateway: `http://localhost:8080`
+  * Shards 0, 1, 2: `http://localhost:8081`, `http://localhost:8082`, `http://localhost:8083`
 
-This will run:
-- `shard0` at `http://localhost:8081`
-- `shard1` at `http://localhost:8082`
-- `shard2` at `http://localhost:8083`
-- `coordinator` gateway at `http://localhost:8080` (public interface)
+#### Option C: Sharded + High-Availability Replicas (Enterprise Scale & HA)
+* **Best for**: Large-scale vector volumes that exceed single-machine memory **and** require multi-replica fault tolerance.
+* **Topology**: 1 coordinator gateway + 2 shard groups $\times$ 2 replicas per shard (4 storage nodes total).
+```bash
+docker compose -f docker-compose.sharded-ha.yml up --build -d
+```
+* **Endpoints**:
+  * Coordinator Gateway: `http://localhost:8080`
+  * Shard 0 (Replicas A/B): `http://localhost:8081`, `http://localhost:8082`
+  * Shard 1 (Replicas A/B): `http://localhost:8083`, `http://localhost:8084`
 
 Open **EpochDB Studio** at [http://localhost:8080/visualize](http://localhost:8080/visualize) (also served at `/`).
 

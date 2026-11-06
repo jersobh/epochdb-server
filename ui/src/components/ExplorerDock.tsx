@@ -25,7 +25,7 @@ interface ExplorerDockProps {
   onFocusSubmit: (v: string) => void;
   filterValue: string;
   onFilterChange: (v: string) => void;
-  onFilterSubmit: () => void;
+  onFilterSubmit: (v?: string) => void;
   depth: number;
   onDepthChange: (d: number) => void;
   physicsEnabled: boolean;
@@ -401,12 +401,12 @@ export function ExplorerDock({
                 onChange={(v) => {
                   onFilterChange(v);
                   if (!v.trim()) {
-                    setTimeout(() => onFilterSubmit(), 250);
+                    setTimeout(() => onFilterSubmit(''), 250);
                   }
                 }}
                 getItems={suggestEntities}
-                onPick={() => onFilterSubmit()}
-                onSubmit={() => onFilterSubmit()}
+                onPick={(it) => onFilterSubmit(it.value)}
+                onSubmit={(val) => onFilterSubmit(val)}
               />
             </div>
             <div className="input-group">

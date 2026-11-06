@@ -143,7 +143,7 @@ export function classifyNodes(
       .toLowerCase()
       .replace(/[\s-]+/g, '_');
     if (slug.length <= 64 && /^[a-z][a-z0-9_]*$/.test(slug)) {
-      if (!allowed || allowed.has(slug)) return slug;
+      if (!allowed || allowed.has(slug) || slug === 'skill') return slug;
       // New discovery not yet registered — still accept compact ids
       return slug;
     }
@@ -208,7 +208,7 @@ export function classifyNodes(
   const out: Record<string, NodeType> = {};
   names.forEach((n) => {
     const l = n.toLowerCase();
-    if ((/^skill:/.test(l) || skillNames.has(l)) && (!allowed || allowed.has('skill'))) {
+    if (/^skill:/.test(l) || skillNames.has(l)) {
       out[n] = 'skill';
       return;
     }
@@ -219,7 +219,7 @@ export function classifyNodes(
     }
 
     const fromName = inferTypeFromName(n);
-    if (fromName && (!allowed || allowed.has(fromName))) {
+    if (fromName && (!allowed || allowed.has(fromName) || fromName === 'skill')) {
       out[n] = fromName;
       return;
     }

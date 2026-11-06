@@ -147,7 +147,10 @@ export default function App() {
     async (entityFilter?: string, depthOverride?: number, overrideSkillNames?: Set<string>) => {
       setLoading(true);
       try {
-        const filter = (entityFilter ?? filterValue).trim();
+        const filter = (entityFilter !== undefined ? entityFilter : filterValue).trim();
+        if (entityFilter !== undefined && entityFilter !== filterValue) {
+          setFilterValue(entityFilter);
+        }
         const d = depthOverride ?? depth;
         const data = await fetchEntityGraph(filter || undefined, d);
         const names = data.nodes || [];
@@ -276,7 +279,7 @@ export default function App() {
   }, [skillNameSet]);
 
   const visibleNodes = useMemo(
-    () => rawNodes.filter((n) => !disabledTypes.has(nodeTypes[n] || 'concept')),
+    () => rawNodes.filter((n) => !disabledTypes.has(nodeTypes[n] || 'entity')),
     [rawNodes, disabledTypes, nodeTypes]
   );
   const visibleSet = useMemo(() => new Set(visibleNodes), [visibleNodes]);
@@ -372,7 +375,7 @@ export default function App() {
         showToast('No matching node');
         return;
       }
-      const matchType = nodeTypes[match] || 'concept';
+      const matchType = nodeTypes[match] || 'entity';
       if (disabledTypes.has(matchType)) {
         setDisabledTypes((prev) => {
           const next = new Set(prev);
@@ -398,7 +401,7 @@ export default function App() {
   const legendCounts = useMemo(() => {
     const counts: Record<string, number> = {};
     rawNodes.forEach((n) => {
-      const t = nodeTypes[n] || 'concept';
+      const t = nodeTypes[n] || 'entity';
       counts[t] = (counts[t] || 0) + 1;
     });
     return counts;
@@ -508,7 +511,11 @@ export default function App() {
           onFocusSubmit={(v) => void focusNode(v)}
           filterValue={filterValue}
           onFilterChange={setFilterValue}
-          onFilterSubmit={() => void loadGraph()}
+          onFilterSubmit={(val) => {
+            const next = val !== undefined ? val : filterValue;
+            setFilterValue(next);
+            void loadGraph(next);
+          }}
           depth={depth}
           onDepthChange={(d) => {
             setDepth(d);

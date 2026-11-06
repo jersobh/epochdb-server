@@ -700,6 +700,54 @@ def test_coordinator_import_resilience():
         server.API_KEY = orig_api_key
 
 
+def test_entity_graph_traversal_depth():
+    """Verify that traversal depth strictly prunes subgraphs and does not leak disconnected entities."""
+    headers = {"X-Internal-Token": "test-token-12345", "X-Namespace": "depth-test-ns"}
+
+    with TestClient(app) as client:
+        # Create a 4-hop chain: DepthChain_A -> DepthChain_B -> DepthChain_C -> DepthChain_D -> DepthChain_E
+        # And an unrelated node: Unrelated_X -> Unrelated_Y
+        client.post("/remember", json={
+            "triples": [
+                ["DepthChain_A", "connected_to", "DepthChain_B"],
+                ["DepthChain_B", "connected_to", "DepthChain_C"],
+                ["DepthChain_C", "connected_to", "DepthChain_D"],
+                ["DepthChain_D", "connected_to", "DepthChain_E"],
+                ["Unrelated_X", "connected_to", "Unrelated_Y"],
+            ]
+        }, headers=headers)
+
+        # Depth 1: DepthChain_A and DepthChain_B only
+        resp1 = client.get("/entity_graph?entity_id=DepthChain_A&depth=1", headers=headers)
+        assert resp1.status_code == 200
+        data1 = resp1.json()
+        assert set(data1["nodes"]) == {"DepthChain_A", "DepthChain_B"}
+        assert len(data1["edges"]) == 1
+
+        # Depth 2: A, B, C
+        resp2 = client.get("/entity_graph?entity_id=DepthChain_A&depth=2", headers=headers)
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert set(data2["nodes"]) == {"DepthChain_A", "DepthChain_B", "DepthChain_C"}
+        assert len(data2["edges"]) == 2
+
+        # Depth 3: A, B, C, D
+        resp3 = client.get("/entity_graph?entity_id=DepthChain_A&depth=3", headers=headers)
+        assert resp3.status_code == 200
+        data3 = resp3.json()
+        assert set(data3["nodes"]) == {"DepthChain_A", "DepthChain_B", "DepthChain_C", "DepthChain_D"}
+        assert len(data3["edges"]) == 3
+
+        # Depth 4: A, B, C, D, E (Unrelated_X / Y must never appear)
+        resp4 = client.get("/entity_graph?entity_id=DepthChain_A&depth=4", headers=headers)
+        assert resp4.status_code == 200
+        data4 = resp4.json()
+        assert set(data4["nodes"]) == {"DepthChain_A", "DepthChain_B", "DepthChain_C", "DepthChain_D", "DepthChain_E"}
+        assert "Unrelated_X" not in data4["nodes"]
+        assert "Unrelated_Y" not in data4["nodes"]
+
+
+
 
 
 
