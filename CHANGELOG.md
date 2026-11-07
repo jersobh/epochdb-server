@@ -2,6 +2,21 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.14.1] - 2026-11-07
+### Added
+- **GLiNER Zero-Shot Extraction Support**:
+  - Integrated `gliner` library for zero-shot named entity and relational extraction, enabling seamless support for checkpoints with architecture `gliner_uni_encoder_span` (such as `jersobh/epochdb-extractor`).
+  - Added `gliner>=0.2.0` dependency to `pyproject.toml`, updated `poetry.lock`, and included in Docker build image.
+
+### Fixed
+- **Process-Level Model Pooling & Memory Optimization**:
+  - Implemented shared process-level model caches (`_SHARED_EMBEDDER_CACHE` and `_SHARED_EXTRACTOR_MODELS`) across all partition instances within the same server process.
+  - Eliminated duplicate 600MB model loading per tenant/namespace partition, preventing worker OOM kills (`SIGKILL`) under high multi-tenant partition load.
+- **Wildcard Overview Graph Traversal**:
+  - Filtered out `None`/empty namespaces in `_overview_graph` when aggregating across wildcard namespaces (`*` / `all`), avoiding tenant root lock collisions (`FileExistsError: /data/tenants/<tenant>/.lock`).
+- **CI Dependency Verification**:
+  - Synced `poetry.lock` with `pyproject.toml` to ensure clean automated GitHub Actions builds with `poetry install --no-root`.
+
 ## [0.14.0] - 2026-11-07
 ### Added
 - **Unified "All Namespaces" (`*` / `all`) Scope Aggregation**:
