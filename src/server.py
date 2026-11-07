@@ -404,6 +404,42 @@ def _patch_epochdb_fact_extractor():
         def patched_load(self):
             if self._model is not None:
                 return
+
+            cache_dir = self._cache_dir()
+            load_id = cache_dir if cache_dir and os.path.isdir(cache_dir) and os.listdir(cache_dir) else self.model_id
+            logger.info(f"Loading HuggingFace extraction model: {load_id}")
+
+            # 1. Detect if the checkpoint is a GLiNER zero-shot entity model
+            is_gliner = "gliner" in load_id.lower() or "epochdb-extractor" in load_id.lower()
+            if not is_gliner:
+                try:
+                    from transformers import AutoConfig
+                    cfg = AutoConfig.from_pretrained(load_id)
+                    if getattr(cfg, "model_type", "") == "gliner_uni_encoder_span":
+                        is_gliner = True
+                except Exception as e:
+                    if "gliner" in str(e).lower():
+                        is_gliner = True
+
+            if is_gliner:
+                try:
+                    from gliner import GLiNER
+                    self._model = GLiNER.from_pretrained(load_id)
+                    self._is_gliner = True
+                    self._is_causal = False
+                    self._tokenizer = None
+                    if cache_dir and load_id == self.model_id:
+                        try:
+                            os.makedirs(cache_dir, exist_ok=True)
+                            self._model.save_pretrained(cache_dir)
+                        except Exception as ce:
+                            logger.warning(f"Could not cache GLiNER model to {cache_dir}: {ce}")
+                    logger.info(f"Loaded GLiNER extraction model successfully: {load_id}")
+                    return
+                except Exception as gliner_err:
+                    logger.warning(f"Could not load as GLiNER model: {gliner_err}")
+
+            # 2. Otherwise load via Transformers (Seq2Seq, CausalLM, or GLiNER fallback)
             try:
                 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
             except ImportError:
@@ -412,21 +448,28 @@ def _patch_epochdb_fact_extractor():
                     "Install it with: pip install epochdb[extraction]"
                 )
 
-            cache_dir = self._cache_dir()
-            load_id = cache_dir if cache_dir and os.path.isdir(cache_dir) and os.listdir(cache_dir) else self.model_id
-            logger.info(f"Loading HuggingFace extraction model: {load_id}")
             self._tokenizer = AutoTokenizer.from_pretrained(load_id)
             try:
                 self._model = AutoModelForSeq2SeqLM.from_pretrained(load_id)
                 self._is_causal = False
             except (ValueError, KeyError, Exception):
-                import torch
-                from transformers import AutoModelForCausalLM
-                self._model = AutoModelForCausalLM.from_pretrained(
-                    load_id,
-                    dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                )
-                self._is_causal = True
+                try:
+                    import torch
+                    from transformers import AutoModelForCausalLM
+                    self._model = AutoModelForCausalLM.from_pretrained(
+                        load_id,
+                        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    )
+                    self._is_causal = True
+                except Exception as causal_err:
+                    if "gliner" in str(causal_err).lower():
+                        from gliner import GLiNER
+                        self._model = GLiNER.from_pretrained(load_id)
+                        self._is_gliner = True
+                        self._is_causal = False
+                        logger.info(f"Loaded GLiNER extraction model after transformers mismatch: {load_id}")
+                        return
+                    raise causal_err
             self._model.eval()
 
             if cache_dir and load_id == self.model_id:
@@ -438,8 +481,47 @@ def _patch_epochdb_fact_extractor():
                     logger.warning(f"Could not cache HF extraction model to {cache_dir}: {e}")
 
         def patched_extract(self, text: str):
-            import torch
             self._load()
+
+            if getattr(self, "_is_gliner", False):
+                raw_labels = os.getenv(
+                    "EPOCHDB_EXTRACTION_LABELS",
+                    "person, organization, company, location, product, concept, event, role, technology, topic"
+                )
+                labels = [l.strip() for l in raw_labels.split(",") if l.strip()]
+                threshold = float(os.getenv("EPOCHDB_EXTRACTION_THRESHOLD", "0.4"))
+                try:
+                    ents = self._model.predict_entities(text, labels=labels, threshold=threshold)
+                except Exception as ex:
+                    logger.warning(f"GLiNER prediction error: {ex}")
+                    return []
+
+                triples = []
+                cleaned_entities = []
+                seen_entities = set()
+                for e in ents:
+                    ent_text = (e.get("text") or "").strip()
+                    ent_label = (e.get("label") or "").strip()
+                    if not ent_text:
+                        continue
+                    if ent_label:
+                        triples.append((ent_text, "is_a", ent_label))
+                    if ent_text.lower() not in seen_entities:
+                        seen_entities.add(ent_text.lower())
+                        cleaned_entities.append(ent_text)
+
+                # Connect consecutive extracted entities with relational edge
+                if len(cleaned_entities) >= 2:
+                    for i in range(len(cleaned_entities) - 1):
+                        triples.append((cleaned_entities[i], "associated_with", cleaned_entities[i + 1]))
+                    if len(cleaned_entities) > 2:
+                        triples.append((cleaned_entities[0], "associated_with", cleaned_entities[-1]))
+                elif len(cleaned_entities) == 1 and not triples:
+                    triples.append((cleaned_entities[0], "mentions", cleaned_entities[0]))
+
+                return fe._normalize_triples(triples)
+
+            import torch
             assert self._tokenizer is not None and self._model is not None
 
             if getattr(self, "_is_causal", False):

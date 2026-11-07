@@ -43,6 +43,7 @@ RUN pip install --no-cache-dir \
     "httpx>=0.28.0" \
     "gunicorn>=22.0.0" \
     "sse-starlette>=2.1.0,<4.0.0" \
+    "gliner>=0.2.0" \
     && pip install --force-reinstall --no-cache-dir --no-binary=hnswlib hnswlib \
     && apt-get purge -y build-essential g++ \
     && apt-get autoremove -y \
