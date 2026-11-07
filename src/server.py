@@ -53,7 +53,7 @@ class EpochEmbedderAdapter:
                             if getattr(arch, "is_decoder", False) or "causal" in arch_str or "qwen" in model_type or "llama" in model_type:
                                 is_causal = True
                                 break
-                    if not is_causal and any(k in self.model_name.lower() for k in ["qwen", "epochdb-embed"]):
+                    if not is_causal and any(k in self.model_name.lower() for k in ["qwen"]):
                         is_causal = True
 
                     if is_causal and current_mode != "lasttoken":
@@ -80,7 +80,9 @@ class EpochEmbedderAdapter:
         if isinstance(prompts, dict) and "query" in prompts:
             return {"prompt_name": "query"}
         model_id = str(getattr(self.model, "model_name_or_path", "") or self.model_name).lower()
-        if any(k in model_id for k in ["qwen", "epochdb-embed", "bge-", "e5-"]):
+        if "epochdb-embed" in model_id or "e5-" in model_id:
+            return {"prompt": "query: "}
+        if any(k in model_id for k in ["qwen", "bge-"]):
             return {"prompt": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "}
         return {}
 
@@ -2601,76 +2603,161 @@ async def query_memories(
                 result["failed_shards"] = failed_shards
             return result
         else:
-            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
-            try:
-                query_kwargs = {
-                    "text": query_text,
-                    "k": payload.k,
-                    "filters": payload.filters,
-                    "memory_type": payload.memory_type,
-                    "context_window": payload.context_window,
-                    "min_score": payload.min_score,
-                }
-                if payload.expand_hops > 0:
-                    query_kwargs["expand_hops"] = payload.expand_hops
-                if payload.cold_search_mode:
-                    query_kwargs["cold_search_mode"] = payload.cold_search_mode
+            if ctx.namespace in ("*", "all"):
+                target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+                if not target_namespaces:
+                    return {"results": [], "memories": []}
 
+                # Pre-embed query once for fast cosine similarity scoring
+                q_emb = None
                 try:
-                    results = await active_db.query(**query_kwargs)
-                except TypeError:
-                    query_kwargs.pop("expand_hops", None)
-                    query_kwargs.pop("cold_search_mode", None)
-                    results = await active_db.query(**query_kwargs)
-                
-                engine = await active_db._get_db()
-                embedder = engine._get_embedder()
-                q_emb = await run_embedding(
-                    embedder.encode,
-                    query_text,
-                    is_query=True,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                )
-                q_emb = np.array(q_emb, dtype=np.float32)
-                if len(q_emb) > engine.dim:
-                    q_emb = q_emb[:engine.dim]
-                    norm = np.linalg.norm(q_emb)
-                    if norm > 1e-10:
-                        q_emb /= norm
-                
-                formatted_results = []
-                for r in results:
-                    score = float(getattr(r, "score", 0.0))
-                    if score == 0.0 and q_emb.any() and r._atom.embedding.any():
-                        atom_emb = r._atom.embedding
-                        if len(atom_emb) != len(q_emb):
-                            min_len = min(len(atom_emb), len(q_emb))
-                            score = float(np.dot(atom_emb[:min_len], q_emb[:min_len]) / (
-                                np.linalg.norm(atom_emb[:min_len]) * np.linalg.norm(q_emb[:min_len]) + 1e-10
-                            ))
-                        else:
-                            score = float(np.dot(atom_emb, q_emb) / (
-                                np.linalg.norm(atom_emb) * np.linalg.norm(q_emb) + 1e-10
-                            ))
-                    item_data = {
-                        "id": r.id,
-                        "text": r.text,
-                        "metadata": r.metadata,
-                        "created_at": r.created_at,
-                        "score": score
-                    }
-                    if hasattr(r._atom, "memory_type") and r._atom.memory_type:
-                        item_data["memory_type"] = r._atom.memory_type.value if hasattr(r._atom.memory_type, "value") else str(r._atom.memory_type)
-                    formatted_results.append(item_data)
+                    embed_engine = db or (await get_db_instance(None, None))
+                    e_backend = await embed_engine._get_db()
+                    embedder = e_backend._get_embedder()
+                    raw_q = await run_embedding(
+                        embedder.encode,
+                        query_text,
+                        is_query=True,
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                    )
+                    q_emb = np.array(raw_q, dtype=np.float32)
+                    if len(q_emb) > e_backend.dim:
+                        q_emb = q_emb[:e_backend.dim]
+                        norm = np.linalg.norm(q_emb)
+                        if norm > 1e-10:
+                            q_emb /= norm
+                except Exception as e:
+                    logger.warning(f"Error pre-embedding query text: {e}")
+
+                all_results = []
+                seen_ids = set()
+                for ns in target_namespaces:
+                    try:
+                        active_db = await get_db_instance(ctx.tenant, ns)
+                        query_kwargs = {
+                            "text": query_text,
+                            "k": payload.k,
+                            "filters": payload.filters,
+                            "memory_type": payload.memory_type,
+                            "context_window": payload.context_window,
+                            "min_score": payload.min_score,
+                        }
+                        if payload.expand_hops > 0:
+                            query_kwargs["expand_hops"] = payload.expand_hops
+                        if payload.cold_search_mode:
+                            query_kwargs["cold_search_mode"] = payload.cold_search_mode
+
+                        try:
+                            results = await active_db.query(**query_kwargs)
+                        except TypeError:
+                            query_kwargs.pop("expand_hops", None)
+                            query_kwargs.pop("cold_search_mode", None)
+                            results = await active_db.query(**query_kwargs)
+
+                        for r in results:
+                            if r.id not in seen_ids:
+                                seen_ids.add(r.id)
+                                score = float(getattr(r, "score", 0.0))
+                                if score == 0.0 and q_emb is not None and q_emb.any() and hasattr(r, "_atom") and getattr(r._atom, "embedding", None) is not None and len(r._atom.embedding) > 0:
+                                    atom_emb = r._atom.embedding
+                                    min_len = min(len(atom_emb), len(q_emb))
+                                    score = float(np.dot(atom_emb[:min_len], q_emb[:min_len]) / (
+                                        np.linalg.norm(atom_emb[:min_len]) * np.linalg.norm(q_emb[:min_len]) + 1e-10
+                                    ))
+                                item_data = {
+                                    "id": r.id,
+                                    "text": r.text,
+                                    "metadata": r.metadata,
+                                    "created_at": r.created_at,
+                                    "score": score
+                                }
+                                if hasattr(r._atom, "memory_type") and r._atom.memory_type:
+                                    item_data["memory_type"] = r._atom.memory_type.value if hasattr(r._atom.memory_type, "value") else str(r._atom.memory_type)
+                                all_results.append(item_data)
+                    except Exception as e:
+                        logger.warning(f"Error querying namespace {ns}: {e}")
 
                 if payload.min_score > 0.0:
-                    formatted_results = [r for r in formatted_results if r.get("score", 0.0) >= payload.min_score]
+                    all_results = [r for r in all_results if r.get("score", 0.0) >= payload.min_score]
 
-                return {"results": formatted_results, "memories": formatted_results}
-            except Exception as e:
-                logger.error(f"Error resolving retrieval operations: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+                all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+                top_results = all_results[:payload.k]
+                return {"results": top_results, "memories": top_results}
+            else:
+                active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+                try:
+                    query_kwargs = {
+                        "text": query_text,
+                        "k": payload.k,
+                        "filters": payload.filters,
+                        "memory_type": payload.memory_type,
+                        "context_window": payload.context_window,
+                        "min_score": payload.min_score,
+                    }
+                    if payload.expand_hops > 0:
+                        query_kwargs["expand_hops"] = payload.expand_hops
+                    if payload.cold_search_mode:
+                        query_kwargs["cold_search_mode"] = payload.cold_search_mode
+
+                    try:
+                        results = await active_db.query(**query_kwargs)
+                    except TypeError:
+                        query_kwargs.pop("expand_hops", None)
+                        query_kwargs.pop("cold_search_mode", None)
+                        results = await active_db.query(**query_kwargs)
+                    
+                    formatted_results = []
+                    needs_rescoring = any(float(getattr(r, "score", 0.0)) == 0.0 for r in results)
+                    q_emb = None
+                    if needs_rescoring:
+                        engine = await active_db._get_db()
+                        embedder = engine._get_embedder()
+                        raw_q = await run_embedding(
+                            embedder.encode,
+                            query_text,
+                            is_query=True,
+                            normalize_embeddings=True,
+                            show_progress_bar=False,
+                        )
+                        q_emb = np.array(raw_q, dtype=np.float32)
+                        if len(q_emb) > engine.dim:
+                            q_emb = q_emb[:engine.dim]
+                            norm = np.linalg.norm(q_emb)
+                            if norm > 1e-10:
+                                q_emb /= norm
+
+                    for r in results:
+                        score = float(getattr(r, "score", 0.0))
+                        if score == 0.0 and q_emb is not None and q_emb.any() and getattr(r._atom, "embedding", None) is not None and r._atom.embedding.any():
+                            atom_emb = r._atom.embedding
+                            if len(atom_emb) != len(q_emb):
+                                min_len = min(len(atom_emb), len(q_emb))
+                                score = float(np.dot(atom_emb[:min_len], q_emb[:min_len]) / (
+                                    np.linalg.norm(atom_emb[:min_len]) * np.linalg.norm(q_emb[:min_len]) + 1e-10
+                                ))
+                            else:
+                                score = float(np.dot(atom_emb, q_emb) / (
+                                    np.linalg.norm(atom_emb) * np.linalg.norm(q_emb) + 1e-10
+                                ))
+                        item_data = {
+                            "id": r.id,
+                            "text": r.text,
+                            "metadata": r.metadata,
+                            "created_at": r.created_at,
+                            "score": score
+                        }
+                        if hasattr(r._atom, "memory_type") and r._atom.memory_type:
+                            item_data["memory_type"] = r._atom.memory_type.value if hasattr(r._atom.memory_type, "value") else str(r._atom.memory_type)
+                        formatted_results.append(item_data)
+
+                    if payload.min_score > 0.0:
+                        formatted_results = [r for r in formatted_results if r.get("score", 0.0) >= payload.min_score]
+
+                    return {"results": formatted_results, "memories": formatted_results}
+                except Exception as e:
+                    logger.error(f"Error resolving retrieval operations: {e}")
+                    raise HTTPException(status_code=500, detail=str(e))
 
     return await handle_cached_read("query", payload, request, response, ctx, fetch)
 
