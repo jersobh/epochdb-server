@@ -2,6 +2,24 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.15.0] - 2026-11-07
+### Added
+- **Hierarchical Multi-Level Scoping**:
+  - Replaced shallow single-level partition scanning with recursive filesystem traversal (`_scan_ns_directory` via `os.walk`), supporting arbitrary nested namespace depth (e.g. `tenant/dealer-group/dealer/store`).
+  - Added prefix and pattern-based hierarchical wildcard matching (`is_wildcard_namespace` and `get_namespaces_for_tenant`) allowing sub-tree queries such as `group_WELLER/*` to automatically fan out across and aggregate all child stores.
+  - Aligned with ECI/enterprise RBAC: Scoped API keys can be restricted to exact leaf stores or wildcard sub-trees (`group_WELLER/*`), strictly denying unauthorized partitions with `HTTP 403 Forbidden`.
+- **20,000 Writes Concurrency & High-Throughput Resilience**:
+  - Increased `SHARD_EMBED_QUEUE_LIMIT` default from 8 to 100,000, eliminating premature HTTP 503 saturation errors during high-volume concurrent write bursts.
+  - Upgraded event loop executor to a dedicated `ThreadPoolExecutor(max_workers=max(128, cpu_count * 16))` to prevent threadpool queue starvation under thousands of concurrent tasks.
+  - Converted SSE event dispatching to non-blocking `put_nowait` with queue eviction on `QueueFull` so slow SSE clients never stall ingest pipelines.
+  - Configured Gunicorn TCP listen backlog (`--backlog ${GUNICORN_BACKLOG:-32768}`) in `Dockerfile` to handle massive concurrent traffic spikes without dropped connection handshakes.
+  - Raised Coordinator HTTP connection limits to 25,000 max connections and 5,000 keep-alive connections.
+  - Vectorized `remember_batch()` memory ingestion with caller-supplied atom ID preservation.
+
+### Fixed
+- **SQLite Concurrency & Lock Shield**:
+  - Increased SQLite KG manager busy timeout to 60s, enabled `PRAGMA wal_autocheckpoint = 1000`, and added exponential backoff retry loops on `sqlite3.OperationalError: database is locked`.
+
 ## [0.14.1] - 2026-11-07
 ### Added
 - **GLiNER Zero-Shot Extraction Support**:
