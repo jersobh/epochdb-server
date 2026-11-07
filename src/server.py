@@ -327,7 +327,7 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.13.2"
+SERVER_VERSION = "0.14.0"
 # Coordinator→shard HTTP timeout. Embeddings on small VPS CPUs often exceed 30s
 # under concurrent ingest; default matches gunicorn --timeout 120.
 COORDINATOR_HTTP_TIMEOUT = float(os.getenv("COORDINATOR_HTTP_TIMEOUT", "120"))
@@ -492,6 +492,20 @@ def _patch_epochdb_fact_extractor():
         fe.HuggingFaceFactExtractor._load = patched_load
         fe.HuggingFaceFactExtractor.extract = patched_extract
         fe._parse_jsonish_triples = patched_parse_jsonish_triples
+
+        orig_fe_extract = fe.FactExtractor.extract
+        def patched_fe_extract(self, text: str):
+            if getattr(self, "_failed_once", False):
+                return self._local_extractor.extract(text)
+            try:
+                return self._get_impl().extract(text)
+            except Exception as e:
+                logger.warning(f"Falling back to LocalFactExtractor permanently for this session ({self._backend_name}): {e}")
+                self._failed_once = True
+                self._impl = self._local_extractor
+                return self._local_extractor.extract(text)
+
+        fe.FactExtractor.extract = patched_fe_extract
         fe._causal_lm_patched = True
         logger.info("Initialized dynamic CausalLM loader for HuggingFace fact extractors.")
     except Exception as ex:
@@ -726,6 +740,11 @@ def invalidate_cache(tenant: Optional[str], namespace: Optional[str]):
     ctx_key = (tenant or "", namespace or "")
     CLUSTER_STATE_VERSIONS[ctx_key] = CLUSTER_STATE_VERSIONS.get(ctx_key, 0) + 1
     LOCAL_READ_CACHE[ctx_key] = {}
+    if namespace not in ("*", "all"):
+        for wildcard in ("*", "all"):
+            w_key = (tenant or "", wildcard)
+            CLUSTER_STATE_VERSIONS[w_key] = CLUSTER_STATE_VERSIONS.get(w_key, 0) + 1
+            LOCAL_READ_CACHE[w_key] = {}
     logger.debug(f"Invalidated read cache for tenant='{tenant}' namespace='{namespace}'. New version: {CLUSTER_STATE_VERSIONS[ctx_key]}")
 
 def generate_etag(endpoint: str, payload_dict: dict, state_version: int) -> str:
@@ -1207,7 +1226,13 @@ def get_shard_db_stats(tenant: Optional[str] = None, namespace: Optional[str] = 
     SentenceTransformer embeddings, heavy write locks, or cold start delays.
     """
     instances = []
-    if tenant is not None or namespace is not None:
+    if namespace in ("*", "all"):
+        for (t, ns), inst in db_pool.items():
+            if (t == tenant or (tenant is None and t is None)) and ns not in ("*", "all"):
+                instances.append(inst)
+        if tenant is None and db is not None:
+            instances.append(db)
+    elif tenant is not None or namespace is not None:
         if (tenant, namespace) in db_pool:
             instances.append(db_pool[(tenant, namespace)])
         elif db is not None:
@@ -1543,6 +1568,54 @@ def get_forward_headers(ctx: RequestContext) -> Dict[str, str]:
     return headers
 
 
+def _scan_local_databases() -> List[Dict[str, Optional[str]]]:
+    storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
+    db_keys = set()
+    for key in db_pool.keys():
+        if key[1] not in ("*", "all"):
+            db_keys.add(key)
+    if db is not None:
+        db_keys.add((None, None))
+    if os.path.exists(os.path.join(storage_dir, "metadata.json")):
+        db_keys.add((None, None))
+    ns_dir = os.path.join(storage_dir, "ns")
+    if os.path.exists(ns_dir):
+        try:
+            for namespace in os.listdir(ns_dir):
+                if namespace not in ("*", "all") and os.path.isdir(os.path.join(ns_dir, namespace)):
+                    db_keys.add((None, namespace))
+        except Exception as e:
+            logger.error(f"Error listing namespace directory: {e}")
+    tenants_dir = os.path.join(storage_dir, "tenants")
+    if os.path.exists(tenants_dir):
+        try:
+            for tenant in os.listdir(tenants_dir):
+                tenant_path = os.path.join(tenants_dir, tenant)
+                if os.path.isdir(tenant_path):
+                    if os.path.exists(os.path.join(tenant_path, "metadata.json")):
+                        db_keys.add((tenant, None))
+                    tenant_ns_dir = os.path.join(tenant_path, "ns")
+                    if os.path.exists(tenant_ns_dir):
+                        for namespace in os.listdir(tenant_ns_dir):
+                            if namespace not in ("*", "all") and os.path.isdir(os.path.join(tenant_ns_dir, namespace)):
+                                db_keys.add((tenant, namespace))
+        except Exception as e:
+            logger.error(f"Error listing tenants directory: {e}")
+    return [{"tenant": t, "namespace": ns} for t, ns in sorted(db_keys, key=lambda x: (x[0] or "", x[1] or ""))]
+
+
+def get_namespaces_for_tenant(tenant: Optional[str]) -> List[Optional[str]]:
+    all_dbs = _scan_local_databases()
+    namespaces = set()
+    for item in all_dbs:
+        t = item["tenant"]
+        ns = item["namespace"]
+        if t == tenant or (tenant is None and t is None) or (tenant == "global" and t in (None, "global")):
+            if ns not in ("*", "all"):
+                namespaces.add(ns)
+    return sorted(list(namespaces), key=lambda x: (x is not None, x or ""))
+
+
 # Shard database partitions administration schemas and routes
 class ResetPayload(BaseModel):
     tenant: Optional[str] = None
@@ -1556,52 +1629,7 @@ async def admin_list_databases(ctx: RequestContext = Depends(get_context({Permis
     """
     if NODE_MODE == "coordinator":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only supported in Shard Mode.")
-    
-    storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
-    db_keys = set()
-    
-    # 1. Gather active databases from memory pool
-    for key in db_pool.keys():
-        db_keys.add(key)
-    if db is not None:
-        db_keys.add((None, None))
-        
-    # 2. Gather databases from filesystem scan
-    if os.path.exists(os.path.join(storage_dir, "metadata.json")):
-        db_keys.add((None, None))
-        
-    # Check namespaces directly under storage_dir
-    ns_dir = os.path.join(storage_dir, "ns")
-    if os.path.exists(ns_dir):
-        try:
-            for namespace in os.listdir(ns_dir):
-                if os.path.isdir(os.path.join(ns_dir, namespace)):
-                    db_keys.add((None, namespace))
-        except Exception as e:
-            logger.error(f"Error listing namespace directory: {e}")
-            
-    # Check tenants
-    tenants_dir = os.path.join(storage_dir, "tenants")
-    if os.path.exists(tenants_dir):
-        try:
-            for tenant in os.listdir(tenants_dir):
-                tenant_path = os.path.join(tenants_dir, tenant)
-                if os.path.isdir(tenant_path):
-                    # Check if tenant has default namespace db
-                    if os.path.exists(os.path.join(tenant_path, "metadata.json")):
-                        db_keys.add((tenant, None))
-                    
-                    # Check namespaces within tenant
-                    tenant_ns_dir = os.path.join(tenant_path, "ns")
-                    if os.path.exists(tenant_ns_dir):
-                        for namespace in os.listdir(tenant_ns_dir):
-                            if os.path.isdir(os.path.join(tenant_ns_dir, namespace)):
-                                db_keys.add((tenant, namespace))
-        except Exception as e:
-            logger.error(f"Error listing tenants directory: {e}")
-            
-    dbs = [{"tenant": t, "namespace": ns} for t, ns in db_keys]
-    return {"databases": dbs}
+    return {"databases": _scan_local_databases()}
 
 
 @app.get("/databases")
@@ -1621,39 +1649,7 @@ async def list_databases(ctx: RequestContext = Depends(get_context({Permission.R
             logger.error(f"Error querying databases from shard: {e}")
         return {"databases": []}
     else:
-        storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
-        db_keys = set()
-        for key in db_pool.keys():
-            db_keys.add(key)
-        if db is not None:
-            db_keys.add((None, None))
-        if os.path.exists(os.path.join(storage_dir, "metadata.json")):
-            db_keys.add((None, None))
-        ns_dir = os.path.join(storage_dir, "ns")
-        if os.path.exists(ns_dir):
-            try:
-                for namespace in os.listdir(ns_dir):
-                    if os.path.isdir(os.path.join(ns_dir, namespace)):
-                        db_keys.add((None, namespace))
-            except Exception as e:
-                logger.error(f"Error listing namespace directory: {e}")
-        tenants_dir = os.path.join(storage_dir, "tenants")
-        if os.path.exists(tenants_dir):
-            try:
-                for tenant in os.listdir(tenants_dir):
-                    tenant_path = os.path.join(tenants_dir, tenant)
-                    if os.path.isdir(tenant_path):
-                        if os.path.exists(os.path.join(tenant_path, "metadata.json")):
-                            db_keys.add((tenant, None))
-                        tenant_ns_dir = os.path.join(tenant_path, "ns")
-                        if os.path.exists(tenant_ns_dir):
-                            for namespace in os.listdir(tenant_ns_dir):
-                                if os.path.isdir(os.path.join(tenant_ns_dir, namespace)):
-                                    db_keys.add((tenant, namespace))
-            except Exception as e:
-                logger.error(f"Error listing tenants directory: {e}")
-        dbs = [{"tenant": t, "namespace": ns} for t, ns in db_keys if t is not None or ns is not None]
-        return {"databases": dbs}
+        return {"databases": _scan_local_databases()}
 
 
 @app.post("/admin/toggle_sync")
@@ -2972,13 +2968,31 @@ async def list_skills(
                             all_skills.append(s)
             return {"skills": all_skills}
         else:
-            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
-            try:
-                skills = await active_db.list_skills()
-                return {"skills": [s._atom.to_dict() for s in skills]}
-            except Exception as e:
-                logger.error(f"Error listing skills: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+            if ctx.namespace in ("*", "all"):
+                target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+                all_skills = []
+                seen = set()
+                for ns in target_namespaces:
+                    try:
+                        adb = await get_db_instance(ctx.tenant, ns)
+                        s_list = await adb.list_skills()
+                        for s in s_list:
+                            s_dict = s._atom.to_dict() if hasattr(s, "_atom") else s.to_dict()
+                            sid = s_dict.get("id") or s_dict.get("metadata", {}).get("skill_name")
+                            if sid not in seen:
+                                seen.add(sid)
+                                all_skills.append(s_dict)
+                    except Exception as e:
+                        logger.warning(f"Error listing skills for ns {ns}: {e}")
+                return {"skills": all_skills}
+            else:
+                active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+                try:
+                    skills = await active_db.list_skills()
+                    return {"skills": [s._atom.to_dict() for s in skills]}
+                except Exception as e:
+                    logger.error(f"Error listing skills: {e}")
+                    raise HTTPException(status_code=500, detail=str(e))
 
     return await handle_cached_read("list_skills", {}, request, response, ctx, fetch)
 
@@ -3696,23 +3710,32 @@ async def entity_graph(
                     result["failed_shards"] = failed_shards
                 return result
         else:
-            active_db = await get_db_instance(ctx.tenant, ctx.namespace)
             try:
                 if not entity_id:
                     # Studio overview: cheap KG index walk. The old hub×BFS path
                     # called recall_by_entity per hub and wedged workers=1 shards
                     # under MiniLM load, so /entity_graph timed out → empty UI.
-                    engine = await active_db._get_db()
+                    if ctx.namespace in ("*", "all"):
+                        target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+                    else:
+                        target_namespaces = [ctx.namespace]
+
+                    if not target_namespaces:
+                        return {"nodes": [], "edges": [], "typed_nodes": [], "node_types": {}}
+
+                    engines = []
+                    for ns in target_namespaces:
+                        try:
+                            adb = await get_db_instance(ctx.tenant, ns)
+                            eng = await adb._get_db()
+                            engines.append(eng)
+                        except Exception as exc:
+                            logger.warning(f"Failed to load engine for ns {ns}: {exc}")
+
+                    if not engines:
+                        return {"nodes": [], "edges": [], "typed_nodes": [], "node_types": {}}
 
                     def _overview_graph():
-                        with engine._internal_lock:
-                            atoms = list(engine.hot_tier.atoms.values())
-                            try:
-                                for epoch_id in engine.cold_tier.get_all_epochs():
-                                    atoms.extend(engine.cold_tier.load_epoch(epoch_id))
-                            except Exception as exc:
-                                logger.debug("Cold tier epoch load error: %s", exc)
-
                         nodes = set()
                         edges = []
                         relational_edges = []
@@ -3731,118 +3754,127 @@ async def entity_graph(
                             votes = node_type_votes.setdefault(ent, {})
                             votes[vtype_norm] = votes.get(vtype_norm, 0) + 1
 
-                        for atom in atoms:
-                            if atom.id in getattr(engine, "deleted_atom_ids", set()):
-                                continue
-                            if atom.metadata and atom.metadata.get("_deleted"):
-                                continue
+                        for eng in engines:
+                            with eng._internal_lock:
+                                eng_atoms = list(eng.hot_tier.atoms.values())
+                                try:
+                                    for epoch_id in eng.cold_tier.get_all_epochs():
+                                        eng_atoms.extend(eng.cold_tier.load_epoch(epoch_id))
+                                except Exception as exc:
+                                    logger.debug("Cold tier epoch load error: %s", exc)
 
-                            mtype = str(getattr(atom.memory_type, "value", atom.memory_type) or "").lower()
-                            if mtype == "skill" or (atom.metadata and atom.metadata.get("skill_name")):
-                                sk_name = (atom.metadata.get("skill_name") if atom.metadata else None) or atom.id
-                                explicit_types[sk_name] = "skill"
-                                nodes.add(sk_name)
-                            elif mtype == "profile" or (atom.metadata and atom.metadata.get("user_id")):
-                                uid = atom.metadata.get("user_id") if atom.metadata else None
-                                if uid:
-                                    explicit_types[uid] = "person"
-                                    nodes.add(uid)
-                                    role = atom.metadata.get("role")
-                                    if role:
-                                        explicit_types[role] = "role"
-                                        nodes.add(role)
+                            for atom in eng_atoms:
+                                if atom.id in getattr(eng, "deleted_atom_ids", set()):
+                                    continue
+                                if atom.metadata and atom.metadata.get("_deleted"):
+                                    continue
+
+                                mtype = str(getattr(atom.memory_type, "value", atom.memory_type) or "").lower()
+                                if mtype == "skill" or (atom.metadata and atom.metadata.get("skill_name")):
+                                    sk_name = (atom.metadata.get("skill_name") if atom.metadata else None) or atom.id
+                                    explicit_types[sk_name] = "skill"
+                                    nodes.add(sk_name)
+                                elif mtype == "profile" or (atom.metadata and atom.metadata.get("user_id")):
+                                    uid = atom.metadata.get("user_id") if atom.metadata else None
+                                    if uid:
+                                        explicit_types[uid] = "person"
+                                        nodes.add(uid)
+                                        role = atom.metadata.get("role")
+                                        if role:
+                                            explicit_types[role] = "role"
+                                            nodes.add(role)
+                                            relational_edges.append({
+                                                "source": uid,
+                                                "target": role,
+                                                "predicate": "holds_role",
+                                                "memory_id": atom.id,
+                                            })
+                                        team = atom.metadata.get("team")
+                                        if team:
+                                            explicit_types[team] = "organization"
+                                            nodes.add(team)
+                                            relational_edges.append({
+                                                "source": uid,
+                                                "target": team,
+                                                "predicate": "member_of",
+                                                "memory_id": atom.id,
+                                            })
+
+                                raw_triples = list(getattr(atom, "triples", []) or [])
+                                if not raw_triples and atom.metadata:
+                                    raw_triples = list(atom.metadata.get("triples") or [])
+
+                                for item in raw_triples:
+                                    if not isinstance(item, (list, tuple)) or len(item) < 3:
+                                        continue
+                                    s, p, o = str(item[0]).strip(), str(item[1]).strip(), str(item[2]).strip()
+                                    if not s or not o:
+                                        continue
+                                    pred_slug = _slug(p)
+                                    if not pred_slug:
+                                        continue
+
+                                    if pred_slug in TYPE_DEFINING_PREDICATES:
+                                        canon = normalize_type(o, allowed=ENTITY_TYPE_SET, default="")
+                                        if canon and canon != "entity":
+                                            explicit_types[s] = canon
+                                        nodes.add(s)
+                                        nodes.add(o)
                                         relational_edges.append({
-                                            "source": uid,
-                                            "target": role,
-                                            "predicate": "holds_role",
+                                            "source": s,
+                                            "target": o,
+                                            "predicate": p,
                                             "memory_id": atom.id,
                                         })
-                                    team = atom.metadata.get("team")
-                                    if team:
-                                        explicit_types[team] = "organization"
-                                        nodes.add(team)
+                                        continue
+
+                                    if pred_slug == "is_skill":
+                                        explicit_types[s] = "skill"
+                                        explicit_types[o] = "skill"
+                                        nodes.add(s)
+                                        nodes.add(o)
                                         relational_edges.append({
-                                            "source": uid,
-                                            "target": team,
-                                            "predicate": "member_of",
+                                            "source": s,
+                                            "target": o,
+                                            "predicate": p,
                                             "memory_id": atom.id,
                                         })
+                                        continue
 
-                            raw_triples = list(getattr(atom, "triples", []) or [])
-                            if not raw_triples and atom.metadata:
-                                raw_triples = list(atom.metadata.get("triples") or [])
+                                    if pred_slug.startswith("has_step"):
+                                        explicit_types[s] = "skill"
+                                        _cast_vote(o, "process")
+                                        nodes.add(s)
+                                        nodes.add(o)
+                                        relational_edges.append({
+                                            "source": s,
+                                            "target": o,
+                                            "predicate": p,
+                                            "memory_id": atom.id,
+                                        })
+                                        continue
 
-                            for item in raw_triples:
-                                if not isinstance(item, (list, tuple)) or len(item) < 3:
-                                    continue
-                                s, p, o = str(item[0]).strip(), str(item[1]).strip(), str(item[2]).strip()
-                                if not s or not o:
-                                    continue
-                                pred_slug = _slug(p)
-                                if not pred_slug:
-                                    continue
+                                    if pred_slug in PRED_ROLES:
+                                        s_role, o_role = PRED_ROLES[pred_slug]
+                                        _cast_vote(s, s_role)
+                                        _cast_vote(o, o_role)
 
-                                if pred_slug in TYPE_DEFINING_PREDICATES:
-                                    canon = normalize_type(o, allowed=ENTITY_TYPE_SET, default="")
-                                    if canon and canon != "entity":
-                                        explicit_types[s] = canon
-                                    nodes.add(s)
-                                    nodes.add(o)
-                                    relational_edges.append({
-                                        "source": s,
-                                        "target": o,
-                                        "predicate": p,
-                                        "memory_id": atom.id,
-                                    })
-                                    continue
-
-                                if pred_slug == "is_skill":
-                                    explicit_types[s] = "skill"
-                                    explicit_types[o] = "skill"
-                                    nodes.add(s)
-                                    nodes.add(o)
-                                    relational_edges.append({
-                                        "source": s,
-                                        "target": o,
-                                        "predicate": p,
-                                        "memory_id": atom.id,
-                                    })
-                                    continue
-
-                                if pred_slug.startswith("has_step"):
-                                    explicit_types[s] = "skill"
-                                    _cast_vote(o, "process")
-                                    nodes.add(s)
-                                    nodes.add(o)
-                                    relational_edges.append({
-                                        "source": s,
-                                        "target": o,
-                                        "predicate": p,
-                                        "memory_id": atom.id,
-                                    })
-                                    continue
-
-                                if pred_slug in PRED_ROLES:
-                                    s_role, o_role = PRED_ROLES[pred_slug]
-                                    _cast_vote(s, s_role)
-                                    _cast_vote(o, o_role)
-
-                                if pred_slug not in ("co_occurs_with", "mentions", "related"):
-                                    nodes.add(s)
-                                    nodes.add(o)
-                                    relational_edges.append({
-                                        "source": s,
-                                        "target": o,
-                                        "predicate": p,
-                                        "memory_id": atom.id,
-                                    })
-                                else:
-                                    cooccur_edges.append({
-                                        "source": s,
-                                        "target": o,
-                                        "predicate": p,
-                                        "memory_id": atom.id,
-                                    })
+                                    if pred_slug not in ("co_occurs_with", "mentions", "related"):
+                                        nodes.add(s)
+                                        nodes.add(o)
+                                        relational_edges.append({
+                                            "source": s,
+                                            "target": o,
+                                            "predicate": p,
+                                            "memory_id": atom.id,
+                                        })
+                                    else:
+                                        cooccur_edges.append({
+                                            "source": s,
+                                            "target": o,
+                                            "predicate": p,
+                                            "memory_id": atom.id,
+                                        })
 
                         if relational_edges:
                             for e in relational_edges:
@@ -3860,30 +3892,31 @@ async def entity_graph(
                                     rel_nodes.add(name)
                             node_list = list(rel_nodes)
                         else:
-                            hubs = engine.get_hub_entities(GRAPH_HUB_LIMIT)
-                            if not hubs and not nodes:
-                                all_ents = engine.get_entities()
-                                if all_ents:
-                                    hubs = all_ents[:GRAPH_HUB_LIMIT]
+                            for eng in engines:
+                                hubs = eng.get_hub_entities(GRAPH_HUB_LIMIT)
+                                if not hubs and not nodes:
+                                    all_ents = eng.get_entities()
+                                    if all_ents:
+                                        hubs = all_ents[:GRAPH_HUB_LIMIT]
 
-                            for ent in (hubs or []):
-                                if len(nodes) < GRAPH_OVERVIEW_NODE_LIMIT:
-                                    nodes.add(ent)
-                                try:
-                                    neighbors = engine.kg_manager.get_neighbors(ent)
-                                except Exception as exc:
-                                    logger.warning("get_neighbors(%s) failed: %s", ent, exc)
-                                    continue
-                                for n in neighbors:
+                                for ent in (hubs or []):
                                     if len(nodes) < GRAPH_OVERVIEW_NODE_LIMIT:
-                                        nodes.add(n)
-                                    elif n not in nodes:
+                                        nodes.add(ent)
+                                    try:
+                                        neighbors = eng.kg_manager.get_neighbors(ent)
+                                    except Exception as exc:
+                                        logger.warning("get_neighbors(%s) failed: %s", ent, exc)
                                         continue
-                                    pair = (ent, n) if ent <= n else (n, ent)
-                                    key = (pair[0], pair[1], "related")
-                                    if key not in seen_all_edges:
-                                        seen_all_edges.add(key)
-                                        edges.append({"source": ent, "target": n, "predicate": "related"})
+                                    for n in neighbors:
+                                        if len(nodes) < GRAPH_OVERVIEW_NODE_LIMIT:
+                                            nodes.add(n)
+                                        elif n not in nodes:
+                                            continue
+                                        pair = (ent, n) if ent <= n else (n, ent)
+                                        key = (pair[0], pair[1], "related")
+                                        if key not in seen_all_edges:
+                                            seen_all_edges.add(key)
+                                            edges.append({"source": ent, "target": n, "predicate": "related"})
 
                             for e in cooccur_edges:
                                 s = e["source"]
@@ -3935,19 +3968,49 @@ async def entity_graph(
                     return await asyncio.to_thread(_overview_graph)
                 else:
                     hop_depth = max(1, min(depth, 10))
-                    graph = await active_db.entity_graph(entity_id, hop_depth)
-                    all_edges = graph.edges or []
-                    candidate_edges = [
-                        e for e in all_edges
-                        if e.get("predicate") not in ("co_occurs_with", "mentions", "related")
-                    ]
-                    if not candidate_edges:
-                        candidate_edges = all_edges
+                    if ctx.namespace in ("*", "all"):
+                        target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+                        all_candidate_edges = []
+                        seen_candidate_keys = set()
+                        raw_types: Dict[str, Any] = {}
+                        registered: Set[str] = set()
+                        for ns in target_namespaces:
+                            try:
+                                adb = await get_db_instance(ctx.tenant, ns)
+                                graph = await adb.entity_graph(entity_id, hop_depth)
+                                for edge in (graph.edges or []):
+                                    ekey = (edge.get("source"), edge.get("target"), edge.get("predicate"))
+                                    if ekey not in seen_candidate_keys:
+                                        seen_candidate_keys.add(ekey)
+                                        all_candidate_edges.append(edge)
+                                if getattr(graph, "node_types", None):
+                                    raw_types.update(graph.node_types)
+                                registered.update(get_registered_ids(ctx.tenant, ns))
+                            except Exception as exc:
+                                logger.warning(f"Error querying entity graph for ns {ns}: {exc}")
+                        candidate_edges = [
+                            e for e in all_candidate_edges
+                            if e.get("predicate") not in ("co_occurs_with", "mentions", "related")
+                        ]
+                        if not candidate_edges:
+                            candidate_edges = all_candidate_edges
+                        final_nodes, final_edges = _prune_subgraph_by_depth(entity_id, candidate_edges, hop_depth)
+                    else:
+                        active_db = await get_db_instance(ctx.tenant, ctx.namespace)
+                        graph = await active_db.entity_graph(entity_id, hop_depth)
+                        all_edges = graph.edges or []
+                        candidate_edges = [
+                            e for e in all_edges
+                            if e.get("predicate") not in ("co_occurs_with", "mentions", "related")
+                        ]
+                        if not candidate_edges:
+                            candidate_edges = all_edges
 
-                    final_nodes, final_edges = _prune_subgraph_by_depth(entity_id, candidate_edges, hop_depth)
+                        final_nodes, final_edges = _prune_subgraph_by_depth(entity_id, candidate_edges, hop_depth)
+                        raw_types = getattr(graph, "node_types", None) or {}
+                        registered = set(get_registered_ids(ctx.tenant, ctx.namespace))
 
                     result = {"nodes": list(final_nodes), "edges": final_edges}
-                    registered = set(get_registered_ids(ctx.tenant, ctx.namespace))
                     allowed = registered or None
                     raw_types = getattr(graph, "node_types", None) or {}
                     node_types: Dict[str, List[str]] = {}
@@ -4020,7 +4083,16 @@ def _merge_type_catalog(
     discovered: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Merge registered (app/seed) + auto-discovered types."""
-    registered = list_registered(tenant, namespace)
+    if namespace in ("*", "all"):
+        registered = []
+        seen_r = set()
+        for ns in get_namespaces_for_tenant(tenant):
+            for t in list_registered(tenant, ns):
+                if t["id"] not in seen_r:
+                    seen_r.add(t["id"])
+                    registered.append(t)
+    else:
+        registered = list_registered(tenant, namespace)
     reg_ids = [t["id"] for t in registered]
     disc_types = []
     for t in discovered.get("types") or []:
@@ -4102,6 +4174,29 @@ async def _collect_discovered_types(ctx: RequestContext) -> Dict[str, Any]:
             "predicates": sorted(predicates),
             "entity_types": {k: sorted(v) for k, v in entity_types.items()},
             "source": source,
+        }
+
+    if ctx.namespace in ("*", "all"):
+        target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+        all_types = set()
+        all_predicates = set()
+        all_entity_types = {}
+        for ns in target_namespaces:
+            try:
+                adb = await get_db_instance(ctx.tenant, ns)
+                eng = await adb._get_db()
+                disc = await asyncio.to_thread(discover_types, eng)
+                all_types.update(disc.get("types") or [])
+                all_predicates.update(disc.get("predicates") or [])
+                for ent, tlist in (disc.get("entity_types") or {}).items():
+                    all_entity_types.setdefault(str(ent), set()).update(tlist or [])
+            except Exception as exc:
+                logger.warning(f"Error collecting discovered types for ns {ns}: {exc}")
+        return {
+            "types": sorted(all_types),
+            "predicates": sorted(all_predicates),
+            "entity_types": {k: sorted(v) for k, v in all_entity_types.items()},
+            "source": "all_namespaces",
         }
 
     active_db = await get_db_instance(ctx.tenant, ctx.namespace)
@@ -4422,6 +4517,41 @@ async def stats(
                 "disk": get_disk_usage(os.getenv("STORAGE_DIR", "./shared_memory")),
             }
 
+        if ctx.namespace in ("*", "all"):
+            target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+            total_memory_count = 0
+            total_l1_size = 0
+            total_l2_size = 0
+            total_entity_count = 0
+            total_pending = 0
+            for ns in target_namespaces:
+                try:
+                    adb = await get_db_instance(ctx.tenant, ns)
+                    s = await adb.stats()
+                    total_memory_count += s.get("memory_count", 0)
+                    total_l1_size += s.get("l1_size", 0)
+                    total_l2_size += s.get("l2_size", 0)
+                    total_entity_count += s.get("entity_count", 0)
+                    try:
+                        total_pending += await adb.pending_extractions()
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    logger.warning(f"Failed to get stats for ns {ns}: {exc}")
+            db_stats = {
+                "mode": "shard",
+                "version": SERVER_VERSION,
+                "memory_count": total_memory_count,
+                "l1_size": total_l1_size,
+                "l2_size": total_l2_size,
+                "entity_count": total_entity_count,
+                "pending_extractions": total_pending,
+                "cpu": get_cpu_usage(),
+                "ram": get_ram_usage(),
+                "disk": get_disk_usage(os.getenv("STORAGE_DIR", "./shared_memory")),
+            }
+            return db_stats
+
         active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
             db_stats = await active_db.stats()
@@ -4554,6 +4684,86 @@ async def _execute_export(
             }
         }
     else:
+        if ctx.namespace in ("*", "all"):
+            target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+            result = {
+                "skills": [],
+                "profiles": [],
+                "memories": [],
+                "triplets": []
+            }
+            seen_skills = set()
+            seen_profiles = set()
+            seen_memories = set()
+            seen_triples = set()
+
+            for ns in target_namespaces:
+                try:
+                    adb = await get_db_instance(ctx.tenant, ns)
+                    raw_db = await adb._get_db()
+
+                    if data_type in ("all", "skills"):
+                        s_list = await adb.list_skills()
+                        for s in s_list:
+                            s_dict = s._atom.to_dict() if hasattr(s, "_atom") else s.to_dict()
+                            sid = s_dict.get("id") or (s_dict.get("metadata", {}).get("skill_name") if s_dict.get("metadata") else None)
+                            if sid and sid not in seen_skills:
+                                seen_skills.add(sid)
+                                result["skills"].append(s_dict)
+
+                    ns_atoms = {}
+                    with raw_db._internal_lock:
+                        for aid, atom in raw_db.hot_tier.atoms.items():
+                            if aid not in raw_db.deleted_atom_ids:
+                                ns_atoms[aid] = atom
+                        for epoch_id in raw_db.cold_tier.get_all_epochs():
+                            for atom in raw_db.cold_tier.load_epoch(epoch_id):
+                                if atom.id not in raw_db.deleted_atom_ids and atom.id not in ns_atoms:
+                                    ns_atoms[atom.id] = atom
+
+                    for atom in ns_atoms.values():
+                        mt = atom.memory_type.value if atom.memory_type else "general"
+                        atom_dict = atom.to_dict()
+
+                        if data_type in ("all", "profiles") and (mt == "profile" or (atom.metadata and atom.metadata.get("user_id"))):
+                            pid = atom.id or ((atom.metadata.get("user_id", "") if atom.metadata else "") + ":" + (atom.payload or ""))
+                            if pid and pid not in seen_profiles:
+                                seen_profiles.add(pid)
+                                result["profiles"].append(atom_dict)
+
+                        if data_type in ("all", "memories"):
+                            if not memory_type or mt == memory_type:
+                                if atom.id and atom.id not in seen_memories:
+                                    seen_memories.add(atom.id)
+                                    result["memories"].append(atom_dict)
+
+                        if data_type in ("all", "triplets", "graph"):
+                            if atom.triples:
+                                for t in atom.triples:
+                                    if isinstance(t, (list, tuple)) and len(t) >= 3:
+                                        tkey = (str(t[0]), str(t[1]), str(t[2]))
+                                        if tkey not in seen_triples:
+                                            seen_triples.add(tkey)
+                                            result["triplets"].append(list(tkey))
+                except Exception as exc:
+                    logger.warning(f"Export error for ns {ns}: {exc}")
+
+            return {
+                "version": "1.0",
+                "server_version": SERVER_VERSION,
+                "exported_at": time.time(),
+                "data_type": data_type,
+                "tenant": ctx.tenant or "global",
+                "namespace": ctx.namespace or "all",
+                "counts": {
+                    "skills": len(result["skills"]),
+                    "profiles": len(result["profiles"]),
+                    "memories": len(result["memories"]),
+                    "triplets": len(result["triplets"])
+                },
+                "data": result
+            }
+
         active_db = await get_db_instance(ctx.tenant, ctx.namespace)
         try:
             raw_db = await active_db._get_db()

@@ -53,7 +53,9 @@ export function TopNav({
           <span>scope:</span>
           <b>{tenant}</b>
           <span>/</span>
-          <b>{namespace}</b>
+          <b style={namespace === '*' || namespace === 'all' ? { color: 'var(--accent-teal-light, #14B8A6)' } : undefined}>
+            {namespace === '*' || namespace === 'all' ? '* (all)' : namespace}
+          </b>
         </div>
       </div>
 

@@ -2,6 +2,18 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.14.0] - 2026-11-07
+### Added
+- **Unified "All Namespaces" (`*` / `all`) Scope Aggregation**:
+  - Added native wildcard namespace support (`*` and `all`) to `/entity_graph`, `/stats`, `/export`, `/skills`, and `/entity_types`.
+  - Aggregates disparate partitions within a tenant into a unified cross-partition 2D/3D knowledge graph while strictly preserving tenant isolation boundaries.
+  - Dynamically merges and deduplicates relational triples, typed entities, procedural skills, and user profile memories across active and cold database partitions.
+  - Automatic tenant-wide cache invalidation: write mutations to any single namespace automatically purge the tenant's wildcard cache.
+- **Tenant and Namespace Discovery & Autocomplete in Studio UI**:
+  - Connected Studio Scope modal (`AuthModal.tsx`) to `/databases` discovery endpoint.
+  - Dynamically autocompletes available tenants and namespaces with input datalists and quick select options.
+  - Supports selecting `*` (all namespaces) directly from scope settings.
+
 ## [0.13.2] - 2026-11-06
 ### Added
 - **Embedding & Extraction Model Support**:

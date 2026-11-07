@@ -97,6 +97,21 @@ export async function fetchHealthz(): Promise<{ mode?: string; version?: string 
   return fetch('/healthz').then((r) => r.json()).catch(() => ({ mode: 'coordinator' }));
 }
 
+export interface DatabasePartition {
+  tenant: string | null;
+  namespace: string | null;
+}
+
+export async function fetchDatabases(): Promise<DatabasePartition[]> {
+  try {
+    const res = await apiRequest<{ databases?: DatabasePartition[] }>('/databases');
+    return res.databases || [];
+  } catch (err) {
+    console.error('Failed to fetch databases:', err);
+    return [];
+  }
+}
+
 export async function fetchEntityGraph(entityId?: string, depth = 2): Promise<GraphPayload> {
   const params = new URLSearchParams();
   if (entityId) params.set('entity_id', entityId);
