@@ -30,18 +30,13 @@ interface KnowledgeGraph2DProps {
 }
 
 /**
- * Wraps long node labels at natural word boundaries so they fit within compact box badges,
- * preventing wide horizontal text overlapping neighboring nodes and edges.
+ * Wraps multi-word entity labels at natural word boundaries to keep label widths compact,
+ * preventing long entity text from colliding with adjacent circles while preserving the full name.
  */
-function wrapLabel(text: string, maxLineLen = 22, maxLines = 3): string {
-  if (!text) return '';
-  const trimmed = text.trim();
-  if (trimmed.length <= maxLineLen) return trimmed;
-
-  const words = trimmed.split(/\s+/);
-  if (words.length === 1) {
-    return trimmed.length > maxLineLen ? trimmed.slice(0, maxLineLen - 1) + '…' : trimmed;
-  }
+function wrapLabel(text: string, maxLineLen = 22): string {
+  if (!text || text.length <= maxLineLen) return text;
+  const words = text.split(/\s+/);
+  if (words.length <= 1) return text;
 
   const lines: string[] = [];
   let cur = '';
@@ -52,15 +47,9 @@ function wrapLabel(text: string, maxLineLen = 22, maxLines = 3): string {
     } else {
       if (cur) lines.push(cur);
       cur = w;
-      if (lines.length >= maxLines - 1) break;
     }
   }
-  if (cur && lines.length < maxLines) lines.push(cur);
-
-  const totalLength = lines.join(' ').length;
-  if (totalLength < trimmed.length) {
-    lines[lines.length - 1] = lines[lines.length - 1].replace(/[.,;:!?]?$/, '…');
-  }
+  if (cur) lines.push(cur);
   return lines.join('\n');
 }
 
@@ -404,41 +393,42 @@ export const KnowledgeGraph2D = forwardRef<Graph2DHandle, KnowledgeGraph2DProps>
         const type = nodeTypes[name] || 'concept';
         const st = TYPE_STYLES[type] || TYPE_STYLES.concept;
         const col = typeColor(type, isDark);
+        const inside = st.shape === 'box' || st.shape === 'ellipse' || st.shape === 'circle';
         const d = degrees?.[name] || 0;
-        const wrappedLabel = wrapLabel(name, 22, 3);
-        const bg = isDark ? 'rgba(23, 27, 38, 0.95)' : '#FFFFFF';
-        const fontColor = isDark ? '#F1F5F9' : '#0F172A';
+        const wrappedLabel = wrapLabel(name, 22);
+        const labelColor = isDark ? '#E5E7EB' : '#1C1C1F';
+        const nodeSize = 12 + Math.min(d, 8) * 1.8;
 
         return {
           id: name,
           label: wrappedLabel,
           title: `Entity: ${name}\nType: ${st.label}\nConnections: ${d}`,
-          // Box shape ensures the physics solver calculates true text bounds and strictly avoids overlap
-          shape: 'box',
-          shapeProperties: { borderRadius: 6 },
-          margin: { top: 8, right: 12, bottom: 8, left: 12 },
+          shape: st.shape,
+          size: nodeSize,
           color: {
-            background: bg,
+            background: col,
             border: col,
-            highlight: { background: isDark ? 'rgba(30, 41, 59, 0.98)' : '#F8FAFC', border: col },
-            hover: { background: isDark ? 'rgba(30, 41, 59, 0.98)' : '#F8FAFC', border: isDark ? '#FFFFFF' : '#1C1C1F' },
+            highlight: { background: col, border: isDark ? '#FFFFFF' : '#1C1C1F' },
+            hover: { background: col, border: isDark ? '#FFFFFF' : '#1C1C1F' },
           },
           font: {
-            color: fontColor,
+            color: inside ? '#FFFFFF' : labelColor,
             size: 11,
             face: 'Plus Jakarta Sans, Inter, system-ui, sans-serif',
+            strokeWidth: inside ? 0 : 3,
+            strokeColor: inside ? undefined : (isDark ? '#0F172A' : '#FFFFFF'),
           },
-          borderWidth: Math.min(2 + Math.floor(d / 4), 4),
+          borderWidth: 2,
           shadow: {
             enabled: true,
-            color: isDark ? 'rgba(0,0,0,0.45)' : 'rgba(0,0,0,0.08)',
-            size: 6,
+            color: isDark ? 'rgba(0,0,0,0.45)' : 'rgba(0,0,0,0.12)',
+            size: 4,
             x: 0,
             y: 2,
           },
-          _origBg: bg,
+          _origBg: col,
           _origBorder: col,
-          _origFontColor: fontColor,
+          _origFontColor: inside ? '#FFFFFF' : labelColor,
         };
       });
 
