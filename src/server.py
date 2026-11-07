@@ -3938,7 +3938,7 @@ async def entity_graph(
                         if not target_namespaces:
                             target_namespaces = ["default"]
                     else:
-                        target_namespaces = [ctx.namespace or "default"]
+                        target_namespaces = [ctx.namespace]
 
                     if not target_namespaces:
                         return {"nodes": [], "edges": [], "typed_nodes": [], "node_types": {}}
