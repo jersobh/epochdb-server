@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { TypeaheadInput } from './TypeaheadInput';
-import { addTriplet } from '../lib/api';
+import { addTriplet, getNamespace, getTenant } from '../lib/api';
 import { DEFAULT_PREDICATES } from '../lib/graph';
 import type { TypeaheadItem } from '../types';
 
@@ -36,6 +36,9 @@ export function AddTripletModal({
 
   if (!open) return null;
 
+  const currentNs = getNamespace();
+  const isWildcard = currentNs === '*' || currentNs === 'all';
+  const targetNs = isWildcard ? 'default' : currentNs;
   const preds = Array.from(new Set([...DEFAULT_PREDICATES, ...knownPredicates])).slice(0, 12);
 
   const submit = async () => {
@@ -73,6 +76,10 @@ export function AddTripletModal({
         <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
           Directly inject relational triples into the distributed neuro-symbolic mesh.
         </p>
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
+          Target Partition: <strong style={{ color: 'var(--text-primary)' }}>{getTenant()} / {targetNs}</strong>
+          {isWildcard && <span style={{ opacity: 0.75 }}> (scope: all namespaces)</span>}
+        </div>
 
         <div className="input-group">
           <label className="input-label">Subject</label>

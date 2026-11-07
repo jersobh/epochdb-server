@@ -73,11 +73,12 @@ function authHeaders(): HeadersInit {
 export async function apiRequest<T = unknown>(
   endpoint: string,
   method: string = 'GET',
-  body: unknown = null
+  body: unknown = null,
+  extraHeaders: Record<string, string> = {}
 ): Promise<T> {
   const config: RequestInit = {
     method,
-    headers: authHeaders(),
+    headers: { ...authHeaders(), ...extraHeaders },
   };
   if (body != null) config.body = JSON.stringify(body);
 
@@ -147,21 +148,39 @@ export async function fetchSkills(): Promise<SkillItem[]> {
   return res.skills || [];
 }
 
+function writeNamespaceHeader(): Record<string, string> {
+  const ns = getNamespace();
+  if (ns === '*' || ns === 'all') {
+    return { 'X-Namespace': 'default' };
+  }
+  return {};
+}
+
 export async function addTriplet(subject: string, predicate: string, object: string) {
-  return apiRequest('/remember', 'POST', {
-    text: `${subject} ${predicate.replace(/_/g, ' ')} ${object}.`,
-    subject,
-    predicate,
-    object,
-    triples: [[subject, predicate, object]],
-  });
+  return apiRequest(
+    '/remember',
+    'POST',
+    {
+      text: `${subject} ${predicate.replace(/_/g, ' ')} ${object}.`,
+      subject,
+      predicate,
+      object,
+      triples: [[subject, predicate, object]],
+    },
+    writeNamespaceHeader()
+  );
 }
 
 export async function rememberTriple(subject: string, predicate: string, object: string) {
-  return apiRequest('/remember', 'POST', {
-    text: `${subject} ${predicate.replace(/_/g, ' ')} ${object}.`,
-    triples: [[subject, predicate, object]],
-  });
+  return apiRequest(
+    '/remember',
+    'POST',
+    {
+      text: `${subject} ${predicate.replace(/_/g, ' ')} ${object}.`,
+      triples: [[subject, predicate, object]],
+    },
+    writeNamespaceHeader()
+  );
 }
 
 export async function rememberSkill(payload: {
@@ -169,14 +188,19 @@ export async function rememberSkill(payload: {
   description: string;
   steps: Array<{ step: number; action: string }>;
 }) {
-  return apiRequest('/skills/remember', 'POST', payload);
+  return apiRequest('/skills/remember', 'POST', payload, writeNamespaceHeader());
 }
 
 export async function rememberProfile(userId: string, factText: string) {
-  return apiRequest('/profiles/remember', 'POST', {
-    user_id: userId,
-    fact_text: factText,
-  });
+  return apiRequest(
+    '/profiles/remember',
+    'POST',
+    {
+      user_id: userId,
+      fact_text: factText,
+    },
+    writeNamespaceHeader()
+  );
 }
 
 export async function exportData(dataType = 'all'): Promise<ExportBundle> {

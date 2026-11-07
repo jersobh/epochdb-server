@@ -1257,6 +1257,11 @@ def get_context(required_permissions: set[str]):
                 )
             req_namespace = key_info.namespace
             
+        # Wildcard safety: "*" and "all" are query/read scopes for aggregating namespaces.
+        # Write mutations must never store into a literal "*" partition directory; normalize to "default".
+        if Permission.WRITE in required_permissions and req_namespace in ("*", "all"):
+            req_namespace = os.getenv("DEFAULT_NAMESPACE") or "default"
+            
         return RequestContext(tenant=req_tenant, namespace=req_namespace, key_info=key_info)
     return context_dependency
 
