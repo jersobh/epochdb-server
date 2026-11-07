@@ -146,19 +146,40 @@ class EpochEmbedderAdapter:
     def __getattr__(self, name):
         return getattr(self.model, name)
 
-# Apply runtime monkey patches to EpochDB to guarantee embedding alignment
+# Apply runtime monkey patches to EpochDB to guarantee embedding alignment and avoid OOM from multiple copies
 try:
+    import threading
     from epochdb.api.db import EpochDB, Memory
+    from epochdb.engine import EpochDB as EngineEpochDB
 
-    _orig_get_embedder = EpochDB._get_embedder
+    _SHARED_EMBEDDER_CACHE: Dict[str, Any] = {}
+    _SHARED_EMBEDDER_LOCK = threading.Lock()
+
+    _orig_get_embedder = EngineEpochDB._get_embedder
     def _patched_get_embedder(self):
-        embedder = _orig_get_embedder(self)
-        if embedder is not None and not isinstance(embedder, EpochEmbedderAdapter):
-            wrapped = EpochEmbedderAdapter(embedder, dim=self.dim, model_name=self._model_name or "")
-            self._embedder = wrapped
-            return wrapped
-        return embedder
+        if getattr(self, "_embedder", None) is not None:
+            return self._embedder
+
+        model_key = (self._model_name or "").strip()
+        with _SHARED_EMBEDDER_LOCK:
+            if model_key in _SHARED_EMBEDDER_CACHE:
+                cached = _SHARED_EMBEDDER_CACHE[model_key]
+                self._embedder = cached
+                return cached
+
+            embedder = _orig_get_embedder(self)
+            if embedder is not None and not isinstance(embedder, EpochEmbedderAdapter):
+                wrapped = EpochEmbedderAdapter(embedder, dim=self.dim, model_name=self._model_name or "")
+                _SHARED_EMBEDDER_CACHE[model_key] = wrapped
+                self._embedder = wrapped
+                return wrapped
+            elif embedder is not None:
+                _SHARED_EMBEDDER_CACHE[model_key] = embedder
+                self._embedder = embedder
+                return embedder
+            return embedder
     EpochDB._get_embedder = _patched_get_embedder
+    EngineEpochDB._get_embedder = _patched_get_embedder
 
     _orig_query = EpochDB.query
     def _patched_query(self, text: str, k: int = 5, filters: Optional[dict] = None, min_score: float = 0.0, memory_type: Optional[str] = None, context_window: int = 0, expand_hops: int = 0, cold_search_mode: Optional[str] = None) -> List[Memory]:
@@ -204,6 +225,7 @@ try:
                 memories.append(mem)
             return memories
     EpochDB.query = _patched_query
+    EngineEpochDB.query = _patched_query
 
     # Patch supersession in RetrievalManager and ColdTier so co-occurrence
     # and biographical relationship triples do not falsely supersede earlier facts
@@ -401,84 +423,106 @@ def _patch_epochdb_fact_extractor():
         orig_load = fe.HuggingFaceFactExtractor._load
         orig_extract = fe.HuggingFaceFactExtractor.extract
 
+        _SHARED_EXTRACTOR_MODELS: Dict[str, Any] = {}
+        _SHARED_EXTRACTOR_LOCK = threading.Lock()
+
         def patched_load(self):
             if self._model is not None:
                 return
 
             cache_dir = self._cache_dir()
             load_id = cache_dir if cache_dir and os.path.isdir(cache_dir) and os.listdir(cache_dir) else self.model_id
-            logger.info(f"Loading HuggingFace extraction model: {load_id}")
 
-            # 1. Detect if the checkpoint is a GLiNER zero-shot entity model
-            is_gliner = "gliner" in load_id.lower() or "epochdb-extractor" in load_id.lower()
-            if not is_gliner:
-                try:
-                    from transformers import AutoConfig
-                    cfg = AutoConfig.from_pretrained(load_id)
-                    if getattr(cfg, "model_type", "") == "gliner_uni_encoder_span":
-                        is_gliner = True
-                except Exception as e:
-                    if "gliner" in str(e).lower():
-                        is_gliner = True
-
-            if is_gliner:
-                try:
-                    from gliner import GLiNER
-                    self._model = GLiNER.from_pretrained(load_id)
-                    self._is_gliner = True
-                    self._is_causal = False
-                    self._tokenizer = None
-                    if cache_dir and load_id == self.model_id:
-                        try:
-                            os.makedirs(cache_dir, exist_ok=True)
-                            self._model.save_pretrained(cache_dir)
-                        except Exception as ce:
-                            logger.warning(f"Could not cache GLiNER model to {cache_dir}: {ce}")
-                    logger.info(f"Loaded GLiNER extraction model successfully: {load_id}")
+            with _SHARED_EXTRACTOR_LOCK:
+                if load_id in _SHARED_EXTRACTOR_MODELS:
+                    cached_model, cached_tok, is_gl, is_causal = _SHARED_EXTRACTOR_MODELS[load_id]
+                    self._model = cached_model
+                    self._tokenizer = cached_tok
+                    self._is_gliner = is_gl
+                    self._is_causal = is_causal
                     return
-                except Exception as gliner_err:
-                    logger.warning(f"Could not load as GLiNER model: {gliner_err}")
 
-            # 2. Otherwise load via Transformers (Seq2Seq, CausalLM, or GLiNER fallback)
-            try:
-                from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-            except ImportError:
-                raise ImportError(
-                    "transformers is required for Hugging Face triple extraction. "
-                    "Install it with: pip install epochdb[extraction]"
-                )
+                logger.info(f"Loading HuggingFace extraction model: {load_id}")
 
-            self._tokenizer = AutoTokenizer.from_pretrained(load_id)
-            try:
-                self._model = AutoModelForSeq2SeqLM.from_pretrained(load_id)
-                self._is_causal = False
-            except (ValueError, KeyError, Exception):
-                try:
-                    import torch
-                    from transformers import AutoModelForCausalLM
-                    self._model = AutoModelForCausalLM.from_pretrained(
-                        load_id,
-                        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                    )
-                    self._is_causal = True
-                except Exception as causal_err:
-                    if "gliner" in str(causal_err).lower():
+                # 1. Detect if the checkpoint is a GLiNER zero-shot entity model
+                is_gliner = "gliner" in load_id.lower() or "epochdb-extractor" in load_id.lower()
+                if not is_gliner:
+                    try:
+                        from transformers import AutoConfig
+                        cfg = AutoConfig.from_pretrained(load_id)
+                        if getattr(cfg, "model_type", "") == "gliner_uni_encoder_span":
+                            is_gliner = True
+                    except Exception as e:
+                        if "gliner" in str(e).lower():
+                            is_gliner = True
+
+                if is_gliner:
+                    try:
                         from gliner import GLiNER
                         self._model = GLiNER.from_pretrained(load_id)
                         self._is_gliner = True
                         self._is_causal = False
-                        logger.info(f"Loaded GLiNER extraction model after transformers mismatch: {load_id}")
+                        self._tokenizer = None
+                        if cache_dir and load_id == self.model_id:
+                            try:
+                                os.makedirs(cache_dir, exist_ok=True)
+                                self._model.save_pretrained(cache_dir)
+                            except Exception as ce:
+                                logger.warning(f"Could not cache GLiNER model to {cache_dir}: {ce}")
+                        _SHARED_EXTRACTOR_MODELS[load_id] = (self._model, None, True, False)
+                        logger.info(f"Loaded GLiNER extraction model successfully: {load_id}")
                         return
-                    raise causal_err
-            self._model.eval()
+                    except Exception as gliner_err:
+                        logger.warning(f"Could not load as GLiNER model: {gliner_err}")
 
-            if cache_dir and load_id == self.model_id:
+                # 2. Otherwise load via Transformers (Seq2Seq, CausalLM, or GLiNER fallback)
                 try:
-                    os.makedirs(cache_dir, exist_ok=True)
-                    self._tokenizer.save_pretrained(cache_dir)
-                    self._model.save_pretrained(cache_dir)
-                except Exception as e:
-                    logger.warning(f"Could not cache HF extraction model to {cache_dir}: {e}")
+                    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+                except ImportError:
+                    raise ImportError(
+                        "transformers is required for Hugging Face triple extraction. "
+                        "Install it with: pip install epochdb[extraction]"
+                    )
+
+                self._tokenizer = AutoTokenizer.from_pretrained(load_id)
+                try:
+                    self._model = AutoModelForSeq2SeqLM.from_pretrained(load_id)
+                    self._is_causal = False
+                except (ValueError, KeyError, Exception):
+                    try:
+                        import torch
+                        from transformers import AutoModelForCausalLM
+                        self._model = AutoModelForCausalLM.from_pretrained(
+                            load_id,
+                            dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                        )
+                        self._is_causal = True
+                    except Exception as causal_err:
+                        if "gliner" in str(causal_err).lower():
+                            from gliner import GLiNER
+                            self._model = GLiNER.from_pretrained(load_id)
+                            self._is_gliner = True
+                            self._is_causal = False
+                            _SHARED_EXTRACTOR_MODELS[load_id] = (self._model, None, True, False)
+                            logger.info(f"Loaded GLiNER extraction model after transformers mismatch: {load_id}")
+                            return
+                        raise causal_err
+                self._model.eval()
+
+                if cache_dir and load_id == self.model_id:
+                    try:
+                        os.makedirs(cache_dir, exist_ok=True)
+                        self._tokenizer.save_pretrained(cache_dir)
+                        self._model.save_pretrained(cache_dir)
+                    except Exception as e:
+                        logger.warning(f"Could not cache HF extraction model to {cache_dir}: {e}")
+
+                _SHARED_EXTRACTOR_MODELS[load_id] = (
+                    self._model,
+                    self._tokenizer,
+                    getattr(self, "_is_gliner", False),
+                    getattr(self, "_is_causal", False),
+                )
 
         def patched_extract(self, text: str):
             self._load()
