@@ -3929,9 +3929,11 @@ async def entity_graph(
                     # called recall_by_entity per hub and wedged workers=1 shards
                     # under MiniLM load, so /entity_graph timed out → empty UI.
                     if ctx.namespace in ("*", "all"):
-                        target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+                        target_namespaces = [ns for ns in get_namespaces_for_tenant(ctx.tenant) if ns]
+                        if not target_namespaces:
+                            target_namespaces = ["default"]
                     else:
-                        target_namespaces = [ctx.namespace]
+                        target_namespaces = [ctx.namespace or "default"]
 
                     if not target_namespaces:
                         return {"nodes": [], "edges": [], "typed_nodes": [], "node_types": {}}
