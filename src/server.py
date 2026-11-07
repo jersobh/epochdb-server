@@ -10,6 +10,8 @@ import asyncio
 import httpx
 import json
 import time
+import fnmatch
+import concurrent.futures
 import numpy as np
 from collections import deque
 from contextlib import asynccontextmanager
@@ -351,17 +353,18 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.14.1"
+SERVER_VERSION = "0.15.0"
 # Coordinator→shard HTTP timeout. Embeddings on small VPS CPUs often exceed 30s
 # under concurrent ingest; default matches gunicorn --timeout 120.
 COORDINATOR_HTTP_TIMEOUT = float(os.getenv("COORDINATOR_HTTP_TIMEOUT", "120"))
 # Short timeout for graph fan-out so one slow shard returns a partial graph
 # instead of holding the coordinator for the full write timeout.
 COORDINATOR_GRAPH_TIMEOUT = float(os.getenv("COORDINATOR_GRAPH_TIMEOUT", "25"))
-# Bound CPU-bound sentence-transformer work per shard process. A full queue is
-# rejected rather than letting requests pile up until coordinator timeouts.
-SHARD_EMBED_CONCURRENCY = max(1, int(os.getenv("SHARD_EMBED_CONCURRENCY", "1")))
-SHARD_EMBED_QUEUE_LIMIT = max(0, int(os.getenv("SHARD_EMBED_QUEUE_LIMIT", "8")))
+# Bound CPU-bound sentence-transformer work per shard process.
+# Concurrency defaults to CPU core count (minimum 4) and queue limit defaults to 100k
+# so high-volume concurrent write bursts (e.g. 20k simultaneous writes) queue cleanly without drops.
+SHARD_EMBED_CONCURRENCY = max(4, int(os.getenv("SHARD_EMBED_CONCURRENCY", str(max(4, min(os.cpu_count() or 4, 16))))))
+SHARD_EMBED_QUEUE_LIMIT = max(100_000, int(os.getenv("SHARD_EMBED_QUEUE_LIMIT", "100000")))
 # Pre-warm this tenant/namespace at shard boot (Percepta uses global/default).
 # Empty → skip; avoids a second MiniLM cold-load on the first app request.
 DEFAULT_TENANT = (os.getenv("DEFAULT_TENANT") or "").strip() or None
@@ -918,13 +921,28 @@ SSE_LISTENERS: List[asyncio.Queue] = []
 
 async def broadcast_sse_event(event_type: str, data: dict):
     """
-    Broadcasts an event to all connected SSE clients.
+    Broadcasts an event to all connected SSE clients non-blockingly.
+    Ensures that high-volume writes (up to 20k+) never block or stall on slow SSE listeners.
     """
     if not SSE_LISTENERS:
         return
-    logger.debug(f"Broadcasting SSE event '{event_type}' to {len(SSE_LISTENERS)} listeners.")
+    dead_queues = []
+    item = {"event": event_type, "data": data}
     for queue in list(SSE_LISTENERS):
-        await queue.put({"event": event_type, "data": data})
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            try:
+                # Evict oldest event to make room for newest so client stays updated without blocking server
+                queue.get_nowait()
+                queue.put_nowait(item)
+            except Exception:
+                dead_queues.append(queue)
+        except Exception:
+            dead_queues.append(queue)
+    for dq in dead_queues:
+        if dq in SSE_LISTENERS:
+            SSE_LISTENERS.remove(dq)
 
 # Track syncing nodes
 SYNCING_NODES = set()
@@ -1226,6 +1244,14 @@ def get_healthy_shard(key: str) -> str:
     )
 
 
+def is_wildcard_namespace(ns: Optional[str]) -> bool:
+    """Returns True if namespace represents a wildcard query scope (*, all, or glob pattern like 'group/*')."""
+    if not ns:
+        return False
+    clean = str(ns).strip()
+    return clean in ("*", "all") or "*" in clean
+
+
 # -------------------------------------------------------------------------
 # Request Context & Scoped Authentication
 # -------------------------------------------------------------------------
@@ -1239,6 +1265,8 @@ def get_context(required_permissions: set[str]):
     ) -> RequestContext:
         req_tenant = x_tenant or tenant
         req_namespace = x_namespace or namespace
+        if req_namespace:
+            req_namespace = req_namespace.strip("/")
         
         # Enforce key-level tenant/namespace constraints
         if key_info.tenant is not None:
@@ -1250,16 +1278,28 @@ def get_context(required_permissions: set[str]):
             req_tenant = key_info.tenant
             
         if key_info.namespace is not None:
-            if req_namespace and req_namespace != key_info.namespace:
+            allowed = False
+            if req_namespace == key_info.namespace:
+                allowed = True
+            elif key_info.namespace in ("*", "all"):
+                allowed = True
+            elif req_namespace and (
+                fnmatch.fnmatch(req_namespace, key_info.namespace)
+                or (key_info.namespace.endswith("/*") and req_namespace.startswith(key_info.namespace[:-1]))
+            ):
+                allowed = True
+
+            if req_namespace and not allowed:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="API Key restricted to a different namespace."
+                    detail=f"API Key restricted to namespace scope '{key_info.namespace}'."
                 )
-            req_namespace = key_info.namespace
+            if not req_namespace:
+                req_namespace = key_info.namespace
             
-        # Wildcard safety: "*" and "all" are query/read scopes for aggregating namespaces.
-        # Write mutations must never store into a literal "*" partition directory; normalize to "default".
-        if Permission.WRITE in required_permissions and req_namespace in ("*", "all"):
+        # Wildcard safety: "*" and pattern wildcards are query/read scopes for aggregating namespaces.
+        # Write mutations must never store into a literal wildcard partition directory; normalize to "default".
+        if Permission.WRITE in required_permissions and is_wildcard_namespace(req_namespace):
             req_namespace = os.getenv("DEFAULT_NAMESPACE") or "default"
             
         return RequestContext(tenant=req_tenant, namespace=req_namespace, key_info=key_info)
@@ -1427,6 +1467,15 @@ async def lifespan(app: FastAPI):
     """
     global db, client
     
+    # Initialize high-capacity ThreadPoolExecutor for high-concurrency storage tasks
+    loop = asyncio.get_running_loop()
+    max_workers = max(128, (os.cpu_count() or 4) * 16)
+    loop.set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="epochdb_worker"
+        )
+    )
+    
     if NODE_MODE == "coordinator":
         logger.info("Initializing Sharded Clustering Coordinator Gateway...")
         if not shard_nodes:
@@ -1434,11 +1483,17 @@ async def lifespan(app: FastAPI):
         headers = {}
         if INTERNAL_AUTH_TOKEN:
             headers["X-Internal-Token"] = INTERNAL_AUTH_TOKEN
+        max_connections = int(os.getenv("COORDINATOR_MAX_CONNECTIONS", "25000"))
+        max_keepalive = int(os.getenv("COORDINATOR_MAX_KEEPALIVE", "5000"))
         logger.info(
-            "Coordinator HTTP client timeout=%.1fs (COORDINATOR_HTTP_TIMEOUT)",
-            COORDINATOR_HTTP_TIMEOUT,
+            "Coordinator HTTP client timeout=%.1fs, max_conn=%d, max_keepalive=%d",
+            COORDINATOR_HTTP_TIMEOUT, max_connections, max_keepalive
         )
-        client = httpx.AsyncClient(headers=headers, timeout=COORDINATOR_HTTP_TIMEOUT)
+        client = httpx.AsyncClient(
+            headers=headers,
+            timeout=COORDINATOR_HTTP_TIMEOUT,
+            limits=httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_keepalive),
+        )
         polling_task = asyncio.create_task(poll_shards_loop())
         yield
         polling_task.cancel()
@@ -1701,6 +1756,23 @@ def get_forward_headers(ctx: RequestContext) -> Dict[str, str]:
     return headers
 
 
+def _scan_ns_directory(base_ns_dir: str, tenant_val: Optional[str], db_keys: set):
+    """Recursively scan namespace directory tree supporting arbitrary nested hierarchies (e.g. dealer-group/dealer)."""
+    if not os.path.exists(base_ns_dir):
+        return
+    try:
+        for root, dirs, files in os.walk(base_ns_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("*", "all")]
+            rel = os.path.relpath(root, base_ns_dir)
+            if rel == ".":
+                continue
+            clean_rel = rel.replace("\\", "/").strip("/")
+            if "metadata.json" in files or "wal.jsonl" in files or not dirs:
+                db_keys.add((tenant_val, clean_rel))
+    except Exception as e:
+        logger.error(f"Error scanning namespace directory {base_ns_dir}: {e}")
+
+
 def _scan_local_databases() -> List[Dict[str, Optional[str]]]:
     storage_dir = os.getenv("STORAGE_DIR", "./shared_memory")
     db_keys = set()
@@ -1712,40 +1784,36 @@ def _scan_local_databases() -> List[Dict[str, Optional[str]]]:
     if os.path.exists(os.path.join(storage_dir, "metadata.json")):
         db_keys.add((None, None))
     ns_dir = os.path.join(storage_dir, "ns")
-    if os.path.exists(ns_dir):
-        try:
-            for namespace in os.listdir(ns_dir):
-                if namespace not in ("*", "all") and os.path.isdir(os.path.join(ns_dir, namespace)):
-                    db_keys.add((None, namespace))
-        except Exception as e:
-            logger.error(f"Error listing namespace directory: {e}")
+    _scan_ns_directory(ns_dir, None, db_keys)
     tenants_dir = os.path.join(storage_dir, "tenants")
     if os.path.exists(tenants_dir):
         try:
             for tenant in os.listdir(tenants_dir):
                 tenant_path = os.path.join(tenants_dir, tenant)
-                if os.path.isdir(tenant_path):
+                if os.path.isdir(tenant_path) and not tenant.startswith("."):
                     if os.path.exists(os.path.join(tenant_path, "metadata.json")):
                         db_keys.add((tenant, None))
                     tenant_ns_dir = os.path.join(tenant_path, "ns")
-                    if os.path.exists(tenant_ns_dir):
-                        for namespace in os.listdir(tenant_ns_dir):
-                            if namespace not in ("*", "all") and os.path.isdir(os.path.join(tenant_ns_dir, namespace)):
-                                db_keys.add((tenant, namespace))
+                    _scan_ns_directory(tenant_ns_dir, tenant, db_keys)
         except Exception as e:
             logger.error(f"Error listing tenants directory: {e}")
     return [{"tenant": t, "namespace": ns} for t, ns in sorted(db_keys, key=lambda x: (x[0] or "", x[1] or ""))]
 
 
-def get_namespaces_for_tenant(tenant: Optional[str]) -> List[Optional[str]]:
+def get_namespaces_for_tenant(tenant: Optional[str], pattern: Optional[str] = None) -> List[Optional[str]]:
     all_dbs = _scan_local_databases()
     namespaces = set()
     for item in all_dbs:
         t = item["tenant"]
         ns = item["namespace"]
         if t == tenant or (tenant is None and t is None) or (tenant == "global" and t in (None, "global")):
-            if ns not in ("*", "all"):
-                namespaces.add(ns)
+            if ns not in ("*", "all") and ns is not None:
+                if pattern is None or pattern in ("*", "all"):
+                    namespaces.add(ns)
+                elif fnmatch.fnmatch(ns, pattern) or (pattern.endswith("/*") and ns.startswith(pattern[:-2])):
+                    namespaces.add(ns)
+                elif ns == pattern:
+                    namespaces.add(ns)
     return sorted(list(namespaces), key=lambda x: (x is not None, x or ""))
 
 
@@ -2326,15 +2394,7 @@ async def remember_batch(
             })
 
         async with embedding_slot():
-            atom_ids = []
-            for itm in formatted_items:
-                aid = await active_db.remember(
-                    text=itm["text"],
-                    metadata=itm["metadata"],
-                    memory_type=itm["memory_type"],
-                    atom_id=itm["id"],
-                )
-                atom_ids.append(aid)
+            atom_ids = await active_db.remember_batch(formatted_items)
 
         invalidate_cache(ctx.tenant, ctx.namespace)
         await broadcast_sse_event("update", {"type": "batch_write", "count": len(atom_ids)})
@@ -2734,8 +2794,8 @@ async def query_memories(
                 result["failed_shards"] = failed_shards
             return result
         else:
-            if ctx.namespace in ("*", "all"):
-                target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+            if is_wildcard_namespace(ctx.namespace):
+                target_namespaces = get_namespaces_for_tenant(ctx.tenant, ctx.namespace)
                 if not target_namespaces:
                     return {"results": [], "memories": []}
 
@@ -3186,8 +3246,8 @@ async def list_skills(
                             all_skills.append(s)
             return {"skills": all_skills}
         else:
-            if ctx.namespace in ("*", "all"):
-                target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+            if is_wildcard_namespace(ctx.namespace):
+                target_namespaces = get_namespaces_for_tenant(ctx.tenant, ctx.namespace)
                 all_skills = []
                 seen = set()
                 for ns in target_namespaces:
@@ -3933,8 +3993,8 @@ async def entity_graph(
                     # Studio overview: cheap KG index walk. The old hub×BFS path
                     # called recall_by_entity per hub and wedged workers=1 shards
                     # under MiniLM load, so /entity_graph timed out → empty UI.
-                    if ctx.namespace in ("*", "all"):
-                        target_namespaces = [ns for ns in get_namespaces_for_tenant(ctx.tenant) if ns]
+                    if is_wildcard_namespace(ctx.namespace):
+                        target_namespaces = [ns for ns in get_namespaces_for_tenant(ctx.tenant, ctx.namespace) if ns]
                         if not target_namespaces:
                             target_namespaces = ["default"]
                     else:
@@ -4188,8 +4248,8 @@ async def entity_graph(
                     return await asyncio.to_thread(_overview_graph)
                 else:
                     hop_depth = max(1, min(depth, 10))
-                    if ctx.namespace in ("*", "all"):
-                        target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+                    if is_wildcard_namespace(ctx.namespace):
+                        target_namespaces = get_namespaces_for_tenant(ctx.tenant, ctx.namespace)
                         all_candidate_edges = []
                         seen_candidate_keys = set()
                         raw_types: Dict[str, Any] = {}
@@ -4303,10 +4363,10 @@ def _merge_type_catalog(
     discovered: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Merge registered (app/seed) + auto-discovered types."""
-    if namespace in ("*", "all"):
+    if is_wildcard_namespace(namespace):
         registered = []
         seen_r = set()
-        for ns in get_namespaces_for_tenant(tenant):
+        for ns in get_namespaces_for_tenant(tenant, namespace):
             for t in list_registered(tenant, ns):
                 if t["id"] not in seen_r:
                     seen_r.add(t["id"])
@@ -4396,8 +4456,8 @@ async def _collect_discovered_types(ctx: RequestContext) -> Dict[str, Any]:
             "source": source,
         }
 
-    if ctx.namespace in ("*", "all"):
-        target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+    if is_wildcard_namespace(ctx.namespace):
+        target_namespaces = get_namespaces_for_tenant(ctx.tenant, ctx.namespace)
         all_types = set()
         all_predicates = set()
         all_entity_types = {}
@@ -4737,8 +4797,8 @@ async def stats(
                 "disk": get_disk_usage(os.getenv("STORAGE_DIR", "./shared_memory")),
             }
 
-        if ctx.namespace in ("*", "all"):
-            target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+        if is_wildcard_namespace(ctx.namespace):
+            target_namespaces = get_namespaces_for_tenant(ctx.tenant, ctx.namespace)
             total_memory_count = 0
             total_l1_size = 0
             total_l2_size = 0
@@ -4904,8 +4964,8 @@ async def _execute_export(
             }
         }
     else:
-        if ctx.namespace in ("*", "all"):
-            target_namespaces = get_namespaces_for_tenant(ctx.tenant)
+        if is_wildcard_namespace(ctx.namespace):
+            target_namespaces = get_namespaces_for_tenant(ctx.tenant, ctx.namespace)
             result = {
                 "skills": [],
                 "profiles": [],
