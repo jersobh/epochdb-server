@@ -353,13 +353,17 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.15.0"
+SERVER_VERSION = "0.16.0"
 # Coordinator→shard HTTP timeout. Embeddings on small VPS CPUs often exceed 30s
 # under concurrent ingest; default matches gunicorn --timeout 120.
-COORDINATOR_HTTP_TIMEOUT = float(os.getenv("COORDINATOR_HTTP_TIMEOUT", "120"))
+# Bound coordinator waits so chat/recommend clients (~15s) cannot hang for minutes
+# when a shard is slow under ~1k+ memories.
+COORDINATOR_HTTP_TIMEOUT = float(os.getenv("COORDINATOR_HTTP_TIMEOUT", "30"))
 # Short timeout for graph fan-out so one slow shard returns a partial graph
 # instead of holding the coordinator for the full write timeout.
-COORDINATOR_GRAPH_TIMEOUT = float(os.getenv("COORDINATOR_GRAPH_TIMEOUT", "25"))
+COORDINATOR_GRAPH_TIMEOUT = float(os.getenv("COORDINATOR_GRAPH_TIMEOUT", "12"))
+COORDINATOR_QUERY_TIMEOUT = float(os.getenv("COORDINATOR_QUERY_TIMEOUT", "12"))
+MAX_QUERY_K = int(os.getenv("MAX_QUERY_K", "50"))
 # Bound CPU-bound sentence-transformer work per shard process.
 # Concurrency defaults to CPU core count (minimum 4) and queue limit defaults to 100k
 # so high-volume concurrent write bursts (e.g. 20k simultaneous writes) queue cleanly without drops.
@@ -2747,6 +2751,9 @@ async def query_memories(
     if not query_text:
         raise HTTPException(status_code=400, detail="Query text must not be empty.")
 
+    # Cap k so large fan-outs cannot explode latency under 1k+ memories.
+    effective_k = max(1, min(int(payload.k or 5), MAX_QUERY_K))
+
     async def fetch():
         if NODE_MODE == "coordinator":
             if not client:
@@ -2761,12 +2768,14 @@ async def query_memories(
             forward_data = payload.model_dump()
             forward_data["query"] = query_text
             forward_data["text"] = query_text
+            forward_data["k"] = effective_k
 
             tasks = [
                 client.post(
                     f"{node}/query",
                     json=forward_data,
-                    headers=get_forward_headers(ctx)
+                    headers=get_forward_headers(ctx),
+                    timeout=COORDINATOR_QUERY_TIMEOUT,
                 ) for node in target_nodes
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2786,8 +2795,8 @@ async def query_memories(
 
             all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
             result = {
-                "results": all_results[:payload.k],
-                "memories": all_results[:payload.k]
+                "results": all_results[:effective_k],
+                "memories": all_results[:effective_k]
             }
             if failed_shards:
                 result["partial"] = True
@@ -2828,7 +2837,7 @@ async def query_memories(
                         active_db = await get_db_instance(ctx.tenant, ns)
                         query_kwargs = {
                             "text": query_text,
-                            "k": payload.k,
+                            "k": effective_k,
                             "filters": payload.filters,
                             "memory_type": payload.memory_type,
                             "context_window": payload.context_window,
@@ -2873,14 +2882,14 @@ async def query_memories(
                     all_results = [r for r in all_results if r.get("score", 0.0) >= payload.min_score]
 
                 all_results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-                top_results = all_results[:payload.k]
+                top_results = all_results[:effective_k]
                 return {"results": top_results, "memories": top_results}
             else:
                 active_db = await get_db_instance(ctx.tenant, ctx.namespace)
                 try:
                     query_kwargs = {
                         "text": query_text,
-                        "k": payload.k,
+                        "k": effective_k,
                         "filters": payload.filters,
                         "memory_type": payload.memory_type,
                         "context_window": payload.context_window,

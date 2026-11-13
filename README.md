@@ -8,6 +8,7 @@
 
 **EpochDB Distributed Server** is an asynchronous, high-concurrency memory and vector database server designed for agentic workloads. Built on top of the core [EpochDB Agentic Memory Engine](https://github.com/jersobh/epochdb), it supports multi-node clustering with automatic horizontal sharding, consistent hashing write distribution, and direct prefix-based routing.
 
+**Current release:** `0.16.0` · requires core engine **`epochdb >= 1.14.0`** (precision-first retrieval, query decomposition, cold-tier BM25).
 
 ---
 
@@ -461,6 +462,23 @@ if __name__ == "__main__":
 ---
 
 ## Performance & Load Testing
+
+### Engine retrieval (via EpochDB 1.14)
+
+Official-dataset scores measured on the core engine (same stack this server ships). Metric = gold answer / evidence turn in returned atoms — retrieval, not LLM-judged QA.
+
+| Benchmark | Metric | Score | Notes |
+|---|---|---:|---|
+| **LoCoMo-10** | recall@50 | **0.955** | 1472/1542 QA · seed 42 · v1.14 |
+| **ConvoMem** | recall@5 / @10 / @20 | **0.80 / 0.86 / 1.00** | n=50 · dual-turn · query decompose |
+| **LongMemEval_S** | recall@10 | **0.860** | last completed full suite |
+| **NIAH** | precision@3 | **1.000** | last completed full suite |
+
+Earlier full-suite snapshot (same embedder/seed, pre-precision polish): LoCoMo recall@20 **0.863**, ConvoMem recall@10 **0.680**. Full logs: [epochdb/benchmark.md](https://github.com/jersobh/epochdb/blob/main/benchmark.md).
+
+Coordinator knobs for large namespaces (`~1k+` atoms): `COORDINATOR_QUERY_TIMEOUT` / `COORDINATOR_GRAPH_TIMEOUT` (default **12s**), `MAX_QUERY_K` (default **50**).
+
+### Load testing
 
 The server includes two options for load testing and performance benchmarking:
 
