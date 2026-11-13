@@ -2,6 +2,15 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.16.0] - 2026-11-13
+### Changed
+- **Core engine**: requires `epochdb >= 1.14.0` (precision-first retrieval, query decomposition, cold-tier BM25, official-benchmark harness).
+- **Query / graph fan-out budgets**: `COORDINATOR_QUERY_TIMEOUT` / `COORDINATOR_GRAPH_TIMEOUT` default to **12s** (override via env) so one slow shard returns a partial result instead of holding the gateway for the full write timeout.
+- **`MAX_QUERY_K`**: default **50** — caps client `k` on `/query` so oversized recalls cannot monopolize shard CPUs under multi-tenant load.
+
+### Fixed
+- Large-memory graph/query paths no longer sit on unbounded per-shard waits; timeouts and bounded `k` keep the coordinator event loop responsive when namespaces grow to ~1k+ atoms.
+
 ## [0.15.0] - 2026-11-07
 ### Added
 - **Hierarchical Multi-Level Scoping**:
