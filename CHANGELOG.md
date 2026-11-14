@@ -2,6 +2,10 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [0.16.1] - 2026-11-14
+### Fixed
+- **Query recall**: requires `epochdb >= 1.14.1` so shared extractor `is_a` / typing triples no longer hard-supersede distinct episodic memories during `/query`.
+
 ## [0.16.0] - 2026-11-13
 ### Changed
 - **Core engine**: requires `epochdb >= 1.14.0` (precision-first retrieval, query decomposition, cold-tier BM25, official-benchmark harness).

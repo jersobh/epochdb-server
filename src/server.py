@@ -240,13 +240,7 @@ try:
         old_rm_block = """    for atom, _ in recency_sorted:
         for s, p, o in atom.triples:
             state_key = (str(s).lower(), str(p).lower())"""
-        new_rm_block = """    NON_SUPERSEDING_PREDICATES = {
-        'co_occurs_with', 'mentions', 'associated_with', 'related_to',
-        'tagged_with', 'has_tag', 'contains', 'part_of', 'member_of',
-        'founded', 'co_founded', 'created', 'invented', 'designed',
-        'mentored', 'worked_at', 'attended', 'developed', 'pioneered',
-        'authored', 'discovered', 'produced', 'competes_with',
-    }
+        new_rm_block = """    from epochdb.core.predicates import NON_SUPERSEDING_PREDICATES
     for atom, _ in recency_sorted:
         for s, p, o in atom.triples:
             p_l = str(p).lower()
@@ -271,13 +265,7 @@ try:
         old_c_block = """        is_superseded = False
         for s, p, o in atom.triples:
             state_key = (str(s).lower(), str(p).lower())"""
-        new_c_block = """        NON_SUPERSEDING_PREDICATES = {
-            'co_occurs_with', 'mentions', 'associated_with', 'related_to',
-            'tagged_with', 'has_tag', 'contains', 'part_of', 'member_of',
-            'founded', 'co_founded', 'created', 'invented', 'designed',
-            'mentored', 'worked_at', 'attended', 'developed', 'pioneered',
-            'authored', 'discovered', 'produced', 'competes_with',
-        }
+        new_c_block = """        from epochdb.core.predicates import NON_SUPERSEDING_PREDICATES
         is_superseded = False
         for s, p, o in atom.triples:
             p_l = str(p).lower()
@@ -353,7 +341,7 @@ except ImportError:
 # Export variables for backward compatibility and tests
 API_KEY = os.getenv("API_KEY")
 INTERNAL_AUTH_TOKEN = os.getenv("INTERNAL_AUTH_TOKEN")
-SERVER_VERSION = "0.16.0"
+SERVER_VERSION = "0.16.1"
 # Coordinator→shard HTTP timeout. Embeddings on small VPS CPUs often exceed 30s
 # under concurrent ingest; default matches gunicorn --timeout 120.
 # Bound coordinator waits so chat/recommend clients (~15s) cannot hang for minutes

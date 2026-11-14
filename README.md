@@ -8,7 +8,7 @@
 
 **EpochDB Distributed Server** is an asynchronous, high-concurrency memory and vector database server designed for agentic workloads. Built on top of the core [EpochDB Agentic Memory Engine](https://github.com/jersobh/epochdb), it supports multi-node clustering with automatic horizontal sharding, consistent hashing write distribution, and direct prefix-based routing.
 
-**Current release:** `0.16.0` · requires core engine **`epochdb >= 1.14.0`** (precision-first retrieval, query decomposition, cold-tier BM25).
+**Current release:** `0.16.1` · requires core engine **`epochdb >= 1.14.1`** (precision-first retrieval; typing-triple supersession fix).
 
 ---
 

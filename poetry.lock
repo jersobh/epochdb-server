@@ -721,14 +721,14 @@ all = ["adbc-driver-manager", "fsspec", "ipython", "numpy", "pandas", "pyarrow"]
 
 [[package]]
 name = "epochdb"
-version = "1.14.0"
+version = "1.14.1"
 description = "An agentic memory engine designed for lossless, tiered verbatim storage and multi-hop retrieval."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "epochdb-1.14.0-py3-none-any.whl", hash = "sha256:e26ef881582bcd824609150bb39ac5e0c544529b8c3ccfb14c9e542fbb7f402f"},
-    {file = "epochdb-1.14.0.tar.gz", hash = "sha256:1edae052ca12e8289cb7addc7ea116d98cf54f7f39332d9eacf404b8ccc28fa1"},
+    {file = "epochdb-1.14.1-py3-none-any.whl", hash = "sha256:f18d030125f97d24cd4ac697ddecf41b36fb5f679cdd65c019ec28322c192afe"},
+    {file = "epochdb-1.14.1.tar.gz", hash = "sha256:751164f2a32e465b160144d43899500b143a2229d387289b64d743e7e5183f6b"},
 ]
 
 [package.dependencies]
@@ -3919,4 +3919,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.15"
-content-hash = "39619b97d49080366db1014b50a19283efac9e7ed96a14b8fab8b5870b8ef209"
+content-hash = "d1623f7c1dfa6eff58859f20e2523aae8f457aa489e69822adf71df84c3a5c46"
