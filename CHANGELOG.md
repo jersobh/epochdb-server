@@ -2,6 +2,10 @@
 
 All notable changes to the EpochDB Distributed Server project will be documented in this file.
 
+## [Unreleased]
+### Changed
+- **Core engine**: requires `epochdb >= 1.14.2` (hard-delete compaction/SQL hide, filter validation, cold-tier update newest-version, context_window isolation, BM25 facet eligibility).
+
 ## [0.16.1] - 2026-11-14
 ### Fixed
 - **Query recall**: requires `epochdb >= 1.14.1` so shared extractor `is_a` / typing triples no longer hard-supersede distinct episodic memories during `/query`.
